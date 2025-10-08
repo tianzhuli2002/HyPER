@@ -1,8 +1,9 @@
 from .messagePassing import EdgeModel, NodeModel, GlobalModel
 from .hyperedge import HyperedgeModel
 from .MPNNs import MPNNs
-from .loss import HyperedgeLoss, EdgeLoss, CombinedLoss
+from .loss import HyperedgeLoss, EdgeLoss, CombinedLoss, ClassificationLoss
 from .HyPERModel import HyPERModel
+from .classification import classificationModel
 
 
 __all__ = [
@@ -14,5 +15,7 @@ __all__ = [
     'HyperedgeLoss',
     'EdgeLoss',
     'CombinedLoss',
-    'HyPERModel'
+    'ClassificationLoss',
+    'HyPERModel',
+    'classificationModel',
 ]

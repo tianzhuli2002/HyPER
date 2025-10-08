@@ -63,13 +63,14 @@ def Predict(cfg : DictConfig) -> None:
 
     hyperedge_out = []
     graphedge_out = []
+    cls_scores = []
     hyperedge_vct = []
     graphedge_vct = []
     hyperedges = []
     graphedges = []
     
     for i in tqdm(range(len(out)), desc="Evaluating", unit='batch'):
-        x_out, edge_attr_out, N_nodes, encodings = out[i]
+        x_out, edge_attr_out, N_nodes, encodings, x_class_out = out[i]
 
         for j in range(len(x_out)):
             hyperedges.append([list(x) for x in combinations(range(int(N_nodes[j])),r=cfg['hyperedge_order'])])
@@ -83,15 +84,18 @@ def Predict(cfg : DictConfig) -> None:
             graphedges.append([list(x) for x in combinations(range(int(N_nodes[j])),r=2)])
             graphedge_out.append(edge_attrs.flatten().tolist())
             graphedge_vct.append([list(x) for x in combinations(encodings[j].cpu().flatten().tolist(),r=2)])
+        
+        cls_scores.extend(x_class_out.cpu().flatten().tolist())
 
     results = pd.DataFrame(
         {
-            "HyPER_HE_RAW": hyperedge_out,
-            "HyPER_GE_RAW": graphedge_out,
-            "HyPER_HE_VCT": hyperedge_vct,
-            "HyPER_GE_VCT": graphedge_vct,
-            "HyPER_HE_IDX": hyperedges,
-            "HyPER_GE_IDX": graphedges   
+            "HyPER_HE_RAW"  : hyperedge_out,
+            "HyPER_GE_RAW"  : graphedge_out,
+            "HyPER_CLS_RAW" : cls_scores,
+            "HyPER_HE_VCT"  : hyperedge_vct,
+            "HyPER_GE_VCT"  : graphedge_vct,
+            "HyPER_HE_IDX"  : hyperedges,
+            "HyPER_GE_IDX"  : graphedges   
         }
     )
 

@@ -1,7 +1,7 @@
-dataset:          null
-train_set:        null
-val_set:          null
-train_val_split:  0.9
+dataset:          '/data/sdellasa/QT_HyPER_Training/tuples_Class/nobtag'
+train_set:        'training_dataset_odd'
+val_set:          'training_dataset_even'
+train_val_split:  0.5
 max_n_events:     -1
 drop_last:        False
 
@@ -12,27 +12,28 @@ hyperedge_feats:      128
 dropout:              0.01
 
 optimizer:            "Adam"
-learning_rate:        0.0003
+learning_rate:        0.001
 criterion_edge:       "BCE"
 criterion_hyperedge:  "BCE"
 loss_reduction:       "mean"
-alpha:                0.8
+alpha:                0.5
+beta:                 0.005
 
-epochs:       500
-patience:     50
+epochs:       300
+patience:     30
 batch_size:   4096
 
-device:       "gpu"
-num_devices:   1
+device:       "cpu"
+num_devices:   16
 
 savedir: "HyPER_logs"
 continue_from_ckpt: null
 
-predict_set:    null
+predict_set:    'ttbar_SL_even'
 predict_with:   "cpu"
-predict_model:  null
-predict_output: null
-topology: ttbar_allhad
+predict_model:  "/home/sdellasa/QT_HyPER_Training/HyPER_pygDataset/HyPER/HyPER_logs/version_118"
+predict_output: "/data/sdellasa/QT_HyPER_Training/tuples_Class/predictions/ttbar_SL_v118_even.pkl"
+topology: 'ttbar_single_lep'
 
 onnx_output:   "HyPER.onnx"
 convert_model: null

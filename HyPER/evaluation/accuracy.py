@@ -25,6 +25,8 @@ def Accuracy(preds: Tensor, target: Tensor, batch: Tensor, num_patterns: int) ->
 
     :rtype: :class:`torch.Tensor`
     """
+    if preds.numel() == 0:
+        return None
     picked = 0
     idx_preds = 0; src_preds = 0
     
@@ -33,7 +35,7 @@ def Accuracy(preds: Tensor, target: Tensor, batch: Tensor, num_patterns: int) ->
     preds = preds.flatten()
 
     while picked < num_patterns:
-        # remove the last highest
+        # remove the previous iteration's highest score
         if picked >= 1:
             preds = torch.scatter(preds,dim=0,index=idx_preds,src=torch.zeros(idx_preds.size(),device=device))
         
@@ -46,7 +48,8 @@ def Accuracy(preds: Tensor, target: Tensor, batch: Tensor, num_patterns: int) ->
 
         picked += 1
 
-    accuracy = binary_accuracy(evaluable,target.flatten(),ignore_index=0,threshold=0.00)
+    # accuracy = binary_accuracy(evaluable,target.flatten(),ignore_index=0,threshold=0.00)
+    accuracy = binary_accuracy(evaluable,target.flatten(),threshold=0.00)
 
     return accuracy
 

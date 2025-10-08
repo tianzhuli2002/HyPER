@@ -6,6 +6,18 @@ from torch_scatter import scatter
 
 from typing import Optional
 
+def ClassificationLoss(cls_out: Tensor, cls_t: Tensor,
+                       criterion: Optional[callable] = BCELoss(reduction='none')) -> Tensor:
+    """
+    Args:
+        cls_out (Tensor): output classification scores.
+        cls_t (Tensor): classification targets.
+        criterion (optional: callable): loss/cost function (default: BCELoss).
+
+    :rtype: :class:`Tensor`
+    """
+    l = criterion(cls_out, cls_t.float())
+    return l.flatten()
 
 def EdgeLoss(edge_attr_out: Tensor, edge_attr_t: Tensor, edge_attr_batch: Tensor,
              criterion: Optional[callable] = BCELoss(reduction='none'), reduction: Optional[str] = 'mean') -> Tensor:
@@ -43,7 +55,8 @@ def HyperedgeLoss(x_out: Tensor, x_t: Tensor, x_t_batch: Tensor,
     return l, loss_masks
 
 
-def CombinedLoss(loss_hyperedge: Tensor, loss_edge: Tensor, alpha: Optional[float] = 0.5, reduction: Optional[str] = 'mean',
+def CombinedLoss(loss_hyperedge: Tensor, loss_edge: Tensor, loss_class: Tensor, 
+                 cls_target: Tensor, alpha: Optional[float] = 0.5, beta: Optional[float] = 0.5, reduction: Optional[str] = 'mean',
                  loss_hyperedge_masks: Optional[Tensor] = None) -> Tensor:
     r"""Get combined loss.
 
@@ -64,7 +77,8 @@ def CombinedLoss(loss_hyperedge: Tensor, loss_edge: Tensor, alpha: Optional[floa
             alpha = torch.full(loss_shape, alpha, device=device)
             alpha = torch.scatter(torch.zeros(loss_shape, device=device), 0, loss_hyperedge_masks.nonzero().flatten(), alpha)
 
-    l = ( alpha * loss_hyperedge ) + ( (1-alpha) * loss_edge )
+    # Not considering the reco loss for bkg events
+    l = cls_target.flatten() * (( alpha * loss_hyperedge ) + ( (1-alpha) * loss_edge )) * (1-beta) + beta * loss_class
 
     if reduction == 'mean':
         rd = torch.mean

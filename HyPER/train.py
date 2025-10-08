@@ -57,20 +57,21 @@ def Train(cfg : DictConfig) -> None:
         optimizer = cfg['optimizer'],
         lr = cfg['learning_rate'],
         alpha = cfg['alpha'],
+        beta = cfg['beta'],
         reduction = cfg['loss_reduction']
     )
 
     callbacks = [
         ModelCheckpoint(
             verbose=True,
-            monitor="fuzzy_accuracy/validation_accuracy_hyperedge",
+            monitor="loss/validation_loss",
             save_top_k=1,
-            mode="max",
+            mode="min",
             save_last=True
         ),
         EarlyStopping(
-            monitor="fuzzy_accuracy/validation_accuracy_hyperedge",
-            mode="max",
+            monitor="loss/validation_loss",
+            mode="min",
             min_delta=0.00,
             patience=cfg['patience'],
             verbose=False

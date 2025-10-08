@@ -154,6 +154,7 @@ class HyPERDataModule(LightningDataModule):
             num_workers=self.num_workers,
             persistent_workers=self.persistent_workers,
             drop_last=self.drop_last,
+            shuffle=True,
             sampler=EventSampler(self.index_range) if self.index_range \
                 is not None else None
         )
@@ -167,6 +168,7 @@ class HyPERDataModule(LightningDataModule):
             num_workers=self.num_workers,
             persistent_workers=self.persistent_workers,
             drop_last=self.drop_last,
+            shuffle=True,
         )
 
     def predict_dataloader(self):

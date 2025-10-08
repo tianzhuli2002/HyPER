@@ -46,9 +46,9 @@ class HyPERDataset(InMemoryDataset):
             listdir(osp.join(self.root, "raw"))]
         # Filter self.names to only include the files that match input_name
         self.names = [name for name in self.names if name == self.name]
-        # Throw an error if no file matching input_name exists
+        # Throw an error if no file matching name exists
         if len(self.names) == 0:
-            raise FileNotFoundError(f"No file matching '{self.input_name}' found in the 'raw' directory.")
+            raise FileNotFoundError(f"No file matching '{self.name}' found in the 'raw' directory.")
         
         file_index = [i for i in range(len(self.names))
                             if self.names[i] == self.name]
@@ -308,9 +308,14 @@ class HyPERDataset(InMemoryDataset):
     def build_global_attributes(self, input_h5: h5py._hl.group.Group) -> torch.Tensor:
         
         """
-        
         """
         return torch.tensor(rf.structured_to_unstructured(input_h5["GLOBAL"][:]))[:].squeeze(1)
+    
+    def build_global_targets(self, labels_h5: h5py._hl.group.Group) -> torch.Tensor:
+        arr = np.asarray(labels_h5["GLOBAL"][:])          # e.g. shape [B] or [B,1]
+        if arr.ndim == 1:
+            arr = arr[:, None]                       # -> [B, 1]
+        return torch.from_numpy(arr).float() 
     
     def assign_node_ids(self,node_feature_array: torch.Tensor, labels_h5: h5py._hl.group.Group):
         
@@ -341,10 +346,10 @@ class HyPERDataset(InMemoryDataset):
         # Convert to torch tensor
         truthlabels = torch.tensor(truthlabels_np)
         # Remove padded events (padded events have to be hard-coded with np.nan)
-        remove_nan_mask = ~torch.isnan(truthlabels)
+        remove_nan_mask_2 = ~torch.isnan(truthlabels)
         # Apply the mask - 
         # this changes the shape from [Nevents,Nnodes] -> [total # nodes in dataset]
-        k2 = truthlabels[remove_nan_mask]
+        k2 = truthlabels[remove_nan_mask_2]
         
         # Use the cantor pairing function to assign a unique ID as a tensor
         cantor_pairing = lambda k1,k2: (k1+k2)*(k1+k2+1)/2 + k2
@@ -458,7 +463,8 @@ class HyPERDataset(InMemoryDataset):
                 'edge_attr_t'       : slice_edge_index,
                 'u'                 : slice_u_index ,
                 'hyperedge_index'   : slice_hyperedge_index, 
-                'hyperedge_attr_t'  : slice_hyperedge_index}
+                'hyperedge_attr_t'  : slice_hyperedge_index,
+                'cls_t'             : slice_u_index,}
            
         
     def process(self) -> None:
@@ -488,13 +494,17 @@ class HyPERDataset(InMemoryDataset):
             
             # Assign the local and Cantor node IDs
             self.node_ids = self.assign_node_ids(x,file['LABELS'])
+
+            # Constructing global target tensor
+            print("Building global target labels")
+            cls_t = self.build_global_targets(file['LABELS'])
             
-        # Construcrting edge index tensor
+        # Constructing edge index tensor
         print("Building edge indices")            
         self.build_edge_indices()
         # Constructing hyperedge index tensor
         print("Building hyperedge indices")    
-        self.build_hyperedge_indices(hyperedge_cardinality=3)
+        self.build_hyperedge_indices(hyperedge_cardinality=self.hyperedge_order)
         # Assign unique target ids
         # Constructing edge label tensor
         print("Building edge target labels")    
@@ -503,6 +513,7 @@ class HyPERDataset(InMemoryDataset):
         print("Building hyperedge target labels")    
         hyperedge_attr_t = self.find_matched_connections(self.cantor_hyperedge_index,self.target_hyperedge_ids)
         
+
         slices = self.generate_slices()   
             
         # Create data_dict
@@ -512,7 +523,9 @@ class HyPERDataset(InMemoryDataset):
                             edge_index      = self.edge_index,
                             hyperedge_index = self.hyperedge_index,
                             edge_attr_t     = edge_attr_t,
-                            hyperedge_attr_t= hyperedge_attr_t)
+                            hyperedge_attr_t= hyperedge_attr_t,
+                            cls_t           = cls_t,
+                            )
     
         # Apply the transforms if required
         if self.pre_transform is not None:

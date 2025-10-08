@@ -28,7 +28,8 @@ class HyperedgeModel(Module):
                           Linear(message_feats, message_feats),
                           ReLU(),
                           Dropout(p=dropout),
-                          Linear(message_feats, message_feats))
+                          Linear(message_feats, message_feats)
+                        )
         self.weight = Parameter(torch.empty((message_feats, message_feats)))
         self.x_hat  = Seq(Linear(message_feats*2, message_feats),
                           ReLU(),
@@ -36,8 +37,9 @@ class HyperedgeModel(Module):
                           Linear(message_feats, message_feats),
                           ReLU(),
                           Dropout(p=dropout),
-                          Linear(message_feats, node_out_channels),
-                          Sigmoid())
+                          Linear(message_feats, message_feats)
+                        )
+                        #   Sigmoid())
         self.reset_parameters()
 
     def reset_parameters(self):

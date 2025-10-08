@@ -1,10 +1,13 @@
 import torch
 
-from torch.nn import BCELoss, Sigmoid
+from torch.nn import Sequential as Seq, Linear, BCELoss, Sigmoid
 from torch.optim import lr_scheduler, Adam
 from torch_geometric.utils import unbatch, degree
 from lightning import LightningModule
-from HyPER.models import MPNNs, HyperedgeModel, HyperedgeLoss, EdgeLoss, CombinedLoss
+from .MPNNs import MPNNs
+from .hyperedge import HyperedgeModel
+from .classification import classificationModel
+from .loss import ClassificationLoss, HyperedgeLoss, EdgeLoss, CombinedLoss
 from HyPER.evaluation import Accuracy
 from torchmetrics.classification import BinaryAccuracy
 from typing import Optional
@@ -46,6 +49,7 @@ class HyPERModel(LightningModule):
             optimizer: Optional[str] = "Adam",
             lr: Optional[float] = 1e-3,
             alpha: Optional[float] = 0.5,
+            beta: Optional[float] = 0.5,
             reduction: Optional[str] = 'mean'
         ):
         super().__init__()
@@ -62,14 +66,14 @@ class HyPERModel(LightningModule):
                         )
                 )
 
-            elif i == self.hparams.message_passing_recurrent-1:
-                setattr(self, 'MessagePassing' + str(i),
-                        MPNNs(
-                            self.hparams.message_feats, self.hparams.message_feats, self.hparams.message_feats,
-                            node_out_channels = self.hparams.message_feats, edge_out_channels = 1, global_out_channels = self.hparams.message_feats,
-                            message_feats = self.hparams.message_feats, dropout = self.hparams.dropout, activation = Sigmoid(), p_out = 'edge'
-                        )
-                )
+            # elif i == self.hparams.message_passing_recurrent-1:
+            #     setattr(self, 'MessagePassing' + str(i),
+            #             MPNNs(
+            #                 self.hparams.message_feats, self.hparams.message_feats, self.hparams.message_feats,
+            #                 node_out_channels = self.hparams.message_feats, edge_out_channels = 1, global_out_channels = self.hparams.message_feats,
+            #                 message_feats = self.hparams.message_feats, dropout = self.hparams.dropout, activation = Sigmoid(), p_out = 'edge'
+            #             )
+            #     )
 
             else:
                 setattr(self, 'MessagePassing' + str(i),
@@ -85,6 +89,17 @@ class HyPERModel(LightningModule):
             message_feats = self.hparams.contraction_feats, dropout = self.hparams.dropout
         )
 
+        self.Classification = classificationModel(
+            n_feats_out=1,
+            contraction_feats=self.hparams.contraction_feats,
+            message_feats=self.hparams.message_feats,
+            dropout=self.hparams.dropout
+        )
+
+        self.he_head  = Seq(Linear(self.hparams.contraction_feats, 1), Sigmoid()) # last layer for hyperedges
+        self.ge_head  = Seq(Linear(self.hparams.message_feats, 1), Sigmoid()) # last layer for edges
+
+
     def forward(self, x, edge_index, edge_attr, u, batch, hyperedge_index, hyperedge_index_batch):
         # Message Passing Step
         for i in range(self.hparams.message_passing_recurrent):
@@ -97,9 +112,19 @@ class HyPERModel(LightningModule):
                     x_prime, edge_index, edge_attr_prime, u_prime, batch
                 )
 
-        # Hyperedge Finding Step
+        # Hyperedge Step
         x_hat, batch_hyperedge  = self.Hyperedge(x_prime, u_prime, batch, hyperedge_index, hyperedge_index_batch, self.hparams.hyperedge_order)
-        return x_hat, batch_hyperedge, edge_attr_prime
+        
+        # Classification step
+        _, col = edge_index
+        batch_edges = batch[col] # [N_ge]
+        x_class = self.Classification(x_hat, edge_attr_prime, batch_edges, batch_hyperedge)
+
+        # Last layer + sigmoid
+        p_hyper = self.he_head(x_hat)             # [N_he, 1]
+        p_edge  = self.ge_head(edge_attr_prime)    # [N_ge, 1]
+
+        return p_hyper, batch_hyperedge, p_edge, x_class
 
     def _shared_step(self, data):
         return self.forward(data.x, data.edge_index, data.edge_attr, data.u, data.batch, data.hyperedge_index, data.hyperedge_index_batch)
@@ -115,16 +140,16 @@ class HyPERModel(LightningModule):
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
-                "scheduler": lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.8, patience=10),
+                "scheduler": lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=10),
                 "interval": "epoch",
-                "monitor": "fuzzy_accuracy/validation_accuracy_hyperedge",
+                "monitor": "loss/validation_loss_epoch",
                 "frequency": 1,
                 "strict": True
             },
         }
 
     def training_step(self, train_batch, batch_idx):
-        x_hat, batch_hyperedge, edge_attr_prime = self._shared_step(train_batch)
+        x_hat, batch_hyperedge, edge_attr_prime, x_class = self._shared_step(train_batch)
 
         # Train Loss Calculation
         if str(self.hparams.criterion_edge).lower() == 'bce':
@@ -143,9 +168,10 @@ class HyPERModel(LightningModule):
         else:
             raise ValueError("Supported edge loss functions are: `torch.BCELoss`.")
 
+        loss_class = ClassificationLoss(x_class, train_batch.cls_t, criterion=BCELoss(reduction='none'))
         loss_edge = EdgeLoss(edge_attr_prime, train_batch.edge_attr_t, train_batch.edge_attr_batch, criterion=criterion_edge, reduction='mean')
         loss_hyperedge, loss_hyperedge_masks = HyperedgeLoss(x_hat, train_batch.hyperedge_attr_t.float(), batch_hyperedge, criterion_hyperedge, reduction='mean')
-        loss = CombinedLoss(loss_edge, loss_hyperedge, alpha=self.hparams.alpha, reduction=self.hparams.reduction, loss_hyperedge_masks=loss_hyperedge_masks)
+        loss = CombinedLoss(loss_edge, loss_hyperedge, loss_class, train_batch.cls_t, alpha=self.hparams.alpha, beta=self.hparams.beta, reduction=self.hparams.reduction, loss_hyperedge_masks=loss_hyperedge_masks)
 
         # Logging
         self.log('loss/train_loss', loss, batch_size=len(train_batch), on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
@@ -153,7 +179,7 @@ class HyPERModel(LightningModule):
         return loss
 
     def validation_step(self, val_batch, batch_idx):
-        x_hat, batch_hyperedge, edge_attr_prime = self._shared_step(val_batch)
+        x_hat, batch_hyperedge, edge_attr_prime, x_class = self._shared_step(val_batch)
 
         # Validation Loss Calculation
         if str(self.hparams.criterion_edge).lower() == 'bce':
@@ -172,27 +198,39 @@ class HyPERModel(LightningModule):
         else:
             raise ValueError("Supported edge loss functions are: `torch.BCELoss`.")
 
+        loss_class = ClassificationLoss(x_class, val_batch.cls_t, criterion=BCELoss(reduction='none'))
         loss_edge = EdgeLoss(edge_attr_prime, val_batch.edge_attr_t, val_batch.edge_attr_batch, criterion=criterion_edge, reduction='mean')
         loss_hyperedge, loss_hyperedge_masks = HyperedgeLoss(x_hat, val_batch.hyperedge_attr_t.float(), batch_hyperedge, criterion_hyperedge, reduction='mean')
-        loss = CombinedLoss(loss_edge, loss_hyperedge, alpha=self.hparams.alpha, reduction=self.hparams.reduction, loss_hyperedge_masks=loss_hyperedge_masks)
+        loss = CombinedLoss(loss_edge, loss_hyperedge, loss_class, val_batch.cls_t, alpha=self.hparams.alpha, beta=self.hparams.beta, reduction=self.hparams.reduction, loss_hyperedge_masks=loss_hyperedge_masks)
 
         # Validation Accuracy Calculation
-        accuracy_edge = BinaryAccuracy(ignore_index=0).to(edge_attr_prime)
-        accuracy_hyperedge = Accuracy(x_hat, val_batch.hyperedge_attr_t.float(), batch_hyperedge, num_patterns=2)
+        
+        # Not considering bkg events for the reco accuracy
+        graph_mask = (val_batch.cls_t.squeeze(-1) == 1)               
+        ge_keep  = graph_mask[val_batch.edge_attr_batch]      
+        he_keep = graph_mask[batch_hyperedge]
+
+        accuracy_class = BinaryAccuracy().to(x_class)
+        accuracy_edge  = BinaryAccuracy(ignore_index=0).to(edge_attr_prime)
+        # accuracy_hyperedge = Accuracy(x_hat[he_keep], val_batch.hyperedge_attr_t[he_keep].float(), batch_hyperedge[he_keep], num_patterns=2)
 
         # Logging
         self.log('loss/validation_loss', loss, batch_size=len(val_batch), on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-        self.log('fuzzy_accuracy/validation_accuracy_edge', accuracy_edge(edge_attr_prime.flatten(), val_batch.edge_attr_t.float().flatten()),
+        self.log('fuzzy_accuracy/validation_accuracy_class', accuracy_class(x_class.flatten(), val_batch.cls_t.float().flatten()),
                  batch_size=len(val_batch), on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-        self.log('fuzzy_accuracy/validation_accuracy_hyperedge', accuracy_hyperedge, batch_size=len(val_batch), on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('fuzzy_accuracy/validation_accuracy_edge', accuracy_edge(edge_attr_prime.flatten()[ge_keep], val_batch.edge_attr_t.float().flatten()[ge_keep]),
+                 batch_size=len(val_batch), on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        # if accuracy_hyperedge is not None:
+        #     self.log('fuzzy_accuracy/validation_accuracy_hyperedge', accuracy_hyperedge, batch_size=len(val_batch), on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        x_hat, batch_hyperedge, edge_attr_prime = self._shared_step(batch)
+        x_hat, batch_hyperedge, edge_attr_prime, x_class = self._shared_step(batch)
 
         # Unbatch results
         x_out         = unbatch(x_hat, batch_hyperedge.type(torch.int64), 0)
         edge_attr_out = unbatch(edge_attr_prime, batch.edge_attr_batch, 0)
         N_nodes       = degree(batch.batch).cpu().flatten().tolist()
         encodings     = unbatch(batch.x[:,-1].reshape(-1,1),batch.batch, 0)
+        x_class_out       = x_class.squeeze(-1)
 
-        return x_out, edge_attr_out, N_nodes, encodings
+        return x_out, edge_attr_out, N_nodes, encodings, x_class_out
