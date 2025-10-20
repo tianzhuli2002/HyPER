@@ -90,10 +90,21 @@ def Train(cfg : DictConfig) -> None:
         logger = TensorBoardLogger(save_dir=cfg['savedir'], name="", log_graph=True),
     )
 
-    if cfg['continue_from_ckpt'] is not None:
-        print("Resume training state from %s"%(cfg['continue_from_ckpt']))
+    if cfg['continue_from_ckpt'] is not None and cfg['reset_params'] is True:
+        print("Resume training state from %s, using new hyperparameters"%(cfg['continue_from_ckpt']))
 
-    trainer.fit(model, datamodule=datamodule, ckpt_path=cfg['continue_from_ckpt'])
+        ckpt = torch.load(cfg['continue_from_ckpt'], map_location='cpu')
+        model.load_state_dict(ckpt['state_dict'], strict=True)
+
+        trainer.fit(model, datamodule=datamodule)
+
+    elif cfg['continue_from_ckpt'] is not None:
+        print("Resume training from %s"%(cfg['continue_from_ckpt']))
+
+        trainer.fit(model, datamodule=datamodule, ckpt_path=cfg['continue_from_ckpt'])
+    
+    else:
+        trainer.fit(model, datamodule=datamodule)
 
 
 if __name__ == '__main__':

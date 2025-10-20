@@ -212,7 +212,7 @@ def ttbar_single_lep_cluster(HyPER_outputs: str | pd.DataFrame):
 
 def ttbar_single_lep_alt(HyPER_outputs: str | pd.DataFrame):
     r"""Reconstruct ttbar events with lepton+jets final states.
-
+        Here we take hyperedge with best (edge + hyperedge)/2 score.
     """
     if   type(HyPER_outputs) is pd.DataFrame:
         results = HyPER_outputs
@@ -377,14 +377,19 @@ def ttbar_single_lep_alt(HyPER_outputs: str | pd.DataFrame):
         'HyPER_best_top1',
         'HyPER_best_top2',
         'HyPER_best_w1',
-        'HyPER_best_w2'
+        'HyPER_best_w2',
+        'HyPER_best_top1_prob',
+        'HyPER_best_top2_prob',
+        'HyPER_best_w1_prob',
+        'HyPER_best_w2_prob',
+        'HyPER_CLS_RAW'
     ]
 
     # Filter results to include only the selected columns (else pickle file might be too heavy)
     #TO DO: add this as an option in the config file
     light_results = results[columns_to_return]
 
-    return results
+    return light_results
 
 def ttbar_single_lep(HyPER_outputs: str | pd.DataFrame):
     r"""Reconstruct ttbar events with lepton+jets final states.

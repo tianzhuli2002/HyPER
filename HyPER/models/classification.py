@@ -4,6 +4,7 @@ import math
 from torch.nn import Module, Sequential as Seq, Linear, ReLU, Dropout, Sigmoid, Parameter, init
 from torch.nn.functional import relu
 from torch_geometric.utils import scatter
+from HyPER.utils.custom_scatter import custom_scatter
 
 class classificationModel(Module):
     r"""Classification MLP Model.
@@ -40,15 +41,20 @@ class classificationModel(Module):
         feat_GE:  [N_ge, F]    edge features
         batch_HE: [N_he]       graph ids (0..B-1)
         batch_GE: [N_ge]       graph ids (0..B-1)
-        returns:  [B, n_feats_out]
+        returns:  [num_events, n_feats_out]
         """
-        B = int(batch_HE.max()) + 1 # number of events
-        
+        num_events = int(batch_HE.max()) + 1 # number of events
+        # num_events = batch_HE.max().to(torch.int64) + 1 # number of events
+
         # Aggregation of hyperedges, edges along the features: mean and max
-        he_mean = scatter(feat_HE, batch_HE, dim=0, dim_size=B, reduce='mean')  # [B, F]
-        he_max  = scatter(feat_HE, batch_HE, dim=0, dim_size=B, reduce='max')   # [B, F]
-        ge_mean = scatter(feat_GE, batch_GE, dim=0, dim_size=B, reduce='mean')  # [B, F]
-        ge_max  = scatter(feat_GE, batch_GE, dim=0, dim_size=B, reduce='max')   # [B, F]
+        he_mean = scatter(feat_HE, batch_HE, dim=0, dim_size=num_events, reduce='mean')  # [num_events, F]
+        # he_mean = scatter(feat_HE, batch_HE, dim=0, dim_size=num_events.item(), reduce='mean')  # [num_events, F]
+        he_max  = scatter(feat_HE, batch_HE, dim=0, dim_size=num_events, reduce='max')  # [num_events, F]
+        # he_max = custom_scatter(feat_HE, batch_HE, dim=0, dim_size=num_events.item(), reduce='amax')   # [num_events, F]
+        ge_mean = scatter(feat_GE, batch_GE, dim=0, dim_size=num_events, reduce='mean')  # [num_events, F]
+        # ge_mean = scatter(feat_GE, batch_GE, dim=0, dim_size=num_events.item(), reduce='mean')  # [num_events, F]
+        ge_max  = scatter(feat_GE, batch_GE, dim=0, dim_size=num_events, reduce='max')   # [num_events, F]
+        # ge_max = custom_scatter(feat_GE, batch_GE, dim=0, dim_size=num_events.item(), reduce='amax')   # [num_events, F]
 
         # Then concatenate hyperedge features with edge features
         x_in = torch.cat([he_mean, he_max, ge_mean, ge_max], dim=1).float()

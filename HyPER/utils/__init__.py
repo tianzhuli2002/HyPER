@@ -5,5 +5,6 @@ from .connectivity import getUndirectedEdges
 __all__ = [
     'ResultWriter',
     'softmax',
-    'getUndirectedEdges'
+    'getUndirectedEdges',
+    'custom_scatter'
 ]
