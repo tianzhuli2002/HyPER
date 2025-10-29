@@ -57,14 +57,15 @@ def Onnx(cfg : DictConfig) -> None:
         ),
         dynamo=True,
         opset_version=18,
-        input_names=['x_s', 'edge_index', 'edge_attr_s', 'u_s', 'batch', 'edge_index_h', 'edge_index_h_batch'],
+        input_names=['x_s', 'edge_index', 'edge_attr_s', 'u_s', 'batch', 'edge_index_h', 'batch_hyperedge'],
         dynamic_shapes={'x_s'               : {0 : Dim.DYNAMIC},
                         'edge_index'        : {1 : Dim.DYNAMIC},
                         'edge_attr_s'       : {0 : Dim.DYNAMIC},
                         'u_s'               : {0 : Dim.DYNAMIC},
                         'batch'             : {0 : Dim.DYNAMIC},
                         'edge_index_h'      : {1 : Dim.DYNAMIC},
-                        'edge_index_h_batch': {0 : Dim.DYNAMIC}}
+                        'batch_hyperedge': {0 : Dim.DYNAMIC}},
+        output_names = ['hyperedge_prime','batch_hyperedge','edge_prime'],
     )
     
     onnx_program.optimize()
