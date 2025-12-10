@@ -168,10 +168,6 @@ class HyPERModel(LightningModule):
         else:
             raise ValueError("Supported edge loss functions are: `torch.BCELoss`.")
 
-        x_class = x_class.clamp(min=1e-6, max=1 - 1e-6)
-
-
-        
         loss_class = ClassificationLoss(x_class, train_batch.cls_t, criterion=BCELoss(reduction='none'))
         loss_edge,loss_edge_masks = EdgeLoss(edge_attr_prime, train_batch.edge_attr_t, train_batch.edge_attr_batch, criterion=criterion_edge, reduction='mean')
         loss_hyperedge, loss_hyperedge_masks = HyperedgeLoss(x_hat, train_batch.hyperedge_attr_t.float(), batch_hyperedge, criterion_hyperedge, reduction='mean')
