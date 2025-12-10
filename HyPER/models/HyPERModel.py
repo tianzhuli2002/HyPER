@@ -168,10 +168,14 @@ class HyPERModel(LightningModule):
         else:
             raise ValueError("Supported edge loss functions are: `torch.BCELoss`.")
 
+        x_class = x_class.clamp(min=1e-6, max=1 - 1e-6)
+
+
+        
         loss_class = ClassificationLoss(x_class, train_batch.cls_t, criterion=BCELoss(reduction='none'))
-        loss_edge = EdgeLoss(edge_attr_prime, train_batch.edge_attr_t, train_batch.edge_attr_batch, criterion=criterion_edge, reduction='mean')
+        loss_edge,loss_edge_masks = EdgeLoss(edge_attr_prime, train_batch.edge_attr_t, train_batch.edge_attr_batch, criterion=criterion_edge, reduction='mean')
         loss_hyperedge, loss_hyperedge_masks = HyperedgeLoss(x_hat, train_batch.hyperedge_attr_t.float(), batch_hyperedge, criterion_hyperedge, reduction='mean')
-        loss = CombinedLoss(loss_edge, loss_hyperedge, loss_class, train_batch.cls_t, alpha=self.hparams.alpha, beta=self.hparams.beta, reduction=self.hparams.reduction, loss_hyperedge_masks=loss_hyperedge_masks)
+        loss = CombinedLoss(loss_edge, loss_hyperedge, loss_class, train_batch.cls_t, alpha=self.hparams.alpha, beta=self.hparams.beta, reduction=self.hparams.reduction, loss_hyperedge_masks=loss_hyperedge_masks,loss_edge_masks=loss_edge_masks)
 
         # Logging
         self.log('loss/train_loss', loss, batch_size=len(train_batch), on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
@@ -199,10 +203,10 @@ class HyPERModel(LightningModule):
             raise ValueError("Supported edge loss functions are: `torch.BCELoss`.")
 
         loss_class = ClassificationLoss(x_class, val_batch.cls_t, criterion=BCELoss(reduction='none'))
-        loss_edge = EdgeLoss(edge_attr_prime, val_batch.edge_attr_t, val_batch.edge_attr_batch, criterion=criterion_edge, reduction='mean')
+        loss_edge,loss_edge_masks = EdgeLoss(edge_attr_prime, val_batch.edge_attr_t, val_batch.edge_attr_batch, criterion=criterion_edge, reduction='mean')
         loss_hyperedge, loss_hyperedge_masks = HyperedgeLoss(x_hat, val_batch.hyperedge_attr_t.float(), batch_hyperedge, criterion_hyperedge, reduction='mean')
-        loss = CombinedLoss(loss_edge, loss_hyperedge, loss_class, val_batch.cls_t, alpha=self.hparams.alpha, beta=self.hparams.beta, reduction=self.hparams.reduction, loss_hyperedge_masks=loss_hyperedge_masks)
-
+        loss = CombinedLoss(loss_edge, loss_hyperedge, loss_class, val_batch.cls_t, alpha=self.hparams.alpha, beta=self.hparams.beta, reduction=self.hparams.reduction, loss_hyperedge_masks=loss_hyperedge_masks,loss_edge_masks=loss_edge_masks)
+        
         # Validation Accuracy Calculation
         
         # Not considering bkg events for the reco accuracy
@@ -223,6 +227,27 @@ class HyPERModel(LightningModule):
         # if accuracy_hyperedge is not None:
         #     self.log('fuzzy_accuracy/validation_accuracy_hyperedge', accuracy_hyperedge, batch_size=len(val_batch), on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
+        # --- Compute simple S/B counts for the event-level classifier (x_class) ---
+        # x_class shape: [N_events, 1] or [N_events]
+        preds = (x_class.view(-1) > 0.5).to(torch.int32)
+        labels = val_batch.cls_t.view(-1).to(torch.int32)
+
+        tp = torch.sum(((preds == 1) & (labels == 1)).to(torch.int32)).cpu()
+        fp = torch.sum(((preds == 1) & (labels == 0)).to(torch.int32)).cpu()
+
+        eps = 1e-8
+        s_over_b_batch = tp.float() / (fp.float() + eps)
+
+        # Log it live to TensorBoard
+        self.log('metrics/validation_S_over_B_batch', s_over_b_batch,
+                batch_size=len(val_batch),
+                on_step=True,      # log per batch
+                on_epoch=True,    # don't accumulate for epoch here
+                prog_bar=True,
+                logger=True,
+                sync_dist=True)    
+        return {'tp': tp, 'fp': fp, 'batch_size': len(val_batch)}
+        
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         x_hat, batch_hyperedge, edge_attr_prime, x_class = self._shared_step(batch)
 

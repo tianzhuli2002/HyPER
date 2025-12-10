@@ -33,7 +33,14 @@ def EdgeLoss(edge_attr_out: Tensor, edge_attr_t: Tensor, edge_attr_batch: Tensor
     :rtype: :class:`Tensor`
     """
     l = criterion(edge_attr_out, edge_attr_t.float())
-    return scatter(l.flatten(), edge_attr_batch, reduce=reduction)
+
+    # build loss masks per graph/event: which edges have truth at all
+    loss_masks = scatter(edge_attr_t.flatten(), edge_attr_batch, reduce='sum') > 0
+
+    # reduce per-event
+    per_event_loss = scatter(l.flatten(), edge_attr_batch, reduce=reduction)
+
+    return per_event_loss, loss_masks
 
 
 def HyperedgeLoss(x_out: Tensor, x_t: Tensor, x_t_batch: Tensor,
@@ -55,40 +62,59 @@ def HyperedgeLoss(x_out: Tensor, x_t: Tensor, x_t_batch: Tensor,
     return l, loss_masks
 
 
+    
 def CombinedLoss(loss_hyperedge: Tensor, loss_edge: Tensor, loss_class: Tensor, 
                  cls_target: Tensor, alpha: Optional[float] = 0.5, beta: Optional[float] = 0.5, reduction: Optional[str] = 'mean',
-                 loss_hyperedge_masks: Optional[Tensor] = None) -> Tensor:
-    r"""Get combined loss.
+                 loss_hyperedge_masks: Optional[Tensor] = None, loss_edge_masks: Optional[Tensor] = None) -> Tensor:
 
-    Args:
-        loss_hyperedge (Tensor): hyperedge loss.
-        loss_edge (Tensor): edge loss.
-        alpha (optional: Tensor): hyperedge loss weight (default: 0.5)
-        reduction (optional: str): the reduce operation (default: 'mean').
+    eps = 1e-8
 
-    :rtype: :class:`Tensor`
-    """
+    # ----- Flatten everything -----
+    loss_edge = loss_edge.flatten()
+    loss_hyperedge = loss_hyperedge.flatten()
+    loss_class = loss_class.flatten()
+    cls_mask = cls_target.flatten() > 0  # signal = True
+    
+        # Compute class weights
+    n_sig = cls_mask.sum().float()
+    n_bkg = (~cls_mask).sum().float()
+    w_sig = (n_sig + n_bkg) / (2.0 * n_sig + eps)
+    w_bkg = (n_sig + n_bkg) / (2.0 * n_bkg + eps)
+
+    weights = torch.where(cls_mask, w_sig, w_bkg)
+
+    # Apply weights to BCE loss
+    
+
+
+    # ----- Apply masks to drop unmatched truth entries -----
+    if loss_edge_masks is not None:
+        loss_edge_masks = loss_edge_masks.flatten().float()
+        loss_edge = loss_edge * loss_edge_masks
+        # normalise ONLY by number of valid edges
+        edge_den = loss_edge_masks.sum() + eps
+        edge_loss = loss_edge.sum() / edge_den
+    else:
+        edge_loss = loss_edge.mean()
+
     if loss_hyperedge_masks is not None:
-         # Ignore `loss_hyperedge` for an event that has no labelled hyperedges:
-        with torch.no_grad():
-            device = loss_hyperedge.device
-            loss_shape = loss_hyperedge.shape
+        loss_hyperedge_masks = loss_hyperedge_masks.flatten().float()
+        loss_hyperedge = loss_hyperedge * loss_hyperedge_masks
+        hyp_den = loss_hyperedge_masks.sum() + eps
+        hyper_loss = loss_hyperedge.sum() / hyp_den
+    else:
+        hyper_loss = loss_hyperedge.mean()
 
-            alpha = torch.full(loss_shape, alpha, device=device)
-            alpha = torch.scatter(torch.zeros(loss_shape, device=device), 0, loss_hyperedge_masks.nonzero().flatten(), alpha)
+    # ----- Reconstruction loss only on signal events -----
+    # (background = no truth structure → no reconstruction)
+    if cls_mask.any():
+        reco_loss = alpha * hyper_loss + (1 - alpha) * edge_loss
+    else:
+        reco_loss = loss_hyperedge.new_tensor(0.0)
 
-    # Not considering the reco loss for bkg events
-    l = cls_target.flatten() * (( alpha * loss_hyperedge ) + ( (1-alpha) * loss_edge )) * (1-beta) + beta * loss_class
+    # ----- Classification is always applied -----
+    #class_loss = loss_class.mean()
+    class_loss = (loss_class * weights).sum() / (weights.sum() + eps)
 
-    if reduction == 'mean':
-        rd = torch.mean
-    elif reduction == 'max':
-        rd = torch.max
-    elif reduction == 'min':
-        rd = torch.min
-    elif reduction == 'sum':
-        rd = torch.sum
-    # ------- custom reduction func -------
-    # elif
-    # -------------------------------------
-    return rd(l)
+    # ----- Combine -----
+    return (1 - beta) * reco_loss + beta * class_loss
