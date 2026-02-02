@@ -43,7 +43,7 @@ class classificationModel(Module):
         batch_GE: [N_ge]       graph ids (0..B-1)
         returns:  [num_events, n_feats_out]
         """
-        num_events = int(batch_HE.max()) + 1 # number of events
+        num_events = batch_HE.max() + 1 # number of events
         # num_events = batch_HE.max().to(torch.int64) + 1 # number of events
 
         # Aggregation of hyperedges, edges along the features: mean and max

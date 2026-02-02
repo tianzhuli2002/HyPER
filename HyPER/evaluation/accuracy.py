@@ -1,55 +1,58 @@
 import torch
-
 from torch import Tensor
-from torch_scatter import scatter_max
 from torchmetrics.functional.classification import binary_accuracy
 
 
-def _index_delete_(src: Tensor, idx: Tensor) -> Tensor:
-    mask = torch.ones(src.numel(), dtype=torch.bool, device=src.device)
-    mask[idx] = False
-    return src[mask]
-
-
-def Accuracy(preds: Tensor, target: Tensor, batch: Tensor, num_patterns: int) -> Tensor:
-    r"""Compute model accuracy for the reconstruction task.
+def Accuracy(
+    preds: Tensor,
+    target: Tensor,
+    batch: Tensor,
+    num_patterns: int,
+) -> Tensor:
+    """
+    Compute hyperedge fuzzy accuracy:
+    - For each graph in `batch`, select top-k predicted hyperedges
+    - Compare against truth hyperedges using binary accuracy
 
     Args:
-        preds (Tensor): a float tensor with shape (N,...), contains 
-                        outputs of the reconstruction network.
-        target (Tensor): a float tensor with shape (N,...), contains
-                         truth hyperedges.
-        batch (Tensor): an int tensor with shape (N,...), contains
-                        batched indicies.
-        num_patterns (int): number of truth patterns available in a graph. 
+        preds (Tensor): shape [N, 1] or [N]
+        target (Tensor): shape [N, 1] or [N]
+        batch (Tensor): shape [N], graph index per hyperedge
+        num_patterns (int): number of true patterns per graph
 
-    :rtype: :class:`torch.Tensor`
+    Returns:
+        Tensor or None
     """
     if preds.numel() == 0:
         return None
-    picked = 0
-    idx_preds = 0; src_preds = 0
-    
+
     device = preds.device
 
-    preds = preds.flatten()
+    preds = preds.view(-1)
+    target = target.view(-1)
+    batch = batch.view(-1)
 
-    while picked < num_patterns:
-        # remove the previous iteration's highest score
-        if picked >= 1:
-            preds = torch.scatter(preds,dim=0,index=idx_preds,src=torch.zeros(idx_preds.size(),device=device))
-        
-        src_preds, idx_preds = scatter_max(preds,batch)
+    evaluable = torch.zeros_like(preds, device=device)
 
-        if picked == 0:
-            evaluable = torch.scatter(torch.zeros(preds.size(),device=device),dim=0,index=idx_preds,src=src_preds)
-        else:
-            evaluable = torch.scatter(evaluable,dim=0,index=idx_preds,src=src_preds)
+    # Iterate per graph (safe and correct)
+    for g in batch.unique():
+        mask = batch == g
+        if mask.sum() == 0:
+            continue
 
-        picked += 1
+        p_g = preds[mask]
 
-    # accuracy = binary_accuracy(evaluable,target.flatten(),ignore_index=0,threshold=0.00)
-    accuracy = binary_accuracy(evaluable,target.flatten(),threshold=0.00)
+        # pick top-k predictions inside this graph
+        k = min(num_patterns, p_g.numel())
+        topk_idx = torch.topk(p_g, k=k, largest=True).indices
 
-    return accuracy
+        # map back to global indices
+        global_idx = torch.nonzero(mask, as_tuple=False).view(-1)[topk_idx]
+        evaluable[global_idx] = preds[global_idx]
 
+    # Compute fuzzy accuracy
+    return binary_accuracy(
+        evaluable,
+        target,
+        threshold=0.0,
+    )

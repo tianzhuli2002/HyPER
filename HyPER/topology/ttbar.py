@@ -4,6 +4,134 @@ import pandas as pd
 from itertools import combinations
 from tqdm.rich import tqdm
 
+
+def ttbar_dilep(HyPER_outputs: str | pd.DataFrame):
+    r"""Reconstruct ttbar events with di-leptonic final states.
+
+    """
+    if   type(HyPER_outputs) is pd.DataFrame:
+        results = HyPER_outputs
+    elif type(HyPER_outputs) is str:
+        results = pd.read_pickle(HyPER_outputs)
+    else:
+        raise ValueError(f"Unrecognised HyPER output type {type(HyPER_outputs)}, it must be `str` or `pandas.DataFrame`.")
+    
+    #results["event_idx"] = np.arange(len(results))
+
+    # Current strategy is to not consider the hyperedge (still keeping the score in outputs, expect huge correlation)
+    HyPER_best_top1 = []
+    HyPER_best_top2 = []
+    #HyPER_best_HE = []
+    
+    HyPER_best_top1_score   = []
+    HyPER_best_top2_score   = []
+    HyPER_best_event_score  = [] # hyperedge of order 4
+
+   
+    # TO DO: save hyperedge score corresponding to the selected graph edges
+    for i in tqdm(range(len(results)), desc="Reconstructing", unit='event'):
+        HE_IDX = results['HyPER_HE_IDX'][i]
+        HE_RAW = results['HyPER_HE_RAW'][i]
+        GE_IDX = results['HyPER_GE_IDX'][i]
+        GE_RAW = results['HyPER_GE_RAW'][i]
+
+        HE_VCT = results['HyPER_HE_VCT'][i]
+        skip_event = False
+        selected_HE = []    # Selected HyperEdge
+        softProb_HE = []    # Soft probability of the selected HyperEdge
+        selected_GE = []    # Selected GraphEdge
+        softProb_GE = []    # Soft probability of the selected GraphEdge
+
+        completed_patterns = 0
+        rank = np.argsort(GE_RAW)
+        p    = -1           # current position
+
+        # We need 2 top quarks
+        while completed_patterns < 2:
+            if completed_patterns == 0:
+                pass
+            
+            if completed_patterns > 0:
+                # for pattern in selected_GE:
+                #     while len(set(pattern).intersection(set(GE_IDX[rank[p]]))) != 0:
+                #         p -= 1
+                        
+                for pattern in selected_GE:
+                    while True:
+                        if abs(p) > len(rank):
+                            skip_event = True
+                            break
+
+                        if len(set(pattern).intersection(GE_IDX[rank[p]])) == 0:
+                            break
+
+                        p -= 1
+
+            if skip_event:
+                break
+
+            # print(f"Selected pattern {GE_IDX[rank[p]]} with rank {rank[p]} and score {GE_RAW[rank[p]]}")
+
+            selected_GE.append(GE_IDX[rank[p]])
+            softProb_GE.append(GE_RAW[rank[p]])
+
+            p -= 1
+            completed_patterns += 1
+
+        if skip_event or len(selected_GE) < 2:
+            HyPER_best_top1.append(None)
+            HyPER_best_top2.append(None)
+            HyPER_best_top1_score.append(0.0)
+            HyPER_best_top2_score.append(0.0)
+            HyPER_best_event_score.append(0.0)
+            continue
+        
+        hyperedge_to_find = set(selected_GE[0]) | set(selected_GE[1]) # Union of the edges
+
+        # Find the hyperedge
+        matched_HE_index = None
+        for j, he in enumerate(HE_IDX):
+            if hyperedge_to_find.issubset(set(he)):
+                matched_HE_index = j
+                break
+
+        HyPER_best_top1.append(selected_GE[0])
+        HyPER_best_top2.append(selected_GE[1])
+
+        HyPER_best_top1_score.append(softProb_GE[0])
+        HyPER_best_top2_score.append(softProb_GE[1])
+        # print("Matched_HE_index:", matched_HE_index)
+        # print("len(HE_RAW):", len(HE_RAW))
+        #print(f"Matched HE index {matched_HE_index} with score {HE_RAW[matched_HE_index]}")
+        if matched_HE_index is None or matched_HE_index >= len(HE_RAW):
+            HyPER_best_event_score.append(0.0)
+        else:
+            HyPER_best_event_score.append(HE_RAW[matched_HE_index])
+
+        #HyPER_best_event_score.append(HE_RAW[matched_HE_index])
+        
+
+    results['HyPER_best_top1'] = HyPER_best_top1
+    results['HyPER_best_top2'] = HyPER_best_top2
+
+    results['HyPER_best_top1_score']    = HyPER_best_top1_score
+    results['HyPER_best_top2_score']    = HyPER_best_top2_score
+    results['HyPER_best_event_score']   = HyPER_best_event_score
+    #results['HyPER_CLS_RAW']            = results['HyPER_CLS_RAW']  # just to be sure it's there
+    columns_to_return = [
+        'HyPER_best_top1',
+        'HyPER_best_top2',
+        'HyPER_best_top1_score',
+        'HyPER_best_top2_score',
+        'HyPER_CLS_RAW'
+    ]
+
+    # Filter results to include only the selected columns (else pickle file might be too heavy)
+    #TO DO: add this as an option in the config file
+    light_results = results[columns_to_return]
+    
+    return light_results #light_results
+
 def ttbar_single_lep_cluster(HyPER_outputs: str | pd.DataFrame):
     r"""Reconstruct ttbar events with lepton+jets final states.
 

@@ -212,7 +212,7 @@ class HyPERModel(LightningModule):
 
         accuracy_class = BinaryAccuracy().to(x_class)
         accuracy_edge  = BinaryAccuracy(ignore_index=0).to(edge_attr_prime)
-        # accuracy_hyperedge = Accuracy(x_hat[he_keep], val_batch.hyperedge_attr_t[he_keep].float(), batch_hyperedge[he_keep], num_patterns=2)
+        accuracy_hyperedge = Accuracy(x_hat[he_keep], val_batch.hyperedge_attr_t[he_keep].float(), batch_hyperedge[he_keep], num_patterns=2)
 
         # Logging
         self.log('loss/validation_loss', loss, batch_size=len(val_batch), on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
@@ -220,12 +220,12 @@ class HyPERModel(LightningModule):
                  batch_size=len(val_batch), on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
         self.log('fuzzy_accuracy/validation_accuracy_edge', accuracy_edge(edge_attr_prime.flatten()[ge_keep], val_batch.edge_attr_t.float().flatten()[ge_keep]),
                  batch_size=len(val_batch), on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-        # if accuracy_hyperedge is not None:
-        #     self.log('fuzzy_accuracy/validation_accuracy_hyperedge', accuracy_hyperedge, batch_size=len(val_batch), on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        if accuracy_hyperedge is not None:
+            self.log('fuzzy_accuracy/validation_accuracy_hyperedge', accuracy_hyperedge, batch_size=len(val_batch), on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
         # --- Compute simple S/B counts for the event-level classifier (x_class) ---
         # x_class shape: [N_events, 1] or [N_events]
-        preds = (x_class.view(-1) > 0.5).to(torch.int32)
+        preds = (x_class.view(-1) > 0.7).to(torch.int32)
         labels = val_batch.cls_t.view(-1).to(torch.int32)
 
         tp = torch.sum(((preds == 1) & (labels == 1)).to(torch.int32)).cpu()
