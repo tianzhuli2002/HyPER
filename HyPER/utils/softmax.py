@@ -2,6 +2,7 @@ from torch import Tensor
 from torch_geometric.utils import scatter
 from HyPER.utils.custom_scatter import custom_scatter
 
+from .custom_scatter import custom_scatter
 
 def softmax(
     src: Tensor,
@@ -24,8 +25,7 @@ def softmax(
 
     :rtype: :class:`Tensor`
     """
-    src_max = scatter(src.detach(), index, dim, dim_size=dim_size, reduce='max')
-    # src_max = custom_scatter(src.detach(), index, dim=dim, dim_size=dim_size, reduce='amax')
+    src_max = custom_scatter(src.detach(), index, dim=dim, dim_size=dim_size, reduce='amax')
     out = src - src_max.index_select(dim, index)
     out = out.exp()
     out_sum = scatter(out, index, dim, dim_size=dim_size, reduce='sum') + 1e-16
