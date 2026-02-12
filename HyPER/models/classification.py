@@ -48,13 +48,9 @@ class classificationModel(Module):
 
         # Aggregation of hyperedges, edges along the features: mean and max
         he_mean = scatter(feat_HE, batch_HE, dim=0, dim_size=num_events, reduce='mean')  # [num_events, F]
-        # he_mean = scatter(feat_HE, batch_HE, dim=0, dim_size=num_events.item(), reduce='mean')  # [num_events, F]
-        he_max  = scatter(feat_HE, batch_HE, dim=0, dim_size=num_events, reduce='max')  # [num_events, F]
-        # he_max = custom_scatter(feat_HE, batch_HE, dim=0, dim_size=num_events.item(), reduce='amax')   # [num_events, F]
+        he_max = custom_scatter(feat_HE, batch_HE, dim=0, dim_size=num_events.item(), reduce='amax')   # [num_events, F]
         ge_mean = scatter(feat_GE, batch_GE, dim=0, dim_size=num_events, reduce='mean')  # [num_events, F]
-        # ge_mean = scatter(feat_GE, batch_GE, dim=0, dim_size=num_events.item(), reduce='mean')  # [num_events, F]
-        ge_max  = scatter(feat_GE, batch_GE, dim=0, dim_size=num_events, reduce='max')   # [num_events, F]
-        # ge_max = custom_scatter(feat_GE, batch_GE, dim=0, dim_size=num_events.item(), reduce='amax')   # [num_events, F]
+        ge_max = custom_scatter(feat_GE, batch_GE, dim=0, dim_size=num_events.item(), reduce='amax')   # [num_events, F]
 
         # Then concatenate hyperedge features with edge features
         x_in = torch.cat([he_mean, he_max, ge_mean, ge_max], dim=1).float()
