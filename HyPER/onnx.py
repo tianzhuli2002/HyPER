@@ -10,7 +10,7 @@ from torch.export.dynamic_shapes import Dim
 from HyPER.models import HyPERModel
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="default")
+@hydra.main(version_base=None, config_path="../configs", config_name="ttbar_singlelep_nobtag")
 def Onnx(cfg : DictConfig) -> None:
     r"""Convert a trained network model to Onnx.
 
@@ -47,26 +47,27 @@ def Onnx(cfg : DictConfig) -> None:
     onnx_program = torch.onnx.export(
         model,
         (
-            torch.randn((13,hparams['node_in_channels']), device=map_location),
-            torch.randint(0,12,(2,72), device=map_location),
-            torch.randn((72,hparams['edge_in_channels']), device=map_location),
-            torch.randn((2,hparams['global_in_channels']), device=map_location),
-            torch.LongTensor([0,0,0,0,0,0,1,1,1,1,1,1,1], device=map_location),
-            torch.randint(0,12,(hparams['hyperedge_order'],55), device=map_location),
-            torch.cat([torch.full([20],0, dtype=torch.int64, device=map_location),torch.full([35],1, dtype=torch.int64, device=map_location)],dim=0)
+            torch.randn((13,hparams['node_in_channels'])),
+            torch.randint(0,12,(2,72)),
+            torch.randn((72,hparams['edge_in_channels'])),
+            torch.randn((2,hparams['global_in_channels'])),
+            torch.LongTensor([0,0,0,0,0,0,1,1,1,1,1,1,1]),
+            torch.randint(0,12,(hparams['hyperedge_order'],55)),
+            torch.cat([torch.full([20],0, dtype=torch.int64),torch.full([35],1, dtype=torch.int64)],dim=0)
         ),
         dynamo=True,
-        opset_version=20,
-        input_names=['x_s', 'edge_index', 'edge_attr_s', 'u_s', 'batch', 'edge_index_h', 'edge_index_h_batch'],
+        opset_version=18,
+        input_names=['x_s', 'edge_index', 'edge_attr_s', 'u_s', 'batch', 'edge_index_h', 'batch_hyperedge'],
         dynamic_shapes={'x_s'               : {0 : Dim.DYNAMIC},
                         'edge_index'        : {1 : Dim.DYNAMIC},
                         'edge_attr_s'       : {0 : Dim.DYNAMIC},
                         'u_s'               : {0 : Dim.DYNAMIC},
                         'batch'             : {0 : Dim.DYNAMIC},
                         'edge_index_h'      : {1 : Dim.DYNAMIC},
-                        'edge_index_h_batch': {0 : Dim.DYNAMIC},},
+                        'batch_hyperedge': {0 : Dim.DYNAMIC}},
+        output_names = ['hyperedge_prime','batch_hyperedge','edge_prime','classification_score'],
     )
-
+    
     onnx_program.optimize()
     onnx_program.save(cfg['onnx_output'])
 
