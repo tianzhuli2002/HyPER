@@ -79,7 +79,8 @@ class NodeModel(Module):
         out = torch.cat([x[row], x[col], edge_attr], 1).float()
         out = self.node_mlp_1(out) # message
         agg_mean = scatter(out, col, dim=0, dim_size=x.size(0), reduce='mean')
-        agg_max = custom_scatter(out, col, dim=0, dim_size=x.size(0), reduce='amax')
+        agg_max = scatter(out, col, dim=0, dim_size=x.size(0), reduce='max')
+        #agg_max = custom_scatter(out, col, dim=0, dim_size=x.size(0), reduce='amax')
         out = torch.cat([x, agg_mean, agg_max, u[batch]], dim=1).float()
         return self.node_mlp_2(out) # update node with message
 
@@ -112,5 +113,10 @@ class GlobalModel(Module):
         # edge_attr: [E, F_e]
         # u: [B, F_u]
         # batch: [N] with max entry B - 1.
-        out = torch.cat([u, scatter(x, batch, dim=0, dim_size=u.size(0), reduce='mean'), custom_scatter(x, batch, dim=0, dim_size=u.size(0), reduce='amax')], dim=1).float()
+        out = torch.cat([
+            u, scatter(x, batch, dim=0, dim_size=u.size(0), reduce='mean'), 
+            scatter(x, batch, dim=0, dim_size=u.size(0), reduce='max')# custom_scatter(x, batch, dim=0, dim_size=u.size(0), reduce='amax')], 
+            #custom_scatter(x, batch, dim=0, dim_size=u.size(0), reduce='amax')
+                         ],
+                        dim=1).float()
         return self.global_mlp(out)

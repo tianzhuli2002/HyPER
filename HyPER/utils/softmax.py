@@ -25,7 +25,8 @@ def softmax(
 
     :rtype: :class:`Tensor`
     """
-    src_max = custom_scatter(src.detach(), index, dim=dim, dim_size=dim_size, reduce='amax')
+    #src_max = custom_scatter(src.detach(), index, dim=dim, dim_size=dim_size, reduce='amax')
+    src_max = scatter(src.detach(), index, dim=dim, dim_size=dim_size, reduce='max')
     out = src - src_max.index_select(dim, index)
     out = out.exp()
     out_sum = scatter(out, index, dim, dim_size=dim_size, reduce='sum') + 1e-16
