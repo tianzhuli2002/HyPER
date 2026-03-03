@@ -105,12 +105,9 @@ def CombinedLoss(loss_hyperedge: Tensor, loss_edge: Tensor, loss_class: Tensor,
     else:
         hyper_loss = loss_hyperedge.mean()
 
-    # ----- Reconstruction loss only on signal events -----
-    # (background = no truth structure → no reconstruction)
-    if cls_mask.any():
-        reco_loss = alpha * hyper_loss + (1 - alpha) * edge_loss
-    else:
-        reco_loss = loss_hyperedge.new_tensor(0.0)
+    # ----- Reconstruction loss from valid reconstruction targets -----
+    # Validity is already handled by edge/hyperedge masks above.
+    reco_loss = alpha * hyper_loss + (1 - alpha) * edge_loss
 
     # ----- Classification is always applied -----
     #class_loss = loss_class.mean()
