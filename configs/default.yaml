@@ -1,6 +1,6 @@
 dataset:          '/data/sdellasa/QT_HyPER_Training/tuples_Class/nobtag'
 train_set:        'training_dataset_odd'
-val_set:          'training_dataset_even'
+val_set:          null #'training_dataset_even'
 train_val_split:  0.5
 max_n_events:     -1
 drop_last:        False

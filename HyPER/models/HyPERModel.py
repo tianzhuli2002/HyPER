@@ -171,7 +171,7 @@ class HyPERModel(LightningModule):
         loss_class = ClassificationLoss(x_class, train_batch.cls_t, criterion=BCELoss(reduction='none'))
         loss_edge,loss_edge_masks = EdgeLoss(edge_attr_prime, train_batch.edge_attr_t, train_batch.edge_attr_batch, criterion=criterion_edge, reduction='mean')
         loss_hyperedge, loss_hyperedge_masks = HyperedgeLoss(x_hat, train_batch.hyperedge_attr_t.float(), batch_hyperedge, criterion_hyperedge, reduction='mean')
-        loss = CombinedLoss(loss_edge, loss_hyperedge, loss_class, train_batch.cls_t, alpha=self.hparams.alpha, beta=self.hparams.beta, reduction=self.hparams.reduction, loss_hyperedge_masks=loss_hyperedge_masks,loss_edge_masks=loss_edge_masks)
+        loss = CombinedLoss(loss_hyperedge, loss_edge, loss_class, train_batch.cls_t, alpha=self.hparams.alpha, beta=self.hparams.beta, reduction=self.hparams.reduction, loss_hyperedge_masks=loss_hyperedge_masks,loss_edge_masks=loss_edge_masks)
 
         # Logging
         self.log('loss/train_loss', loss, batch_size=len(train_batch), on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
@@ -201,7 +201,7 @@ class HyPERModel(LightningModule):
         loss_class = ClassificationLoss(x_class, val_batch.cls_t, criterion=BCELoss(reduction='none'))
         loss_edge,loss_edge_masks = EdgeLoss(edge_attr_prime, val_batch.edge_attr_t, val_batch.edge_attr_batch, criterion=criterion_edge, reduction='mean')
         loss_hyperedge, loss_hyperedge_masks = HyperedgeLoss(x_hat, val_batch.hyperedge_attr_t.float(), batch_hyperedge, criterion_hyperedge, reduction='mean')
-        loss = CombinedLoss(loss_edge, loss_hyperedge, loss_class, val_batch.cls_t, alpha=self.hparams.alpha, beta=self.hparams.beta, reduction=self.hparams.reduction, loss_hyperedge_masks=loss_hyperedge_masks,loss_edge_masks=loss_edge_masks)
+        loss = CombinedLoss(loss_hyperedge, loss_edge, loss_class, val_batch.cls_t, alpha=self.hparams.alpha, beta=self.hparams.beta, reduction=self.hparams.reduction, loss_hyperedge_masks=loss_hyperedge_masks,loss_edge_masks=loss_edge_masks)
         
         # Validation Accuracy Calculation
         
@@ -216,16 +216,26 @@ class HyPERModel(LightningModule):
 
         # Logging
         self.log('loss/validation_loss', loss, batch_size=len(val_batch), on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-        self.log('fuzzy_accuracy/validation_accuracy_class', accuracy_class(x_class.flatten(), val_batch.cls_t.float().flatten()),
-                 batch_size=len(val_batch), on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-        self.log('fuzzy_accuracy/validation_accuracy_edge', accuracy_edge(edge_attr_prime.flatten()[ge_keep], val_batch.edge_attr_t.float().flatten()[ge_keep]),
-                 batch_size=len(val_batch), on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-        if accuracy_hyperedge is not None:
-            self.log('fuzzy_accuracy/validation_accuracy_hyperedge', accuracy_hyperedge, batch_size=len(val_batch), on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+
+        pred_edge = edge_attr_prime.flatten()[ge_keep]
+        tgt_edge = val_batch.edge_attr_t.float().flatten()[ge_keep]
+
+        # guard against empty masked tensors
+        if pred_edge.numel() > 0 and tgt_edge.numel() > 0:
+            self.log(
+                'fuzzy_accuracy/validation_accuracy_edge',
+                accuracy_edge(pred_edge, tgt_edge),
+                batch_size=len(val_batch),
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                sync_dist=True,
+            )
 
         # --- Compute simple S/B counts for the event-level classifier (x_class) ---
         # x_class shape: [N_events, 1] or [N_events]
-        preds = (x_class.view(-1) > 0.7).to(torch.int32)
+        preds = (x_class.view(-1) > 0.5).to(torch.int32)
         labels = val_batch.cls_t.view(-1).to(torch.int32)
 
         tp = torch.sum(((preds == 1) & (labels == 1)).to(torch.int32)).cpu()
@@ -245,6 +255,15 @@ class HyPERModel(LightningModule):
         return {'tp': tp, 'fp': fp, 'batch_size': len(val_batch)}
         
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        # print("PREDICTION STEP INPUTS")
+        # print("batch:", batch)
+        # #print(batch)
+        # print(batch.x)
+        # print(batch.edge_index)
+        # print(batch.edge_attr)
+        # print(batch.u)
+        # print(batch.batch)
+        #print(x_hat, batch_hyperedge, edge_attr_prime, x_class)
         x_hat, batch_hyperedge, edge_attr_prime, x_class = self._shared_step(batch)
 
         # Unbatch results
@@ -253,5 +272,10 @@ class HyPERModel(LightningModule):
         N_nodes       = degree(batch.batch).cpu().flatten().tolist()
         encodings     = unbatch(batch.x[:,-1].reshape(-1,1),batch.batch, 0)
         x_class_out       = x_class.squeeze(-1)
-
+        # print("PREDICTION STEP OUTPUTS")
+        # print("x_out:", x_out)
+        # print("edge_attr_out:", edge_attr_out)
+        # print("N_nodes:", N_nodes)
+        # print("encodings:", encodings)
+        # print("x_class_out:", x_class_out)
         return x_out, edge_attr_out, N_nodes, encodings, x_class_out
