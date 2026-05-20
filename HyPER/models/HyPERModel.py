@@ -119,8 +119,16 @@ class HyPERModel(LightningModule):
         # Classification step
         _, col = edge_index
         batch_edges = batch[col] # [N_ge]
-        x_class = self.Classification(x_hat, edge_attr_prime, batch_edges, batch_hyperedge)
-
+        #x_class = self.Classification(x_hat, edge_attr_prime, batch_edges, batch_hyperedge)
+        x_class = self.Classification(
+            feat_HE=x_hat,
+            feat_GE=edge_attr_prime,
+            feat_N=x_prime,
+            feat_U=u_prime,
+            batch_GE=batch_edges,
+            batch_HE=batch_hyperedge,
+            batch_N=batch,
+        )
         # Last layer + sigmoid
         p_hyper = self.he_head(x_hat)             # [N_he, 1]
         p_edge  = self.ge_head(edge_attr_prime)    # [N_ge, 1]
@@ -143,7 +151,7 @@ class HyPERModel(LightningModule):
             "lr_scheduler": {
                 "scheduler": lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=10),
                 "interval": "epoch",
-                "monitor": "loss/validation_loss_epoch",
+                "monitor": "loss/validation_loss", #_epoch",
                 "frequency": 1,
                 "strict": True
             },
