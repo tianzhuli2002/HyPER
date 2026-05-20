@@ -50,7 +50,8 @@ class HyPERModel(LightningModule):
             lr: Optional[float] = 1e-3,
             alpha: Optional[float] = 0.5,
             beta: Optional[float] = 0.5,
-            reduction: Optional[str] = 'mean'
+            reduction: Optional[str] = 'mean',
+            validation_mode: Optional[str] = 'keep'
         ):
         super().__init__()
 
@@ -180,6 +181,8 @@ class HyPERModel(LightningModule):
 
     def validation_step(self, val_batch, batch_idx):
         x_hat, batch_hyperedge, edge_attr_prime, x_class = self._shared_step(val_batch)
+        fast_validation = str(self.hparams.validation_mode).lower() == 'fast'
+        val_on_step = not fast_validation
 
         # Validation Loss Calculation
         if str(self.hparams.criterion_edge).lower() == 'bce':
@@ -210,12 +213,10 @@ class HyPERModel(LightningModule):
         ge_keep  = graph_mask[val_batch.edge_attr_batch]      
         he_keep = graph_mask[batch_hyperedge]
 
-        accuracy_class = BinaryAccuracy().to(x_class)
         accuracy_edge  = BinaryAccuracy(ignore_index=0).to(edge_attr_prime)
-        accuracy_hyperedge = Accuracy(x_hat[he_keep], val_batch.hyperedge_attr_t[he_keep].float(), batch_hyperedge[he_keep], num_patterns=2)
 
         # Logging
-        self.log('loss/validation_loss', loss, batch_size=len(val_batch), on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('loss/validation_loss', loss, batch_size=len(val_batch), on_step=val_on_step, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
         pred_edge = edge_attr_prime.flatten()[ge_keep]
         tgt_edge = val_batch.edge_attr_t.float().flatten()[ge_keep]
@@ -226,7 +227,7 @@ class HyPERModel(LightningModule):
                 'fuzzy_accuracy/validation_accuracy_edge',
                 accuracy_edge(pred_edge, tgt_edge),
                 batch_size=len(val_batch),
-                on_step=True,
+                on_step=val_on_step,
                 on_epoch=True,
                 prog_bar=False,
                 logger=True,
@@ -241,15 +242,15 @@ class HyPERModel(LightningModule):
         tp = torch.sum(((preds == 1) & (labels == 1)).to(torch.int32)).cpu()
         fp = torch.sum(((preds == 1) & (labels == 0)).to(torch.int32)).cpu()
 
-        eps = 1e-8
-        s_over_b_batch = tp.float() / (fp.float() + eps)
+        # Safely compute S/B: clamp fp to avoid huge ratios when fp~0
+        s_over_b_batch = tp.float() / torch.clamp(fp.float(), min=1.0)
 
-        # Log it live to TensorBoard
-        self.log('metrics/validation_S_over_B_batch', s_over_b_batch,
+        # Log it live to TensorBoard (clamped to reasonable range for stability)
+        self.log('metrics/validation_S_over_B_batch', torch.clamp(s_over_b_batch, min=0.0, max=1000.0),
                 batch_size=len(val_batch),
-                on_step=True,      # log per batch
-                on_epoch=True,    # don't accumulate for epoch here
-                prog_bar=True,
+            on_step=val_on_step,
+            on_epoch=True,
+            prog_bar=not fast_validation,
                 logger=True,
                 sync_dist=True)    
         return {'tp': tp, 'fp': fp, 'batch_size': len(val_batch)}

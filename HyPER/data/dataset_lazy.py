@@ -3,6 +3,9 @@ from typing import Callable, List, Optional, Tuple, Dict, Sequence
 from warnings import warn
 from os import listdir, path as osp, makedirs
 import shutil
+import time
+import sys
+import os
 
 import math
 import h5py
@@ -23,7 +26,7 @@ from .transforms import TRANSFORM_REGISTRY
 
 
 class HyPERDatasetLazy(Dataset):
-    """Lazy-loading HyPERDataset with picklable everything."""
+    """Lazy-loading HyPERDataset in VyPER style (fork-compatible)."""
     
     def __init__(
         self,
@@ -66,10 +69,10 @@ class HyPERDatasetLazy(Dataset):
             warn("Non-standard 4-vector features", UserWarning)
             self._use_EPxPyPz = True
 
-        # Edge features (picklable)
+        # Edge features
         self.edge_features_to_use = self.parse_edge_features(parsed_inputs)
         
-        # Node/global transforms (picklable)
+        # Node/global transforms
         node_transform_names = parsed_inputs['input'].get('node_transforms', [])
         global_transform_names = parsed_inputs['input'].get('global_transforms', [])
         
@@ -101,19 +104,22 @@ class HyPERDatasetLazy(Dataset):
         else:
             self._pre_filter = None
 
-        # STORE PATH ONLY (not file handle!)
+        # HDF5 path (do NOT keep a global open handle - open per-worker)
         self._h5_path = osp.join(root, "raw", f"{name}.h5")
-        self._num_events = self._get_num_events()
+
+        # Get number of events by opening/closing briefly (safe at init)
+        with h5py.File(self._h5_path, 'r') as _f:
+            self._num_events = len(_f["INPUTS"]["GLOBAL"])
+        self.file = None
         
         # Precompute target sets
         self._target_edge_set = set(tuple(t) for t in self.target_edge_ids) if self.target_edge_ids else set()
         self._target_hyperedge_set = set(tuple(t) for t in self.target_hyperedge_ids) if self.target_hyperedge_ids else set()
-    
-    
-    def _get_num_events(self) -> int:
-        """Get number of events without keeping file handle open."""
-        with h5py.File(self._h5_path, "r") as f:
-            return len(f["INPUTS"]["GLOBAL"])
+        
+        # === DEBUG: Log dataset creation ===
+        if os.getenv("HYPER_DEBUG", "0") == "1":
+            print(f"[DEBUG] HyPERDatasetLazy created: {self.name}, {self._num_events} events, PID={os.getpid()}", 
+                  file=sys.stderr, flush=True)
     
     
     def __len__(self) -> int:
@@ -121,22 +127,33 @@ class HyPERDatasetLazy(Dataset):
     
     
     def __getitem__(self, idx: int) -> Data:
-        """Load/process single event on-demand"""
+        """Load/process single event on-demand - VYPER STYLE"""
         
-        # Check cache first
-        cache_path = osp.join(self._cache_dir, f"event_{idx}.pt")
+        # === DEBUG: Progress logging (every 1000 events) ===
+        if os.getenv("HYPER_DEBUG", "0") == "1" and idx % 1000 == 0:
+            t0 = time.time()
+            print(f"[CACHE] Event {idx}/{len(self)} - PID={os.getpid()} - Time={t0:.0f}", 
+                  file=sys.stderr, flush=True)
+        # ================================================
+        
+        # Check cache first (VyPER pattern) - cache stores already-processed Data
+        cache_path = osp.join(self._cache_dir, f"processed_{idx}.pt")
         if osp.exists(cache_path):
             try:
+                # Load and return cached processed Data directly (do NOT re-apply transforms)
                 data = torch.load(cache_path)
-                if self.transform:
-                    data = self.transform(data)
                 return data
-            except:
+            except Exception as e:
+                # === DEBUG: Log cache load failures and continue processing ===
+                if os.getenv("HYPER_DEBUG", "0") == "1":
+                    print(f"[CACHE] Load failed for {idx}: {e}", file=sys.stderr, flush=True)
+                # fall through to reprocess
                 pass
         
-        # OPEN HDF5 HERE (each worker gets its own handle)
-        with h5py.File(self._h5_path, "r") as h5_file:
-            data = self._process_single_event(idx, h5_file)
+        # === VYPER-STYLE: Call processing() which uses self.file ===
+        t0 = time.time()
+        data = self.processing(idx)
+        t_process = time.time() - t0
         
         # Apply filters/transforms
         if self._pre_filter and not self._pre_filter(data):
@@ -144,20 +161,37 @@ class HyPERDatasetLazy(Dataset):
         if self.transform:
             data = self.transform(data)
         
-        # Cache for next time
-        torch.save(data, cache_path)
+        # Cache for next time (save processed/transformed Data)
+        t_save = time.time()
+        try:
+            torch.save(data, cache_path)
+        except Exception:
+            # Best-effort caching; ignore failures
+            if os.getenv("HYPER_DEBUG", "0") == "1":
+                print(f"[CACHE] Save failed for {idx}", file=sys.stderr, flush=True)
+        t_save = time.time() - t_save
+        
+        # === DEBUG: Log processing time ===
+        if os.getenv("HYPER_DEBUG", "0") == "1" and idx % 1000 == 0:
+            t_total = time.time() - t0
+            print(f"[CACHE] Processed {idx}: process={t_process:.2f}s, save={t_save:.2f}s, total={t_total:.2f}s", 
+                  file=sys.stderr, flush=True)
         
         return data
     
     
-    def _process_single_event(self, idx: int, h5_file: h5py.File) -> Data:
-        """Extract and build one event from HDF5."""
+    def processing(self, idx: int) -> Data:
+        """
+        Extract and build one event from HDF5 using self.file.
+        VyPER-style: uses the file handle opened in __init__.
+        """
+        # Ensure file handle is opened in this process/worker
+        self._ensure_file_open()
+        inputs = self.file["INPUTS"]
+        labels = self.file["LABELS"]
         
-        inputs = h5_file["INPUTS"]
-        labels = h5_file["LABELS"]
-        
-        # Node attributes
-        x, Nobjects = self.build_node_attributes(inputs, idx, idx+1)
+        # Node attributes (also returns precomputed per-node 4-vectors)
+        x, Nobjects, node_p4 = self.build_node_attributes(inputs, idx, idx+1)
         
         # Edge attributes & indices
         edge_attr = self.build_edge_attributes(inputs, idx, idx+1)
@@ -204,6 +238,7 @@ class HyPERDatasetLazy(Dataset):
             x=x,
             edge_index=edge_index,
             edge_attr=edge_attr,
+            node_p4=node_p4,
             u=u,
             cls_t=cls_t,
             node_ids=cantor_node_ids_flat,
@@ -213,7 +248,7 @@ class HyPERDatasetLazy(Dataset):
         )
     
     
-    # === Static helper methods (all picklable) ===
+    # === Static helper methods (all fork-compatible) ===
     
     @staticmethod
     def _parse_config_file(filename):
@@ -240,17 +275,18 @@ class HyPERDatasetLazy(Dataset):
         # Flatten the array into 1D
         flat = ak.flatten(arr)
 
-        # Convert to numpy
-        np_array = flat.to_numpy()
+        # Convert to numpy via awkward (returns ndarray)
+        np_array = ak.to_numpy(flat)
 
         # Check if it's a structured array (has named fields)
         if np_array.dtype.names is not None:
             # Structured array: convert to unstructured, then transpose
             unstruct = rf.structured_to_unstructured(np_array)
-            return torch.as_tensor(unstruct, dtype=torch.long).t()  # [F, N] -> indices as long
+            # Use torch.from_numpy to avoid extra copies where possible
+            return torch.from_numpy(unstruct).t().to(torch.long)
         else:
-            # Regular float array: just reshape to column vector
-            return torch.as_tensor(np_array, dtype=torch.float32).reshape(-1, 1)  # [N, 1]
+            # Regular float array: convert via from_numpy and ensure float32
+            return torch.from_numpy(np_array.astype(np.float32)).reshape(-1, 1)
     
     @staticmethod
     def _remove_self_pairing(arr, mask):
@@ -291,7 +327,7 @@ class HyPERDatasetLazy(Dataset):
         return target_edge_ids, target_hyperedge_ids
     
 
-    def build_node_attributes(self, input_h5: h5py._hl.group.Group, start: int, end: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def build_node_attributes(self, input_h5: h5py._hl.group.Group, start: int, end: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         object_arrays = []
 
         for name, uid in self.input_id.items():
@@ -308,52 +344,38 @@ class HyPERDatasetLazy(Dataset):
         Nobjects_chunk = torch.count_nonzero(remove_nan_mask, dim=1)
         x_chunk = combined[remove_nan_mask]
 
-        return x_chunk, Nobjects_chunk
-
-
-    def build_edge_attributes(self, input_h5: h5py._hl.group.Group, start: int, end: int) -> torch.Tensor:
-        object_vectors_list = []
-
-        for obj in self.input_id.keys():
-            obj_arr = input_h5[obj][start:end]
-
+        # Compute per-node 4-vector (e, px, py, pz) and mass to cache/precompute
+        # Assume first four entries of features correspond to either
+        # [e, eta, phi, pt] or [e, px, py, pz] depending on config flags.
+        if x_chunk.size(1) >= 4:
+            e_col = x_chunk[:, 0]
+            a1 = x_chunk[:, 1]
+            a2 = x_chunk[:, 2]
+            a3 = x_chunk[:, 3]
             if self._use_EEtaPhiPt:
-                obj_e   = ak.drop_none(ak.nan_to_none(ak.Array(obj_arr["e"])))
-                obj_pt  = ak.drop_none(ak.nan_to_none(ak.Array(obj_arr["pt"])))
-                obj_eta = ak.drop_none(ak.nan_to_none(ak.Array(obj_arr["eta"])))
-                obj_phi = ak.drop_none(ak.nan_to_none(ak.Array(obj_arr["phi"])))
-                obj_vectors = vector.zip({"pt": obj_pt, "eta": obj_eta, "phi": obj_phi, "e": obj_e})
-            elif self._use_EPxPyPz:
-                obj_e   = ak.drop_none(ak.nan_to_none(ak.Array(obj_arr["e"])))
-                obj_px  = ak.drop_none(ak.nan_to_none(ak.Array(obj_arr["px"])))
-                obj_py  = ak.drop_none(ak.nan_to_none(ak.Array(obj_arr["py"])))
-                obj_pz = ak.drop_none(ak.nan_to_none(ak.Array(obj_arr["pz"])))
-                obj_vectors = vector.zip({"px": obj_px, "py": obj_py, "pz": obj_pz, "e": obj_e})
+                eta = a1
+                phi = a2
+                pt = a3
+                px = pt * torch.cos(phi)
+                py = pt * torch.sin(phi)
+                pz = pt * torch.sinh(eta)
             else:
-                raise ValueError("Either _use_EEtaPhiPt or _use_EPxPyPz must be True.")
+                # EPxPyPz
+                px = a1
+                py = a2
+                pz = a3
 
-            object_vectors_list.append(obj_vectors)
+            # Stack into (N,4): (e, px, py, pz)
+            p4 = torch.stack([e_col, px, py, pz], dim=1)
+            # mass = sqrt(max(e^2 - p^2, eps))
+            p_sq = px * px + py * py + pz * pz
+            mass = torch.sqrt(torch.clamp(e_col * e_col - p_sq, min=1e-6))
+            # Optionally attach mass as a separate column if needed downstream
+            # Return node features, counts, and p4
+        else:
+            p4 = torch.empty((x_chunk.shape[0], 4), dtype=torch.float32)
 
-        vectors = ak.concatenate(object_vectors_list, axis=1)
-
-        DR   = vectors[:, None].deltaR(vectors)
-        Deta = vectors[:, None].deltaeta(vectors)
-        Dphi = vectors[:, None].deltaphi(vectors)
-        M    = (vectors[:, None] + vectors).m
-
-        itself_mask = DR == 0.0
-
-        # Use static methods (no lambdas!)
-        torch_DR   = self._map_nested_awkward_to_torch(self._remove_self_pairing(DR, itself_mask))
-        torch_Deta = self._map_nested_awkward_to_torch(self._remove_self_pairing(Deta, itself_mask))
-        torch_Dphi = self._map_nested_awkward_to_torch(self._remove_self_pairing(Dphi, itself_mask))
-        torch_M    = self._map_nested_awkward_to_torch(self._remove_self_pairing(M, itself_mask))
-
-        torch_M = torch.clamp(torch_M, 0.001)
-
-        edge_attr_chunk = torch.cat((torch_Deta, torch_Dphi, torch_DR, torch_M), dim=1)
-        return edge_attr_chunk
-
+        return x_chunk, Nobjects_chunk, p4
 
     def build_global_attributes(self, input_h5: h5py._hl.group.Group, start: int, end: int) -> torch.Tensor:
         arr = rf.structured_to_unstructured(input_h5["GLOBAL"][start:end])
@@ -392,16 +414,107 @@ class HyPERDatasetLazy(Dataset):
 
 
     def build_edge_indices(self, local_node_ids_chunk: ak.Array, cantor_node_ids_chunk: ak.Array) -> Tuple[torch.Tensor, torch.Tensor]:
-        edge_pairs = self._awkward_nondiag_cartesian(local_node_ids_chunk)
-        edge_pairs_1flat = ak.flatten(edge_pairs)
-        edge_index_chunk = self._map_nested_awkward_to_torch(edge_pairs_1flat)
+        """Build edge indices for UNDIRECTED graph (i < j only)."""
+        
+        # === Local node indices ===
+        edge_pairs = ak.combinations(local_node_ids_chunk, 2)
+        edge_index_0 = ak.flatten(edge_pairs["0"])
+        edge_index_1 = ak.flatten(edge_pairs["1"])
+        edge_index_0_torch = torch.tensor(edge_index_0.to_numpy(), dtype=torch.long)
+        edge_index_1_torch = torch.tensor(edge_index_1.to_numpy(), dtype=torch.long)
+        edge_index_chunk = torch.stack([edge_index_0_torch, edge_index_1_torch], dim=0)
 
-        cantor_edge_pairs = self._awkward_nondiag_cartesian(cantor_node_ids_chunk)
-        cantor_edge_pairs_1flat = ak.flatten(cantor_edge_pairs)
-        cantor_edge_index_chunk = self._map_nested_awkward_to_torch(cantor_edge_pairs_1flat)
+        # === Cantor node indices ===
+        cantor_edge_pairs = ak.combinations(cantor_node_ids_chunk, 2)
+        cantor_edge_index_0 = ak.flatten(cantor_edge_pairs["0"])
+        cantor_edge_index_1 = ak.flatten(cantor_edge_pairs["1"])
+        cantor_edge_index_0_torch = torch.tensor(cantor_edge_index_0.to_numpy(), dtype=torch.long)
+        cantor_edge_index_1_torch = torch.tensor(cantor_edge_index_1.to_numpy(), dtype=torch.long)
+        cantor_edge_index_chunk = torch.stack([cantor_edge_index_0_torch, cantor_edge_index_1_torch], dim=0)
 
         return edge_index_chunk, cantor_edge_index_chunk
 
+
+    def build_edge_attributes(self, input_h5: h5py._hl.group.Group, start: int, end: int) -> torch.Tensor:
+        """
+        Construct edge attributes using awkward arrays (matches build_edge_indices).
+        Creates UNDIRECTED edges only (i < j).
+        """
+        object_vectors_list = []
+
+        for obj in self.input_id.keys():
+            obj_arr = input_h5[obj][start:end]
+
+            if self._use_EEtaPhiPt:
+                obj_e   = ak.drop_none(ak.nan_to_none(ak.Array(obj_arr["e"])))
+                obj_pt  = ak.drop_none(ak.nan_to_none(ak.Array(obj_arr["pt"])))
+                obj_eta = ak.drop_none(ak.nan_to_none(ak.Array(obj_arr["eta"])))
+                obj_phi = ak.drop_none(ak.nan_to_none(ak.Array(obj_arr["phi"])))
+                obj_vectors = vector.zip({"pt": obj_pt, "eta": obj_eta, "phi": obj_phi, "e": obj_e})
+            elif self._use_EPxPyPz:
+                obj_e   = ak.drop_none(ak.nan_to_none(ak.Array(obj_arr["e"])))
+                obj_px  = ak.drop_none(ak.nan_to_none(ak.Array(obj_arr["px"])))
+                obj_py  = ak.drop_none(ak.nan_to_none(ak.Array(obj_arr["py"])))
+                obj_pz  = ak.drop_none(ak.nan_to_none(ak.Array(obj_arr["pz"])))
+                obj_vectors = vector.zip({"px": obj_px, "py": obj_py, "pz": obj_pz, "e": obj_e})
+            else:
+                raise ValueError("Either _use_EEtaPhiPt or _use_EPxPyPz must be True.")
+
+            object_vectors_list.append(obj_vectors)
+
+        vectors = ak.concatenate(object_vectors_list, axis=1)
+
+        # === Use ak.combinations for undirected edges (i < j), NOT cartesian! ===
+        pairs = ak.combinations(vectors, 2)
+        
+        # Extract components from pairs
+        v1 = pairs["0"]
+        v2 = pairs["1"]
+        
+        # Compute pairwise features
+        # Note: deltaR/deltaeta/deltaphi already return positive values, no abs needed
+        # Also: use deltaphi (no underscore), not delta_phi
+        DR   = v1.deltaR(v2)
+        Deta = v1.eta - v2.eta
+        Dphi = v1.deltaphi(v2)  # ← No underscore!
+        M    = (v1 + v2).m
+        
+        # Remove any NaN/None values
+        DR   = ak.drop_none(ak.nan_to_none(DR))
+        Deta = ak.drop_none(ak.nan_to_none(Deta))
+        Dphi = ak.drop_none(ak.nan_to_none(Dphi))
+        M    = ak.drop_none(ak.nan_to_none(M))
+        
+        # Convert to numpy via awkward and perform a single conversion to torch
+        np_DR = ak.to_numpy(DR)
+        np_Deta = ak.to_numpy(Deta)
+        np_Dphi = ak.to_numpy(Dphi)
+        np_M = ak.to_numpy(M)
+
+        # ak.to_numpy may return arrays with a leading event dimension (1, N).
+        # Flatten to 1D per-event arrays for stacking (N,).
+        np_DR = np.asarray(np_DR).ravel()
+        np_Deta = np.asarray(np_Deta).ravel()
+        np_Dphi = np.asarray(np_Dphi).ravel()
+        np_M = np.asarray(np_M).ravel()
+
+        # Stack into a single (N,4) numpy array to perform one torch.from_numpy call
+        if np_DR.size == 0:
+            # No edges in this event
+            return torch.empty((0, 4), dtype=torch.float32)
+
+        stacked = np.stack([
+            np.abs(np_Deta).astype(np.float32),
+            np.abs(np_Dphi).astype(np.float32),
+            np.abs(np_DR).astype(np.float32),
+            np_M.astype(np.float32),
+        ], axis=1)
+
+        edge_attr_chunk = torch.from_numpy(stacked)
+        # Clamp mass column to avoid zeros/very small values
+        edge_attr_chunk[:, 3] = torch.clamp(edge_attr_chunk[:, 3], min=0.001)
+
+        return edge_attr_chunk
 
     def build_hyperedge_indices(self, local_node_ids_chunk: ak.Array, cantor_node_ids_chunk: ak.Array,
                                 hyperedge_cardinality: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -430,3 +543,30 @@ class HyPERDatasetLazy(Dataset):
         output_labels = full_matches.any(dim=1, keepdim=True).float()
         
         return output_labels
+
+
+    def __del__(self):
+        """Close HDF5 file when dataset is destroyed."""
+        if hasattr(self, 'file') and self.file is not None:
+            try:
+                self.file.close()
+            except Exception:
+                pass
+
+    def _ensure_file_open(self):
+        """Open HDF5 file handle on-demand (safe for multiprocessing workers)."""
+        if getattr(self, 'file', None) is None:
+            self.file = h5py.File(self._h5_path, 'r')
+
+    def __getstate__(self):
+        """Ensure the HDF5 file handle is not pickled when dataset is sent to workers."""
+        state = self.__dict__.copy()
+        # Remove file handle from state so workers can open their own
+        if 'file' in state:
+            state['file'] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # Ensure file handle starts closed in new process
+        self.file = None
