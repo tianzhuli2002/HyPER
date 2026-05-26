@@ -1,17 +1,16 @@
-# HyPER/data/datamodule.py
-import yaml
 import warnings
-import os.path as osp
 import os
 import torch
 import numpy as np
+from copy import deepcopy
 from typing import Optional
 
 from lightning import LightningDataModule
 from torch.utils.data import random_split
 from torch_geometric.loader import DataLoader
 
-from .dataset_lazy import HyPERDatasetLazy
+from .dataset import HyPERDataset
+from .preprocessed import HyPEROnDiskDataset
 
 
 def worker_init_fn(worker_id: int) -> None:
@@ -22,7 +21,7 @@ def worker_init_fn(worker_id: int) -> None:
 
 
 class HyPERDataModule(LightningDataModule):
-    r"""HyPER Data Module - Optimized for speed with VyPER-style simplicity."""
+    r"""HyPER Data Module using VyPER-style on-disk graph preprocessing."""
     
     def __init__(
         self,
@@ -39,10 +38,11 @@ class HyPERDataModule(LightningDataModule):
         persistent_workers: bool = True,
         cache_dir: Optional[str] = None,
         force_reload: bool = False,
-        use_ondisk: bool = False,
+        use_ondisk: bool = True,
+        graph_config: Optional[dict] = None,
     ):
         super().__init__()
-        self.save_hyperparameters()  # ← VyPER pattern: save all params
+        self.save_hyperparameters()
         
         self.root = root
         self.train_set = train_set
@@ -58,9 +58,10 @@ class HyPERDataModule(LightningDataModule):
         self.cache_dir = cache_dir
         self.force_reload = force_reload
         self.use_ondisk = use_ondisk
+        self.graph_config = deepcopy(graph_config) if graph_config is not None else None
         
         # Parse config for channel dimensions
-        parsed_inputs = HyPERDatasetLazy._parse_config_file(f"{self.root}/config.yaml")
+        parsed_inputs = HyPERDataset._resolve_graph_config(root=self.root, config=self.graph_config)
         self.node_in_channels = len(parsed_inputs['input']['node_features']) + 1
         self.edge_in_channels = len(parsed_inputs['input']['edge_features'])
         self.global_in_channels = len(parsed_inputs['input']['global_features'])
@@ -73,15 +74,6 @@ class HyPERDataModule(LightningDataModule):
         self.val_data = None
         self.predict_data = None
     
-    @staticmethod
-    def parse_config_file(filename):
-        with open(filename) as stream:
-            try:
-                return yaml.safe_load(stream)
-            except yaml.YAMLError as exc:
-                print(exc)
-                raise
-
     def setup(self, stage: str):
         """Setting up datasets."""
         if self.train_set is not None:
@@ -90,9 +82,7 @@ class HyPERDataModule(LightningDataModule):
                 print(f"Creating validation set using "
                       f"{round(self.percent_valid_samples * 100, 2)}% of the training file.")
                 
-                # Choose dataset implementation: lazy per-event or prebuilt on-disk DB
                 if self.use_ondisk:
-                    from .ondisk import HyPEROnDiskDataset
                     full_data = HyPEROnDiskDataset(
                         root=self.root,
                         name=self.train_set,
@@ -100,13 +90,14 @@ class HyPERDataModule(LightningDataModule):
                         force_reload=self.force_reload,
                         batch_size=self.batch_size,
                         num_workers=self.num_workers,
+                        config=self.graph_config,
                     )
                 else:
-                    full_data = HyPERDatasetLazy(
+                    full_data = HyPERDataset(
                         root=self.root,
                         name=self.train_set,
-                        cache_dir=osp.join(self.cache_dir, self.train_set) if self.cache_dir else None,
                         force_reload=self.force_reload,
+                        config=self.graph_config,
                     )
                 
                 n_total = len(full_data)
@@ -121,7 +112,6 @@ class HyPERDataModule(LightningDataModule):
             else:
                 # Separate train and val files
                 if self.use_ondisk:
-                    from .ondisk import HyPEROnDiskDataset
                     self.train_data = HyPEROnDiskDataset(
                         root=self.root,
                         name=self.train_set,
@@ -129,27 +119,30 @@ class HyPERDataModule(LightningDataModule):
                         force_reload=self.force_reload,
                         batch_size=self.batch_size,
                         num_workers=self.num_workers,
+                        config=self.graph_config,
                     )
                     self.val_data = HyPEROnDiskDataset(
                         root=self.root,
                         name=self.val_set,
-                        training=False,
+                        training=True,
                         force_reload=self.force_reload,
                         batch_size=self.batch_size,
                         num_workers=self.num_workers,
+                        config=self.graph_config,
                     )
                 else:
-                    self.train_data = HyPERDatasetLazy(
+                    self.train_data = HyPERDataset(
                         root=self.root,
                         name=self.train_set,
-                        cache_dir=osp.join(self.cache_dir, self.train_set) if self.cache_dir else None,
                         force_reload=self.force_reload,
+                        config=self.graph_config,
                     )
-                    self.val_data = HyPERDatasetLazy(
+                    self.val_data = HyPERDataset(
                         root=self.root,
                         name=self.val_set,
-                        cache_dir=osp.join(self.cache_dir, self.val_set) if self.cache_dir else None,
+                        training=True,
                         force_reload=self.force_reload,
+                        config=self.graph_config,
                     )
 
             # Limit training dataset size if requested
@@ -164,7 +157,6 @@ class HyPERDataModule(LightningDataModule):
 
         if self.predict_set is not None:
             if self.use_ondisk:
-                from .ondisk import HyPEROnDiskDataset
                 self.predict_data = HyPEROnDiskDataset(
                     root=self.root,
                     name=self.predict_set,
@@ -172,13 +164,14 @@ class HyPERDataModule(LightningDataModule):
                     force_reload=self.force_reload,
                     batch_size=self.batch_size,
                     num_workers=self.num_workers,
+                    config=self.graph_config,
                 )
             else:
-                self.predict_data = HyPERDatasetLazy(
+                self.predict_data = HyPERDataset(
                     root=self.root,
                     name=self.predict_set,
-                    cache_dir=osp.join(self.cache_dir, self.predict_set) if self.cache_dir else None,
                     force_reload=self.force_reload,
+                    config=self.graph_config,
                 )
 
         if self.train_data is None and self.val_data is None and self.predict_data is None:
@@ -194,19 +187,21 @@ class HyPERDataModule(LightningDataModule):
             table.add_column("Name", justify="left")
             table.add_column("Value", justify="left")
             table.add_row("Drop last batch", str(self.drop_last))
+            table.add_row("Use on-disk DB", str(self.use_ondisk))
+            table.add_row("Force reload", str(self.force_reload))
             table.add_row("Batch size", str(self.batch_size))
             table.add_row("Num workers", str(self.num_workers))
             table.add_row("Persistent workers", str(self.persistent_workers))
             table.add_row("Pin memory", str(self.pin_memory))
             
-            if self.cache_dir:
-                table.add_row("Cache directory", self.cache_dir)
-            
             if self.train_data is not None:
+                table.add_row("Training set", str(self.train_set))
                 table.add_row("Training samples", str(len(self.index_range) if self.index_range else len(self.train_data)))
             if self.val_data is not None:
+                table.add_row("Validation set", str(self.val_set) if self.val_set else "split from training set")
                 table.add_row("Validation samples", str(len(self.val_data)))
             if self.predict_data is not None:
+                table.add_row("Prediction set", str(self.predict_set))
                 table.add_row("Prediction samples", str(len(self.predict_data)))
             
             table.add_row("N node attributes", str(self.node_in_channels))

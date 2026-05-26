@@ -41,15 +41,38 @@ def _negate(x):
     return -x
 
 
+def _div6(x):
+    return x / 6
+
+
+def _div8(x):
+    return x / 8
+
+
+def _div4(x):
+    return x / 4
+
+
 # Registry of all picklable transforms
 TRANSFORM_REGISTRY = {
     'identity': _identity,
+    'x': _identity,
     'log': _log,
+    'torch.log(x)': _log,
     'log10': _log10,
+    'torch.log10(x)': _log10,
     'sqrt': _sqrt,
+    'torch.sqrt(x)': _sqrt,
     'exp': _exp,
+    'torch.exp(x)': _exp,
     'sigmoid': _sigmoid,
+    'torch.sigmoid(x)': _sigmoid,
     'normalize': _normalize,
     'abs': _abs,
+    'torch.abs(x)': _abs,
     'negate': _negate,
+    '-x': _negate,
+    'x/4': _div4,
+    'x/6': _div6,
+    'x/8': _div8,
 }
