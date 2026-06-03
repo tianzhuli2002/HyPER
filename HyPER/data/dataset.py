@@ -2,6 +2,7 @@ from typing import Callable, List, Optional, Tuple, Sequence
 from warnings import warn
 from copy import deepcopy
 from os import path as osp
+from itertools import combinations, permutations
 import time
 import sys
 import os
@@ -98,19 +99,33 @@ class HyPERDataset(Dataset):
 
         # Edge features
         self.edge_features_to_use = self.parse_edge_features(parsed_inputs)
+        self.edge_feature_names = list(self.edge_features_to_use.keys())
+        self.edge_directionality = str(
+            parsed_inputs["input"].get("edge_directionality", "undirected")
+        ).strip().lower()
+        if self.edge_directionality not in {"undirected", "directed"}:
+            raise ValueError(
+                "input.edge_directionality must be either 'undirected' or 'directed'."
+            )
 
         # Node/global transforms
         node_transform_names = parsed_inputs['input'].get('node_transforms', [])
         global_transform_names = parsed_inputs['input'].get('global_transforms', [])
 
-        self._node_transforms = [
-            TRANSFORM_REGISTRY.get(name, TRANSFORM_REGISTRY['identity'])
-            for name in node_transform_names
-        ]
-        self._global_transforms = [
-            TRANSFORM_REGISTRY.get(name, TRANSFORM_REGISTRY['identity'])
-            for name in global_transform_names
-        ]
+        if len(node_transform_names) != len(self.node_feature_names):
+            raise ValueError(
+                "`input.node_transforms` must match `input.node_features`: "
+                f"{len(node_transform_names)} transforms for {len(self.node_feature_names)} features."
+            )
+        global_feature_names = parsed_inputs['input'].get('global_features', [])
+        if len(global_transform_names) != len(global_feature_names):
+            raise ValueError(
+                "`input.global_transforms` must match `input.global_features`: "
+                f"{len(global_transform_names)} transforms for {len(global_feature_names)} features."
+            )
+
+        self._node_transforms = self._resolve_transforms(node_transform_names, "input.node_transforms")
+        self._global_transforms = self._resolve_transforms(global_transform_names, "input.global_transforms")
 
         # Build transform pipeline
         self._transforms = TransformFeatures(
@@ -180,6 +195,17 @@ class HyPERDataset(Dataset):
                   file=sys.stderr, flush=True)
 
         return data
+
+
+    def processing_chunk(self, start: int, end: int) -> List[Data]:
+        """Build a contiguous event chunk through the canonical per-event path.
+
+        This preserves the exact filtering and transform semantics of
+        :meth:`__getitem__` while giving the on-disk preprocessor a safe chunking
+        interface. A future implementation can batch raw HDF5 reads behind this
+        method without changing the DB writer.
+        """
+        return [self[idx] for idx in range(start, end)]
 
 
     def processing(self, idx: int) -> Data:
@@ -352,6 +378,16 @@ class HyPERDataset(Dataset):
 
     def _has_node_features(self, *names: str) -> bool:
         return all(name in self._node_feature_index for name in names)
+
+    @staticmethod
+    def _resolve_transforms(names: Sequence[str], config_key: str) -> List[Callable]:
+        unknown = [name for name in names if name not in TRANSFORM_REGISTRY]
+        if unknown:
+            raise ValueError(
+                f"Unknown transform name(s) in `{config_key}`: {unknown}. "
+                f"Known transforms are: {sorted(TRANSFORM_REGISTRY)}"
+            )
+        return [TRANSFORM_REGISTRY[name] for name in names]
 
 
     def assign_target_ids(self) -> Tuple[List, List]:
@@ -559,10 +595,23 @@ class HyPERDataset(Dataset):
 
 
     def build_edge_indices(self, local_node_ids_chunk: ak.Array, cantor_node_ids_chunk: ak.Array) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build edge indices for UNDIRECTED graph (i < j only)."""
+        """Build graph edge indices.
+
+        The default is ``input.edge_directionality: undirected`` for backwards
+        compatibility with existing HyPER caches and reconstruction outputs.
+        ``directed`` is available for explicit audits/training tests against the
+        VyPER-style convention.
+        """
 
         # === Local node indices ===
-        edge_pairs = ak.combinations(local_node_ids_chunk, 2)
+        edge_pairs = (
+            ak.combinations(local_node_ids_chunk, 2)
+            if self.edge_directionality == "undirected"
+            else ak.cartesian((local_node_ids_chunk, local_node_ids_chunk), nested=True)
+        )
+        if self.edge_directionality == "directed":
+            edge_pair_indices = ak.argcartesian((local_node_ids_chunk, local_node_ids_chunk), nested=True)
+            edge_pairs = edge_pairs[edge_pair_indices["0"] != edge_pair_indices["1"]]
         edge_index_0 = ak.flatten(edge_pairs["0"])
         edge_index_1 = ak.flatten(edge_pairs["1"])
         edge_index_0_torch = torch.tensor(edge_index_0.to_numpy(), dtype=torch.long)
@@ -573,7 +622,16 @@ class HyPERDataset(Dataset):
             cantor_edge_index_chunk = torch.empty((2, 0), dtype=torch.long)
         else:
             # === Cantor node indices ===
-            cantor_edge_pairs = ak.combinations(cantor_node_ids_chunk, 2)
+            cantor_edge_pairs = (
+                ak.combinations(cantor_node_ids_chunk, 2)
+                if self.edge_directionality == "undirected"
+                else ak.cartesian((cantor_node_ids_chunk, cantor_node_ids_chunk), nested=True)
+            )
+            if self.edge_directionality == "directed":
+                cantor_edge_pair_indices = ak.argcartesian((cantor_node_ids_chunk, cantor_node_ids_chunk), nested=True)
+                cantor_edge_pairs = cantor_edge_pairs[
+                    cantor_edge_pair_indices["0"] != cantor_edge_pair_indices["1"]
+                ]
             cantor_edge_index_0 = ak.flatten(cantor_edge_pairs["0"])
             cantor_edge_index_1 = ak.flatten(cantor_edge_pairs["1"])
             cantor_edge_index_0_torch = torch.tensor(cantor_edge_index_0.to_numpy(), dtype=torch.long)
@@ -620,55 +678,42 @@ class HyPERDataset(Dataset):
 
         vectors = ak.concatenate(object_vectors_list, axis=1)
 
-        # === Use ak.combinations for undirected edges (i < j), NOT cartesian! ===
-        pairs = ak.combinations(vectors, 2)
+        if self.edge_directionality == "undirected":
+            pairs = ak.combinations(vectors, 2)
+        else:
+            pairs = ak.cartesian((vectors, vectors), nested=True)
+            pair_indices = ak.argcartesian((vectors, vectors), nested=True)
+            pairs = pairs[pair_indices["0"] != pair_indices["1"]]
 
         # Extract components from pairs
         v1 = pairs["0"]
         v2 = pairs["1"]
 
-        # Compute pairwise features
-        # Note: deltaR/deltaeta/deltaphi already return positive values, no abs needed
-        # Also: use deltaphi (no underscore), not delta_phi
-        DR   = v1.deltaR(v2)
-        Deta = v1.eta - v2.eta
-        Dphi = v1.deltaphi(v2)  # ← No underscore!
-        M    = (v1 + v2).m
+        raw_features = {
+            "delta_eta": np.abs(np.asarray(ak.to_numpy(ak.drop_none(ak.nan_to_none(v1.eta - v2.eta)))).ravel()).astype(np.float32),
+            "delta_phi": np.asarray(ak.to_numpy(ak.drop_none(ak.nan_to_none(v1.deltaphi(v2))))).ravel().astype(np.float32),
+            "delta_R": np.abs(np.asarray(ak.to_numpy(ak.drop_none(ak.nan_to_none(v1.deltaR(v2))))).ravel()).astype(np.float32),
+            "M": np.asarray(ak.to_numpy(ak.drop_none(ak.nan_to_none((v1 + v2).m)))).ravel().astype(np.float32),
+            "M2": np.asarray(ak.to_numpy(ak.drop_none(ak.nan_to_none((v1 + v2).m2)))).ravel().astype(np.float32),
+            "kT": np.minimum(v1.pt, v2.pt) * v1.deltaR(v2),
+            "Z": np.minimum(v1.pt, v2.pt) / (v1.pt + v2.pt),
+        }
+        for key in ("kT", "Z"):
+            raw_features[key] = np.asarray(
+                ak.to_numpy(ak.drop_none(ak.nan_to_none(raw_features[key])))
+            ).ravel().astype(np.float32)
 
-        # Remove any NaN/None values
-        DR   = ak.drop_none(ak.nan_to_none(DR))
-        Deta = ak.drop_none(ak.nan_to_none(Deta))
-        Dphi = ak.drop_none(ak.nan_to_none(Dphi))
-        M    = ak.drop_none(ak.nan_to_none(M))
-
-        # Convert to numpy via awkward and perform a single conversion to torch
-        np_DR = ak.to_numpy(DR)
-        np_Deta = ak.to_numpy(Deta)
-        np_Dphi = ak.to_numpy(Dphi)
-        np_M = ak.to_numpy(M)
-
-        # ak.to_numpy may return arrays with a leading event dimension (1, N).
-        # Flatten to 1D per-event arrays for stacking (N,).
-        np_DR = np.asarray(np_DR).ravel()
-        np_Deta = np.asarray(np_Deta).ravel()
-        np_Dphi = np.asarray(np_Dphi).ravel()
-        np_M = np.asarray(np_M).ravel()
-
-        # Stack into a single (N,4) numpy array to perform one torch.from_numpy call
-        if np_DR.size == 0:
+        first_feature = raw_features[self.edge_feature_names[0]] if self.edge_feature_names else np.asarray([])
+        if first_feature.size == 0:
             # No edges in this event
-            return torch.empty((0, 4), dtype=torch.float32)
+            return torch.empty((0, len(self.edge_feature_names)), dtype=torch.float32)
 
-        stacked = np.stack([
-            np.abs(np_Deta).astype(np.float32),
-            np_Dphi.astype(np.float32),
-            np.abs(np_DR).astype(np.float32),
-            np_M.astype(np.float32),
-        ], axis=1)
+        stacked = np.stack([raw_features[name] for name in self.edge_feature_names], axis=1)
 
         edge_attr_chunk = torch.from_numpy(stacked)
-        # Clamp mass column to avoid zeros/very small values
-        edge_attr_chunk[:, 3] = torch.clamp(edge_attr_chunk[:, 3], min=0.001)
+        for col, name in enumerate(self.edge_feature_names):
+            if name in {"M", "M2", "kT", "Z"}:
+                edge_attr_chunk[:, col] = torch.clamp(edge_attr_chunk[:, col], min=0.001)
 
         return edge_attr_chunk
 
@@ -693,7 +738,14 @@ class HyPERDataset(Dataset):
 
     def find_matched_connections(self, connection_input_cantor_tensor: torch.Tensor,
                                 target_connection_ids: Sequence[Sequence[int]]) -> torch.Tensor:
-        """Vectorized version - assign target 1 or 0 to all connection objects."""
+        """Assign target 1 or 0 to all connection objects.
+
+        Candidate edges/hyperedges are unordered combinations of graph nodes.
+        Truth target definitions are semantic sets, so matching must be
+        permutation-invariant.  Sorting both the candidate Cantor IDs and target
+        Cantor IDs avoids dropping valid Whad/thad targets when, for example,
+        W_HAD_J2 appears before W_HAD_J1 in the input jet order.
+        """
         if len(target_connection_ids) == 0:
             n_conn = connection_input_cantor_tensor.shape[1]
             return torch.zeros(n_conn, 1, dtype=torch.float32)
@@ -702,6 +754,8 @@ class HyPERDataset(Dataset):
                               for t in target_connection_ids])
 
         connections = connection_input_cantor_tensor.t()
+        connections = torch.sort(connections, dim=1).values
+        targets = torch.sort(targets, dim=1).values
         matches = (connections.unsqueeze(1) == targets.unsqueeze(0))
         full_matches = matches.all(dim=2)
         output_labels = full_matches.any(dim=1, keepdim=True).float()

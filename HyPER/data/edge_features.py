@@ -27,5 +27,6 @@ EDGE_FEATURE_TRANSFORMS = {
     "delta_R": _identity,
     "kT": _log_clamped,      # log(kT), kT can be small
     "Z": _log_clamped,       # log(Z), Z can be small
+    "M": _log_positive,      # log(M), invariant mass should be positive
     "M2": _log_positive,     # log(M^2), mass squared should be positive
 }

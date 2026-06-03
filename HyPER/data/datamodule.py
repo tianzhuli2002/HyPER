@@ -36,6 +36,7 @@ class HyPERDataModule(LightningDataModule):
         num_workers: int = 8,
         pin_memory: bool = True,
         persistent_workers: bool = True,
+        prefetch_factor: int = 2,
         cache_dir: Optional[str] = None,
         force_reload: bool = False,
         use_ondisk: bool = True,
@@ -54,6 +55,7 @@ class HyPERDataModule(LightningDataModule):
         self.drop_last = drop_last
         self.max_n_events = max_n_events
         self.persistent_workers = persistent_workers
+        self.prefetch_factor = prefetch_factor
         self.percent_valid_samples = percent_valid_samples
         self.cache_dir = cache_dir
         self.force_reload = force_reload
@@ -192,6 +194,7 @@ class HyPERDataModule(LightningDataModule):
             table.add_row("Batch size", str(self.batch_size))
             table.add_row("Num workers", str(self.num_workers))
             table.add_row("Persistent workers", str(self.persistent_workers))
+            table.add_row("Prefetch factor", str(self.prefetch_factor))
             table.add_row("Pin memory", str(self.pin_memory))
             
             if self.train_data is not None:
@@ -232,7 +235,7 @@ class HyPERDataModule(LightningDataModule):
             shuffle = True
         
         # === SPEEDUP 3: Optimize prefetch_factor ===
-        prefetch_factor = 2 if self.num_workers > 0 else None
+        prefetch_factor = self.prefetch_factor if self.num_workers > 0 else None
         
         # === SPEEDUP 4: Use worker_init_fn for reproducible seeding ===
         worker_init_fn_to_use = worker_init_fn if self.num_workers > 0 else None
@@ -253,7 +256,7 @@ class HyPERDataModule(LightningDataModule):
     def val_dataloader(self):
         """Returns validation DataLoader - OPTIMIZED."""
         follow_batch = ['edge_attr', 'hyperedge_index'] if self._use_hyperedge else ['edge_attr']
-        prefetch_factor = 2 if self.num_workers > 0 else None
+        prefetch_factor = self.prefetch_factor if self.num_workers > 0 else None
         
         # === Use worker_init_fn for reproducible seeding ===
         worker_init_fn_to_use = worker_init_fn if self.num_workers > 0 else None
@@ -274,7 +277,7 @@ class HyPERDataModule(LightningDataModule):
     def predict_dataloader(self):
         """Returns prediction DataLoader - OPTIMIZED."""
         follow_batch = ['edge_attr', 'hyperedge_index'] if self._use_hyperedge else ['edge_attr']
-        prefetch_factor = 2 if self.num_workers > 0 else None
+        prefetch_factor = self.prefetch_factor if self.num_workers > 0 else None
         
         # === Use worker_init_fn for reproducible seeding ===
         worker_init_fn_to_use = worker_init_fn if self.num_workers > 0 else None

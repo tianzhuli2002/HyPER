@@ -94,6 +94,11 @@ def Train(cfg : DictConfig) -> None:
     batch_size = _select(cfg, 'dataset.batch_size', 'batch_size', 128)
     num_workers = _select(cfg, 'dataset.num_workers', 'datamodule.num_workers', 8)
     pin_memory = _select(cfg, 'dataset.pin_memory', 'datamodule.pin_memory', True if device == "gpu" else False)
+    if device == "cpu" and pin_memory:
+        warnings.warn("Disabling `pin_memory` for CPU training.", UserWarning)
+        pin_memory = False
+    persistent_workers = _select(cfg, 'dataset.persistent_workers', 'datamodule.persistent_workers', True)
+    prefetch_factor = _select(cfg, 'dataset.prefetch_factor', 'datamodule.prefetch_factor', 2)
     cache_dir = _select(cfg, 'dataset.cache_dir', 'datamodule.cache_dir', None)
     force_reload = _select(cfg, 'dataset.force_reload', 'datamodule.force_reload', False)
     use_ondisk = _select(cfg, 'dataset.use_ondisk', 'datamodule.use_ondisk', True)
@@ -111,6 +116,8 @@ def Train(cfg : DictConfig) -> None:
         drop_last = _select(cfg, 'dataset.drop_last', 'drop_last', True),
         num_workers = num_workers,
         pin_memory = pin_memory,
+        persistent_workers = persistent_workers,
+        prefetch_factor = prefetch_factor,
         cache_dir = cache_dir,
         force_reload = force_reload,
         use_ondisk = use_ondisk,
@@ -137,6 +144,9 @@ def Train(cfg : DictConfig) -> None:
         classification_enabled = _select(cfg, 'classification.enabled', default=True),
         # = _select(cfg, 'classification.input_mode', default='edge_hyperedge'),
         classification_loss_weight = classification_loss_weight,
+        reconstruction_weighting = _select(cfg, 'loss.reconstruction_weighting', default='legacy'),
+        positive_weight_cap = _select(cfg, 'loss.positive_weight_cap', default=50.0),
+        negative_weight_cap = _select(cfg, 'loss.negative_weight_cap', default=5.0),
     )
 
     trainer_cfg = cfg.get('trainer', {})
@@ -181,9 +191,11 @@ def Train(cfg : DictConfig) -> None:
         callbacks.append(DeviceStatsMonitor())
 
     # Extract trainer settings
+    precision = trainer_cfg.get("precision", "32-true")
     trainer_kwargs = dict(
         accelerator = device,
         devices = num_devices,
+        precision = precision,
         max_epochs = _select(cfg, 'trainer.epochs', 'epochs', 1),
         callbacks = callbacks,
         logger = TensorBoardLogger(

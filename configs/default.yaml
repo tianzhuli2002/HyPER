@@ -20,7 +20,7 @@ trainer:
   log_graph:               false           # Disable graph logging for faster startup
   enable_device_stats:     false           # DeviceStatsMonitor can add overhead
   enable_early_stopping:   true
-  validation_mode:         keep            # keep|fast
+  validation_mode:         fast           # keep|fast
   checkpoint_mode:         keep_best_last  # keep_best_last|keep_best_only|last_only
   check_val_every_n_epoch: 1
   limit_train_batches:     null
