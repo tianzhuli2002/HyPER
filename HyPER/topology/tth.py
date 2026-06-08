@@ -95,7 +95,10 @@ def _nonjet_nodes_from_vct(nodes, vct):
     return [node for node, kind in zip(_as_list(nodes), _as_list(vct)) if kind != 1]
 
 
-def ttH_single_lep(HyPER_outputs: str | pd.DataFrame):
+def ttH_single_lep(
+    HyPER_outputs: str | pd.DataFrame,
+    classification: bool | None = None,
+):
     r"""Reconstruct ttH events with single-lepton ttH topology.
 
     Assumed training-label convention:
@@ -334,12 +337,15 @@ def ttH_single_lep(HyPER_outputs: str | pd.DataFrame):
         "higgs_valid",
     ]
 
-    if "HyPER_CLS_RAW" in results.columns:
+    if (classification is None or bool(classification)) and "HyPER_CLS_RAW" in results.columns:
         columns_to_return.append("HyPER_CLS_RAW")
 
     return results[columns_to_return]
 
 
 # Alias with shorter naming for config/CLI dispatch.
-def tth_single_lep(HyPER_outputs: str | pd.DataFrame):
-    return ttH_single_lep(HyPER_outputs)
+def tth_single_lep(
+    HyPER_outputs: str | pd.DataFrame,
+    classification: bool | None = None,
+):
+    return ttH_single_lep(HyPER_outputs, classification=classification)
