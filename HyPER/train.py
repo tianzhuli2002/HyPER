@@ -124,6 +124,9 @@ def Train(cfg : DictConfig) -> None:
         graph_config = graph_config,
     )
 
+    trainer_cfg = cfg.get('trainer', {})
+    check_val_every_n_epoch = trainer_cfg.get('check_val_every_n_epoch', 1)
+
     model = HyPERModel(
         node_in_channels = datamodule.node_in_channels,
         edge_in_channels = datamodule.edge_in_channels,
@@ -137,6 +140,15 @@ def Train(cfg : DictConfig) -> None:
         criterion_hyperedge = _select(cfg, 'loss.criterion_hyperedge', 'criterion_hyperedge', 'BCE'),
         optimizer = _select(cfg, 'optimizer.name', 'optimizer', 'Adam'),
         lr = _select(cfg, 'optimizer.learning_rate', 'learning_rate', 1e-3),
+        weight_decay = _select(cfg, 'optimizer.weight_decay', default=0.0),
+        lr_scheduler_enabled = _select(cfg, 'lr_scheduler.enabled', default=True),
+        lr_scheduler_method = _select(cfg, 'lr_scheduler.method', default='reduce_on_plateau'),
+        lr_scheduler_monitor = _select(cfg, 'lr_scheduler.monitor', default='val_loss'),
+        lr_scheduler_mode = _select(cfg, 'lr_scheduler.mode', default='min'),
+        lr_scheduler_factor = _select(cfg, 'lr_scheduler.factor', default=0.8),
+        lr_scheduler_patience = _select(cfg, 'lr_scheduler.patience', default=10),
+        lr_scheduler_min_lr = _select(cfg, 'lr_scheduler.min_lr', default=0.0),
+        lr_scheduler_frequency = _select(cfg, 'lr_scheduler.frequency', default=check_val_every_n_epoch),
         alpha = _select(cfg, 'loss.alpha', 'alpha', 0.5),
         beta = classification_loss_weight,
         reduction = _select(cfg, 'loss.reduction', 'loss_reduction', 'mean'),
@@ -149,7 +161,6 @@ def Train(cfg : DictConfig) -> None:
         negative_weight_cap = _select(cfg, 'loss.negative_weight_cap', default=5.0),
     )
 
-    trainer_cfg = cfg.get('trainer', {})
     checkpoint_mode = str(trainer_cfg.get('checkpoint_mode', 'keep_best_last')).lower()
 
     if checkpoint_mode == 'keep_best_only':
@@ -165,20 +176,24 @@ def Train(cfg : DictConfig) -> None:
     callbacks = [
         ModelCheckpoint(
             verbose=True,
-            monitor="loss/validation_loss",
+            monitor=_select(cfg, 'checkpoint.monitor', default='val_loss'),
             save_top_k=save_top_k,
-            mode="min",
-            save_last=save_last
+            mode=_select(cfg, 'checkpoint.mode', default='min'),
+            save_last=save_last,
+            save_on_train_epoch_end=False,
         ),
     ]
 
-    if trainer_cfg.get('enable_early_stopping', True):
+    early_stopping_enabled = _select(cfg, 'early_stopping.enabled', 'trainer.enable_early_stopping', True)
+    if early_stopping_enabled:
         callbacks.append(EarlyStopping(
-            monitor="loss/validation_loss",
-            mode="min",
-            min_delta=0.00,
-            patience=_select(cfg, 'trainer.patience', 'patience', 30),
-            verbose=False
+            monitor=_select(cfg, 'early_stopping.monitor', default='val_loss'),
+            mode=_select(cfg, 'early_stopping.mode', default='min'),
+            min_delta=_select(cfg, 'early_stopping.min_delta', default=0.00),
+            patience=_select(cfg, 'early_stopping.patience', 'trainer.patience', 30),
+            verbose=False,
+            strict=False,
+            check_on_train_epoch_end=False,
         ))
 
     callbacks += [
@@ -192,6 +207,7 @@ def Train(cfg : DictConfig) -> None:
 
     # Extract trainer settings
     precision = trainer_cfg.get("precision", "32-true")
+    print(f"Validation cadence: check_val_every_n_epoch={check_val_every_n_epoch}")
     trainer_kwargs = dict(
         accelerator = device,
         devices = num_devices,
@@ -205,13 +221,13 @@ def Train(cfg : DictConfig) -> None:
         ),
         log_every_n_steps = trainer_cfg.get('log_every_n_steps', 50),
         num_sanity_val_steps = trainer_cfg.get('num_sanity_val_steps', 0),
+        check_val_every_n_epoch = check_val_every_n_epoch,
     )
     
     # Add optional trainer controls
-    if trainer_cfg.get('gradient_clip', None) is not None:
-        trainer_kwargs['gradient_clip_val'] = trainer_cfg['gradient_clip']
-    if trainer_cfg.get('check_val_every_n_epoch', None) is not None:
-        trainer_kwargs['check_val_every_n_epoch'] = trainer_cfg['check_val_every_n_epoch']
+    gradient_clip_val = _select(cfg, 'trainer.gradient_clip_val', 'trainer.gradient_clip', None)
+    if gradient_clip_val is not None:
+        trainer_kwargs['gradient_clip_val'] = gradient_clip_val
     if trainer_cfg.get('limit_val_batches', None) is not None:
         trainer_kwargs['limit_val_batches'] = trainer_cfg['limit_val_batches']
     if trainer_cfg.get('limit_train_batches', None) is not None:
@@ -221,7 +237,15 @@ def Train(cfg : DictConfig) -> None:
     
     trainer = pl.Trainer(**trainer_kwargs)
 
-    continue_from_ckpt = _select(cfg, 'paths.checkpoint', 'continue_from_ckpt', None)
+    continue_from_ckpt = _select(cfg, 'training.resume_from_checkpoint', 'paths.checkpoint', None)
+    if continue_from_ckpt is None:
+        continue_from_ckpt = _select(cfg, 'continue_from_ckpt', default=None)
+    if continue_from_ckpt is not None:
+        continue_from_ckpt = str(continue_from_ckpt).strip()
+        if not continue_from_ckpt:
+            continue_from_ckpt = None
+    if continue_from_ckpt is not None and not os.path.isfile(continue_from_ckpt):
+        raise FileNotFoundError(f"Checkpoint not found: {continue_from_ckpt}")
 
     if continue_from_ckpt is not None and cfg.get('reset_params', False) is True:
         print("Resume training state from %s, using new hyperparameters"%(continue_from_ckpt))

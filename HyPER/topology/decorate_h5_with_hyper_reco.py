@@ -35,7 +35,22 @@ LOGGER = logging.getLogger(__name__)
 OBJECT_DTYPE = np.dtype(
     [("e", "f4"), ("eta", "f4"), ("phi", "f4"), ("pt", "f4")]
 )
-CONSTITUENT_DTYPE = np.dtype(
+TTBAR_SL_CONSTITUENT_DTYPE = np.dtype(
+    [
+        ("e", "f4"),
+        ("eta", "f4"),
+        ("phi", "f4"),
+        ("pt", "f4"),
+        ("btag", "f4"),
+        ("id", "f4"),
+        ("reco_score", "f4"),
+        ("is_b_lep", "f4"),
+        ("is_b_had", "f4"),
+        ("is_Whad_j1", "f4"),
+        ("is_Whad_j2", "f4"),
+    ]
+)
+TTH_CONSTITUENT_DTYPE = np.dtype(
     [
         ("e", "f4"),
         ("eta", "f4"),
@@ -52,7 +67,7 @@ CONSTITUENT_DTYPE = np.dtype(
         ("is_Higgs_b2", "f4"),
     ]
 )
-RECO_GLOBAL_DTYPE = np.dtype(
+TTBAR_SL_RECO_GLOBAL_DTYPE = np.dtype(
     [
         ("m_thad", "f4"),
         ("m_Whad", "f4"),
@@ -87,6 +102,10 @@ TTH_RECO_GLOBAL_DTYPE = np.dtype(
         ("higgs_valid", "f4"),
     ]
 )
+
+# Backwards-compatible local aliases for helper code that still refers to the
+# original names internally.
+RECO_GLOBAL_DTYPE = TTBAR_SL_RECO_GLOBAL_DTYPE
 
 PRIMARY_INPUT_PATHS = [
     "INPUTS/TOP_HAD",
@@ -166,6 +185,22 @@ def get_field(row: np.void, candidates: tuple[str, ...]) -> float:
             except (TypeError, ValueError):
                 return float("nan")
     return float("nan")
+def phi_from_row(
+    row: np.void,
+    phi_candidates: tuple[str, ...] = ("phi",),
+    sin_candidates: tuple[str, ...] = ("sin_phi", "sinphi"),
+    cos_candidates: tuple[str, ...] = ("cos_phi", "cosphi"),
+) -> float:
+    phi = get_field(row, phi_candidates)
+    if math.isfinite(phi):
+        return phi
+
+    sin_phi = get_field(row, sin_candidates)
+    cos_phi = get_field(row, cos_candidates)
+    if math.isfinite(sin_phi) and math.isfinite(cos_phi):
+        return math.atan2(sin_phi, cos_phi)
+
+    return float("nan")
 
 
 def row_to_candidate_features(row: np.void) -> tuple[float, float, float, float, float, float]:
@@ -173,12 +208,11 @@ def row_to_candidate_features(row: np.void) -> tuple[float, float, float, float,
     return (
         get_field(row, ("e", "energy", "E")),
         get_field(row, ("eta",)),
-        get_field(row, ("phi",)),
+        phi_from_row(row),
         get_field(row, ("pt", "pT")),
         get_field(row, ("btag", "btag_score", "btagging", "btagged")),
         get_field(row, ("id", "pid", "type")),
     )
-
 
 def p4_from_e_eta_phi_pt(e: float, eta: float, phi: float, pt: float) -> np.ndarray:
     """Return [E, px, py, pz]."""
@@ -219,7 +253,12 @@ def invariant_mass(vec: np.ndarray) -> float:
 def met_proxy_p4(row: np.void) -> np.ndarray:
     """Build a massless transverse MET proxy, ignoring MET eta if present."""
     pt = get_field(row, ("pt", "met", "met_pt"))
-    phi = get_field(row, ("phi", "met_phi"))
+    phi = phi_from_row(
+        row,
+        phi_candidates=("phi", "met_phi"),
+        sin_candidates=("sin_phi", "sinphi", "met_sin_phi", "met_sinphi"),
+        cos_candidates=("cos_phi", "cosphi", "met_cos_phi", "met_cosphi"),
+    )
     if not (math.isfinite(pt) and math.isfinite(phi)):
         return np.full(4, np.nan, dtype=float)
     return np.asarray([pt, pt * math.cos(phi), pt * math.sin(phi), 0.0], dtype=float)
@@ -386,11 +425,11 @@ def create_decoration_datasets(
     output_dtypes = {
         "TOP_HAD": OBJECT_DTYPE,
         "W_HAD": OBJECT_DTYPE,
-        "TOP_HAD_B": CONSTITUENT_DTYPE,
-        "W_HAD_J1": CONSTITUENT_DTYPE,
-        "W_HAD_J2": CONSTITUENT_DTYPE,
-        "B_LEP": CONSTITUENT_DTYPE,
-        "RECO_GLOBAL": RECO_GLOBAL_DTYPE,
+        "TOP_HAD_B": TTBAR_SL_CONSTITUENT_DTYPE,
+        "W_HAD_J1": TTBAR_SL_CONSTITUENT_DTYPE,
+        "W_HAD_J2": TTBAR_SL_CONSTITUENT_DTYPE,
+        "B_LEP": TTBAR_SL_CONSTITUENT_DTYPE,
+        "RECO_GLOBAL": TTBAR_SL_RECO_GLOBAL_DTYPE,
     }
     debug_shapes = {
         "b_lep_idx": (n_events,),
@@ -458,12 +497,12 @@ def create_tth_decoration_datasets(
         "TOP_HAD": OBJECT_DTYPE,
         "W_HAD": OBJECT_DTYPE,
         "HIGGS": OBJECT_DTYPE,
-        "TOP_HAD_B": CONSTITUENT_DTYPE,
-        "W_HAD_J1": CONSTITUENT_DTYPE,
-        "W_HAD_J2": CONSTITUENT_DTYPE,
-        "B_LEP": CONSTITUENT_DTYPE,
-        "HIGGS_B1": CONSTITUENT_DTYPE,
-        "HIGGS_B2": CONSTITUENT_DTYPE,
+        "TOP_HAD_B": TTH_CONSTITUENT_DTYPE,
+        "W_HAD_J1": TTH_CONSTITUENT_DTYPE,
+        "W_HAD_J2": TTH_CONSTITUENT_DTYPE,
+        "B_LEP": TTH_CONSTITUENT_DTYPE,
+        "HIGGS_B1": TTH_CONSTITUENT_DTYPE,
+        "HIGGS_B2": TTH_CONSTITUENT_DTYPE,
         "RECO_GLOBAL": TTH_RECO_GLOBAL_DTYPE,
     }
     debug_shapes = {
@@ -703,11 +742,11 @@ def decorate_ttbar_singlelep(
     outputs = {
         "TOP_HAD": fill_nan_structured((n_output_events, 1), OBJECT_DTYPE),
         "W_HAD": fill_nan_structured((n_output_events, 1), OBJECT_DTYPE),
-        "TOP_HAD_B": fill_nan_structured((n_output_events, 1), CONSTITUENT_DTYPE),
-        "W_HAD_J1": fill_nan_structured((n_output_events, 1), CONSTITUENT_DTYPE),
-        "W_HAD_J2": fill_nan_structured((n_output_events, 1), CONSTITUENT_DTYPE),
-        "B_LEP": fill_nan_structured((n_output_events, 1), CONSTITUENT_DTYPE),
-        "RECO_GLOBAL": fill_nan_structured((n_output_events, 1), RECO_GLOBAL_DTYPE),
+        "TOP_HAD_B": fill_nan_structured((n_output_events, 1), TTBAR_SL_CONSTITUENT_DTYPE),
+        "W_HAD_J1": fill_nan_structured((n_output_events, 1), TTBAR_SL_CONSTITUENT_DTYPE),
+        "W_HAD_J2": fill_nan_structured((n_output_events, 1), TTBAR_SL_CONSTITUENT_DTYPE),
+        "B_LEP": fill_nan_structured((n_output_events, 1), TTBAR_SL_CONSTITUENT_DTYPE),
+        "RECO_GLOBAL": fill_nan_structured((n_output_events, 1), TTBAR_SL_RECO_GLOBAL_DTYPE),
     }
 
     debug_indices = None
@@ -929,12 +968,12 @@ def decorate_ttH(
         "TOP_HAD": fill_nan_structured((n_output_events, 1), OBJECT_DTYPE),
         "W_HAD": fill_nan_structured((n_output_events, 1), OBJECT_DTYPE),
         "HIGGS": fill_nan_structured((n_output_events, 1), OBJECT_DTYPE),
-        "TOP_HAD_B": fill_nan_structured((n_output_events, 1), CONSTITUENT_DTYPE),
-        "W_HAD_J1": fill_nan_structured((n_output_events, 1), CONSTITUENT_DTYPE),
-        "W_HAD_J2": fill_nan_structured((n_output_events, 1), CONSTITUENT_DTYPE),
-        "B_LEP": fill_nan_structured((n_output_events, 1), CONSTITUENT_DTYPE),
-        "HIGGS_B1": fill_nan_structured((n_output_events, 1), CONSTITUENT_DTYPE),
-        "HIGGS_B2": fill_nan_structured((n_output_events, 1), CONSTITUENT_DTYPE),
+        "TOP_HAD_B": fill_nan_structured((n_output_events, 1), TTH_CONSTITUENT_DTYPE),
+        "W_HAD_J1": fill_nan_structured((n_output_events, 1), TTH_CONSTITUENT_DTYPE),
+        "W_HAD_J2": fill_nan_structured((n_output_events, 1), TTH_CONSTITUENT_DTYPE),
+        "B_LEP": fill_nan_structured((n_output_events, 1), TTH_CONSTITUENT_DTYPE),
+        "HIGGS_B1": fill_nan_structured((n_output_events, 1), TTH_CONSTITUENT_DTYPE),
+        "HIGGS_B2": fill_nan_structured((n_output_events, 1), TTH_CONSTITUENT_DTYPE),
         "RECO_GLOBAL": fill_nan_structured((n_output_events, 1), TTH_RECO_GLOBAL_DTYPE),
     }
 

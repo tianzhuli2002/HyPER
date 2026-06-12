@@ -1,7 +1,7 @@
 import torch
 
 from torch.nn import Sequential as Seq, Linear, BCELoss, Sigmoid
-from torch.optim import lr_scheduler, Adam
+from torch.optim import lr_scheduler, Adam, AdamW
 from torch_geometric.utils import unbatch, degree
 from lightning import LightningModule
 from .MPNNs import MPNNs
@@ -49,6 +49,15 @@ class HyPERModel(LightningModule):
             criterion_hyperedge: Optional[str] = "BCE",
             optimizer: Optional[str] = "Adam",
             lr: Optional[float] = 1e-3,
+            weight_decay: Optional[float] = 0.0,
+            lr_scheduler_enabled: Optional[bool] = True,
+            lr_scheduler_method: Optional[str] = "reduce_on_plateau",
+            lr_scheduler_monitor: Optional[str] = "val_loss",
+            lr_scheduler_mode: Optional[str] = "min",
+            lr_scheduler_factor: Optional[float] = 0.8,
+            lr_scheduler_patience: Optional[int] = 10,
+            lr_scheduler_min_lr: Optional[float] = 0.0,
+            lr_scheduler_frequency: Optional[int] = 1,
             alpha: Optional[float] = 0.5,
             beta: Optional[float] = 0.5,
             reduction: Optional[str] = 'mean',
@@ -334,21 +343,46 @@ class HyPERModel(LightningModule):
                     )
 
     def configure_optimizers(self):
-        if str(self.hparams.optimizer).lower() == 'adam':
-            optimizer = Adam(self.parameters(), lr=self.hparams.lr)
-        # --------- custom optimizers ---------
-        # elif
-        # -------------------------------------
+        optimizer_name = str(self.hparams.optimizer).lower()
+        lr = float(self.hparams.lr)
+        weight_decay = float(self.hparams.weight_decay or 0.0)
+        print(f"Configuring optimizer: name={optimizer_name}, lr={lr}, weight_decay={weight_decay}")
+
+        if optimizer_name == 'adam':
+            optimizer = Adam(self.parameters(), lr=lr, weight_decay=weight_decay)
+        elif optimizer_name == 'adamw':
+            optimizer = AdamW(self.parameters(), lr=lr, weight_decay=weight_decay)
         else:
-            raise ValueError("Supported optimizers are: `torch.Adam`.")
+            raise ValueError("Supported optimizers are: adam, adamw.")
+
+        if not bool(self.hparams.lr_scheduler_enabled):
+            return optimizer
+
+        scheduler_method = str(self.hparams.lr_scheduler_method).lower()
+        if scheduler_method not in ('reduce_on_plateau', 'reducelronplateau'):
+            raise ValueError("Supported lr_scheduler methods are: reduce_on_plateau.")
+
+        monitor = str(self.hparams.lr_scheduler_monitor or "val_loss")
+        print(
+            "Configuring lr scheduler: "
+            f"method=reduce_on_plateau, monitor={monitor}, mode={self.hparams.lr_scheduler_mode}, "
+            f"factor={self.hparams.lr_scheduler_factor}, patience={self.hparams.lr_scheduler_patience}, "
+            f"min_lr={self.hparams.lr_scheduler_min_lr}"
+        )
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
-                "scheduler": lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=10),
+                "scheduler": lr_scheduler.ReduceLROnPlateau(
+                    optimizer,
+                    mode=str(self.hparams.lr_scheduler_mode),
+                    factor=float(self.hparams.lr_scheduler_factor),
+                    patience=int(self.hparams.lr_scheduler_patience),
+                    min_lr=float(self.hparams.lr_scheduler_min_lr),
+                ),
                 "interval": "epoch",
-                "monitor": "loss/validation_loss", #_epoch",
-                "frequency": 1,
-                "strict": True
+                "monitor": monitor,
+                "frequency": int(self.hparams.lr_scheduler_frequency),
+                "strict": False,
             },
         }
 
@@ -460,6 +494,7 @@ class HyPERModel(LightningModule):
         accuracy_edge  = BinaryAccuracy(ignore_index=0).to(edge_attr_prime)
 
         # Logging
+        self.log('val_loss', loss, batch_size=len(val_batch), on_step=val_on_step, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         self.log('loss/validation_loss', loss, batch_size=len(val_batch), on_step=val_on_step, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
         if loss_class is not None and loss_class.numel() > 0:
             self.log('loss/validation_classification_loss', loss_class.mean(), batch_size=len(val_batch), on_step=val_on_step, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)

@@ -87,6 +87,192 @@ def _select_best_edge(GE_IDX, GE_RAW, GE_VCT, predicate, required_subset=None, f
     return None, [-1, -1], 0.0
 
 
+def _candidate_hyperedges(HE_IDX, HE_RAW, HE_VCT, predicate, max_candidates):
+    candidates = []
+    order = np.argsort(np.asarray(HE_RAW, dtype=float))[::-1]
+    for idx in order:
+        if not predicate(HE_VCT[idx]):
+            continue
+        candidates.append((int(idx), _as_list(HE_IDX[idx]), float(HE_RAW[idx])))
+        if len(candidates) >= int(max_candidates):
+            break
+    return candidates
+
+
+def _candidate_edges(GE_IDX, GE_RAW, GE_VCT, predicate, max_candidates):
+    candidates = []
+    order = np.argsort(np.asarray(GE_RAW, dtype=float))[::-1]
+    for idx in order:
+        if not predicate(GE_VCT[idx]):
+            continue
+        candidates.append((int(idx), _as_list(GE_IDX[idx]), float(GE_RAW[idx])))
+        if len(candidates) >= int(max_candidates):
+            break
+    return candidates
+
+
+def _default_assignment():
+    return {
+        "tlep_idx": None,
+        "tlep_nodes": [-1, -1, -1],
+        "tlep_score": 0.0,
+        "thad_idx": None,
+        "thad_nodes": [-1, -1, -1],
+        "thad_score": 0.0,
+        "whad_idx": None,
+        "whad_nodes": [-1, -1],
+        "whad_score": 0.0,
+        "higgs_idx": None,
+        "higgs_nodes": [-1, -1],
+        "higgs_score": 0.0,
+        "wlep_idx": None,
+        "wlep_nodes": [-1, -1],
+        "wlep_score": 0.0,
+        "blep_node": -1,
+        "bhad_node": -1,
+        "whad_j1": -1,
+        "whad_j2": -1,
+        "higgs_b1": -1,
+        "higgs_b2": -1,
+    }
+
+
+def _finish_thad_assignment(assignment):
+    if assignment["thad_idx"] is None or assignment["whad_idx"] is None:
+        return assignment
+    whad_set = set(assignment["whad_nodes"])
+    bhad_candidates = [
+        node for node in assignment["thad_nodes"] if node not in whad_set
+    ]
+    assignment["bhad_node"] = bhad_candidates[0] if len(bhad_candidates) == 1 else -1
+    assignment["whad_j1"] = assignment["whad_nodes"][0]
+    assignment["whad_j2"] = assignment["whad_nodes"][1]
+    return assignment
+
+
+def _fill_wlep(assignment, GE_IDX, GE_RAW, GE_VCT):
+    wlep_idx, wlep_nodes, wlep_score = _select_best_edge(
+        GE_IDX,
+        GE_RAW,
+        GE_VCT,
+        predicate=_is_wlep_edge,
+    )
+    assignment["wlep_idx"] = wlep_idx
+    assignment["wlep_nodes"] = wlep_nodes
+    assignment["wlep_score"] = wlep_score
+    return assignment
+
+
+def _score_global_assignment(
+    HE_IDX,
+    HE_RAW,
+    HE_VCT,
+    GE_IDX,
+    GE_RAW,
+    GE_VCT,
+    max_tlep_candidates,
+    max_thad_candidates,
+    max_pair_candidates,
+    max_wlep_candidates,
+):
+    tlep_candidates = _candidate_hyperedges(
+        HE_IDX, HE_RAW, HE_VCT, _is_tlep_hyperedge, max_tlep_candidates
+    )
+    thad_candidates = _candidate_hyperedges(
+        HE_IDX, HE_RAW, HE_VCT, _is_thad_hyperedge, max_thad_candidates
+    )
+    pair_candidates = _candidate_edges(
+        GE_IDX, GE_RAW, GE_VCT, _is_whad_or_higgs_edge, max_pair_candidates
+    )
+    wlep_candidates = _candidate_edges(
+        GE_IDX, GE_RAW, GE_VCT, _is_wlep_edge, max_wlep_candidates
+    )
+
+    best = None
+    best_log_score = -np.inf
+    eps = 1e-12
+
+    for tlep_idx, tlep_nodes, tlep_score in tlep_candidates:
+        tlep_jet_nodes = _jet_nodes_from_vct(tlep_nodes, HE_VCT[tlep_idx])
+        if len(tlep_jet_nodes) != 1:
+            continue
+        blep_node = tlep_jet_nodes[0]
+
+        for thad_idx, thad_nodes, thad_score in thad_candidates:
+            thad_set = set(thad_nodes)
+            if blep_node in thad_set:
+                continue
+
+            whad_options = [
+                (idx, nodes, score)
+                for idx, nodes, score in pair_candidates
+                if set(nodes).issubset(thad_set)
+            ]
+            if not whad_options:
+                continue
+
+            higgs_options = [
+                (idx, nodes, score)
+                for idx, nodes, score in pair_candidates
+                if blep_node not in set(nodes) and not thad_set.intersection(nodes)
+            ]
+            if not higgs_options:
+                continue
+
+            for whad_idx, whad_nodes, whad_score in whad_options:
+                whad_set = set(whad_nodes)
+                bhad_candidates = [node for node in thad_nodes if node not in whad_set]
+                if len(bhad_candidates) != 1:
+                    continue
+
+                for higgs_idx, higgs_nodes, higgs_score in higgs_options:
+                    log_score = (
+                        np.log(eps + max(float(tlep_score), 0.0))
+                        + np.log(eps + max(float(thad_score), 0.0))
+                        + np.log(eps + max(float(whad_score), 0.0))
+                        + np.log(eps + max(float(higgs_score), 0.0))
+                    )
+                    if log_score <= best_log_score:
+                        continue
+
+                    assignment = _default_assignment()
+                    assignment.update(
+                        {
+                            "tlep_idx": tlep_idx,
+                            "tlep_nodes": tlep_nodes,
+                            "tlep_score": tlep_score,
+                            "thad_idx": thad_idx,
+                            "thad_nodes": thad_nodes,
+                            "thad_score": thad_score,
+                            "whad_idx": whad_idx,
+                            "whad_nodes": whad_nodes,
+                            "whad_score": whad_score,
+                            "higgs_idx": higgs_idx,
+                            "higgs_nodes": higgs_nodes,
+                            "higgs_score": higgs_score,
+                            "blep_node": blep_node,
+                            "bhad_node": bhad_candidates[0],
+                            "whad_j1": whad_nodes[0],
+                            "whad_j2": whad_nodes[1],
+                            "higgs_b1": higgs_nodes[0],
+                            "higgs_b2": higgs_nodes[1],
+                        }
+                    )
+                    best = assignment
+                    best_log_score = log_score
+
+    if best is None:
+        best = _default_assignment()
+
+    if wlep_candidates:
+        wlep_idx, wlep_nodes, wlep_score = wlep_candidates[0]
+        best["wlep_idx"] = wlep_idx
+        best["wlep_nodes"] = wlep_nodes
+        best["wlep_score"] = wlep_score
+
+    return best
+
+
 def _jet_nodes_from_vct(nodes, vct):
     return [node for node, kind in zip(_as_list(nodes), _as_list(vct)) if kind == 1]
 
@@ -98,6 +284,11 @@ def _nonjet_nodes_from_vct(nodes, vct):
 def ttH_single_lep(
     HyPER_outputs: str | pd.DataFrame,
     classification: bool | None = None,
+    strategy: str = "thad_first",
+    max_tlep_candidates: int = 20,
+    max_thad_candidates: int = 30,
+    max_pair_candidates: int = 60,
+    max_wlep_candidates: int = 10,
 ):
     r"""Reconstruct ttH events with single-lepton ttH topology.
 
@@ -126,6 +317,13 @@ def ttH_single_lep(
     decorator using these selected node indices.
     """
 
+    valid_strategies = {"thad_first", "higgs_first", "score_global"}
+    if strategy not in valid_strategies:
+        raise ValueError(
+            f"Unknown ttH reconstruction strategy {strategy!r}; "
+            f"expected one of {sorted(valid_strategies)}"
+        )
+
     results = _load_hyper_outputs(HyPER_outputs)
 
     HyPER_best_tlep = []
@@ -146,7 +344,6 @@ def ttH_single_lep(
     HyPER_best_wlep_prob = []
     HyPER_best_whad_prob = []
     HyPER_best_higgs_prob = []
-    HyPER_best_event_score = []
 
     reco_valid = []
     tlep_valid = []
@@ -163,81 +360,196 @@ def ttH_single_lep(
         HE_VCT = results["HyPER_HE_VCT"][i]
         GE_VCT = results["HyPER_GE_VCT"][i]
 
-        # 1. Select leptonic top: b_lep + lepton + MET.
-        tlep_idx, tlep_nodes, tlep_score = _select_best_hyperedge(
-            HE_IDX,
-            HE_RAW,
-            HE_VCT,
-            predicate=_is_tlep_hyperedge,
-        )
+        assignment = _default_assignment()
 
-        if tlep_idx is not None:
-            tlep_jet_nodes = _jet_nodes_from_vct(tlep_nodes, HE_VCT[tlep_idx])
-            blep_node = tlep_jet_nodes[0] if len(tlep_jet_nodes) == 1 else -1
+        if strategy == "score_global":
+            assignment = _score_global_assignment(
+                HE_IDX,
+                HE_RAW,
+                HE_VCT,
+                GE_IDX,
+                GE_RAW,
+                GE_VCT,
+                max_tlep_candidates=max_tlep_candidates,
+                max_thad_candidates=max_thad_candidates,
+                max_pair_candidates=max_pair_candidates,
+                max_wlep_candidates=max_wlep_candidates,
+            )
         else:
-            blep_node = -1
+            # 1. Select leptonic top: b_lep + lepton + MET.
+            tlep_idx, tlep_nodes, tlep_score = _select_best_hyperedge(
+                HE_IDX,
+                HE_RAW,
+                HE_VCT,
+                predicate=_is_tlep_hyperedge,
+            )
+            assignment.update(
+                {
+                    "tlep_idx": tlep_idx,
+                    "tlep_nodes": tlep_nodes,
+                    "tlep_score": tlep_score,
+                }
+            )
 
-        # 2. Select hadronic top: three jets, disjoint from b_lep.
-        thad_forbidden = {blep_node} if blep_node >= 0 else set()
-        thad_idx, thad_nodes, thad_score = _select_best_hyperedge(
-            HE_IDX,
-            HE_RAW,
-            HE_VCT,
-            predicate=_is_thad_hyperedge,
-            forbidden_nodes=thad_forbidden,
-        )
+            if tlep_idx is not None:
+                tlep_jet_nodes = _jet_nodes_from_vct(tlep_nodes, HE_VCT[tlep_idx])
+                assignment["blep_node"] = (
+                    tlep_jet_nodes[0] if len(tlep_jet_nodes) == 1 else -1
+                )
 
-        thad_node_set = set(thad_nodes) if thad_idx is not None else set()
+        if strategy == "thad_first":
+            # 2. Select hadronic top: three jets, disjoint from b_lep.
+            blep_node = assignment["blep_node"]
+            thad_forbidden = {blep_node} if blep_node >= 0 else set()
+            thad_idx, thad_nodes, thad_score = _select_best_hyperedge(
+                HE_IDX,
+                HE_RAW,
+                HE_VCT,
+                predicate=_is_thad_hyperedge,
+                forbidden_nodes=thad_forbidden,
+            )
+            assignment.update(
+                {
+                    "thad_idx": thad_idx,
+                    "thad_nodes": thad_nodes,
+                    "thad_score": thad_score,
+                }
+            )
 
-        # 3. Select Whad: best two-jet edge inside THAD.
-        whad_idx, whad_nodes, whad_score = _select_best_edge(
-            GE_IDX,
-            GE_RAW,
-            GE_VCT,
-            predicate=_is_whad_or_higgs_edge,
-            required_subset=thad_node_set if thad_idx is not None else None,
-        )
+            thad_node_set = set(thad_nodes) if thad_idx is not None else set()
 
-        if thad_idx is not None and whad_idx is not None:
-            whad_set = set(whad_nodes)
-            bhad_candidates = [node for node in thad_nodes if node not in whad_set]
-            bhad_node = bhad_candidates[0] if len(bhad_candidates) == 1 else -1
-            whad_j1 = whad_nodes[0]
-            whad_j2 = whad_nodes[1]
-        else:
-            bhad_node = -1
-            whad_j1 = -1
-            whad_j2 = -1
+            # 3. Select Whad: best two-jet edge inside THAD.
+            whad_idx, whad_nodes, whad_score = _select_best_edge(
+                GE_IDX,
+                GE_RAW,
+                GE_VCT,
+                predicate=_is_whad_or_higgs_edge,
+                required_subset=thad_node_set if thad_idx is not None else None,
+            )
+            assignment.update(
+                {
+                    "whad_idx": whad_idx,
+                    "whad_nodes": whad_nodes,
+                    "whad_score": whad_score,
+                }
+            )
+            assignment = _finish_thad_assignment(assignment)
 
-        # 4. Select H: best two-jet edge disjoint from THAD and b_lep.
-        higgs_forbidden = set()
-        if thad_idx is not None:
-            higgs_forbidden.update(thad_nodes)
-        if blep_node >= 0:
-            higgs_forbidden.add(blep_node)
+            # 4. Select H: best two-jet edge disjoint from THAD and b_lep.
+            higgs_forbidden = set()
+            if thad_idx is not None:
+                higgs_forbidden.update(thad_nodes)
+            if blep_node >= 0:
+                higgs_forbidden.add(blep_node)
 
-        higgs_idx, higgs_nodes, higgs_score = _select_best_edge(
-            GE_IDX,
-            GE_RAW,
-            GE_VCT,
-            predicate=_is_whad_or_higgs_edge,
-            forbidden_nodes=higgs_forbidden,
-        )
+            higgs_idx, higgs_nodes, higgs_score = _select_best_edge(
+                GE_IDX,
+                GE_RAW,
+                GE_VCT,
+                predicate=_is_whad_or_higgs_edge,
+                forbidden_nodes=higgs_forbidden,
+            )
 
-        if higgs_idx is not None:
-            higgs_b1 = higgs_nodes[0]
-            higgs_b2 = higgs_nodes[1]
-        else:
-            higgs_b1 = -1
-            higgs_b2 = -1
+            if higgs_idx is not None:
+                assignment["higgs_b1"] = higgs_nodes[0]
+                assignment["higgs_b2"] = higgs_nodes[1]
+            assignment.update(
+                {
+                    "higgs_idx": higgs_idx,
+                    "higgs_nodes": higgs_nodes,
+                    "higgs_score": higgs_score,
+                }
+            )
 
-        # 5. Select Wlep: best lepton-MET edge.
-        wlep_idx, wlep_nodes, wlep_score = _select_best_edge(
-            GE_IDX,
-            GE_RAW,
-            GE_VCT,
-            predicate=_is_wlep_edge,
-        )
+            # 5. Select Wlep: best lepton-MET edge.
+            assignment = _fill_wlep(assignment, GE_IDX, GE_RAW, GE_VCT)
+        elif strategy == "higgs_first":
+            # 2. Select H first: best two-jet edge disjoint from b_lep.
+            blep_node = assignment["blep_node"]
+            higgs_forbidden = {blep_node} if blep_node >= 0 else set()
+
+            higgs_idx, higgs_nodes, higgs_score = _select_best_edge(
+                GE_IDX,
+                GE_RAW,
+                GE_VCT,
+                predicate=_is_whad_or_higgs_edge,
+                forbidden_nodes=higgs_forbidden,
+            )
+
+            if higgs_idx is not None:
+                assignment["higgs_b1"] = higgs_nodes[0]
+                assignment["higgs_b2"] = higgs_nodes[1]
+            assignment.update(
+                {
+                    "higgs_idx": higgs_idx,
+                    "higgs_nodes": higgs_nodes,
+                    "higgs_score": higgs_score,
+                }
+            )
+
+            # 3. Select thad disjoint from b_lep and Higgs.
+            thad_forbidden = set()
+            if blep_node >= 0:
+                thad_forbidden.add(blep_node)
+            if higgs_idx is not None:
+                thad_forbidden.update(higgs_nodes)
+
+            thad_idx, thad_nodes, thad_score = _select_best_hyperedge(
+                HE_IDX,
+                HE_RAW,
+                HE_VCT,
+                predicate=_is_thad_hyperedge,
+                forbidden_nodes=thad_forbidden,
+            )
+            assignment.update(
+                {
+                    "thad_idx": thad_idx,
+                    "thad_nodes": thad_nodes,
+                    "thad_score": thad_score,
+                }
+            )
+
+            thad_node_set = set(thad_nodes) if thad_idx is not None else set()
+
+            # 4. Select Whad inside thad.
+            whad_idx, whad_nodes, whad_score = _select_best_edge(
+                GE_IDX,
+                GE_RAW,
+                GE_VCT,
+                predicate=_is_whad_or_higgs_edge,
+                required_subset=thad_node_set if thad_idx is not None else None,
+            )
+            assignment.update(
+                {
+                    "whad_idx": whad_idx,
+                    "whad_nodes": whad_nodes,
+                    "whad_score": whad_score,
+                }
+            )
+            assignment = _finish_thad_assignment(assignment)
+            assignment = _fill_wlep(assignment, GE_IDX, GE_RAW, GE_VCT)
+
+        tlep_idx = assignment["tlep_idx"]
+        tlep_nodes = assignment["tlep_nodes"]
+        tlep_score = assignment["tlep_score"]
+        thad_idx = assignment["thad_idx"]
+        thad_nodes = assignment["thad_nodes"]
+        thad_score = assignment["thad_score"]
+        whad_idx = assignment["whad_idx"]
+        whad_nodes = assignment["whad_nodes"]
+        whad_score = assignment["whad_score"]
+        higgs_idx = assignment["higgs_idx"]
+        higgs_nodes = assignment["higgs_nodes"]
+        higgs_score = assignment["higgs_score"]
+        wlep_idx = assignment["wlep_idx"]
+        wlep_nodes = assignment["wlep_nodes"]
+        wlep_score = assignment["wlep_score"]
+        blep_node = assignment["blep_node"]
+        bhad_node = assignment["bhad_node"]
+        whad_j1 = assignment["whad_j1"]
+        whad_j2 = assignment["whad_j2"]
+        higgs_b1 = assignment["higgs_b1"]
+        higgs_b2 = assignment["higgs_b2"]
 
         this_tlep_valid = int(tlep_idx is not None and blep_node >= 0)
         this_thad_valid = int(thad_idx is not None)
@@ -251,11 +563,6 @@ def ttH_single_lep(
             and this_whad_valid
             and this_higgs_valid
         )
-
-        if this_reco_valid:
-            event_score = float(tlep_score * thad_score * whad_score * higgs_score)
-        else:
-            event_score = 0.0
 
         HyPER_best_tlep.append(tlep_nodes)
         HyPER_best_thad.append(thad_nodes)
@@ -275,7 +582,6 @@ def ttH_single_lep(
         HyPER_best_wlep_prob.append(wlep_score)
         HyPER_best_whad_prob.append(whad_score)
         HyPER_best_higgs_prob.append(higgs_score)
-        HyPER_best_event_score.append(event_score)
 
         reco_valid.append(this_reco_valid)
         tlep_valid.append(this_tlep_valid)
@@ -302,7 +608,6 @@ def ttH_single_lep(
     results["HyPER_best_wlep_prob"] = HyPER_best_wlep_prob
     results["HyPER_best_whad_prob"] = HyPER_best_whad_prob
     results["HyPER_best_higgs_prob"] = HyPER_best_higgs_prob
-    results["HyPER_best_event_score"] = HyPER_best_event_score
 
     results["reco_valid"] = reco_valid
     results["tlep_valid"] = tlep_valid
@@ -310,6 +615,7 @@ def ttH_single_lep(
     results["wlep_valid"] = wlep_valid
     results["whad_valid"] = whad_valid
     results["higgs_valid"] = higgs_valid
+    results["reco_strategy"] = strategy
 
     columns_to_return = [
         "HyPER_best_tlep",
@@ -328,13 +634,13 @@ def ttH_single_lep(
         "HyPER_best_wlep_prob",
         "HyPER_best_whad_prob",
         "HyPER_best_higgs_prob",
-        "HyPER_best_event_score",
         "reco_valid",
         "tlep_valid",
         "thad_valid",
         "wlep_valid",
         "whad_valid",
         "higgs_valid",
+        "reco_strategy",
     ]
 
     if (classification is None or bool(classification)) and "HyPER_CLS_RAW" in results.columns:
@@ -347,5 +653,12 @@ def ttH_single_lep(
 def tth_single_lep(
     HyPER_outputs: str | pd.DataFrame,
     classification: bool | None = None,
+    strategy: str = "thad_first",
+    **kwargs,
 ):
-    return ttH_single_lep(HyPER_outputs, classification=classification)
+    return ttH_single_lep(
+        HyPER_outputs,
+        classification=classification,
+        strategy=strategy,
+        **kwargs,
+    )
