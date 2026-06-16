@@ -188,14 +188,29 @@ def _build_raw_chunk_from_batches(
     graphedge_vct = []
     hyperedges = []
     graphedges = []
+    hyperedge_probs = []
+    graphedge_probs = []
+    cls_targets = []
 
     have_cls = False
+    have_typed_probs = False
+    have_cls_targets = False
 
-    for x_out, edge_attr_out, N_nodes, encodings, x_class_out in tqdm(
+    for prediction in tqdm(
         prediction_batches,
         desc=desc,
         unit="batch",
     ):
+        if len(prediction) == 5:
+            x_out, edge_attr_out, N_nodes, encodings, x_class_out = prediction
+            x_probs_out = None
+            edge_probs_out = None
+            cls_t_out = None
+        elif len(prediction) == 7:
+            x_out, edge_attr_out, N_nodes, encodings, x_class_out, x_probs_out, edge_probs_out = prediction
+            cls_t_out = None
+        else:
+            x_out, edge_attr_out, N_nodes, encodings, x_class_out, x_probs_out, edge_probs_out, cls_t_out = prediction
 
         for j in range(len(x_out)):
             n_nodes = int(N_nodes[j])
@@ -225,6 +240,16 @@ def _build_raw_chunk_from_batches(
             have_cls = True
             cls_scores.extend(x_class_out.cpu().flatten().tolist())
 
+        if cls_t_out is not None:
+            have_cls_targets = True
+            cls_targets.extend(cls_t_out.cpu().flatten().tolist())
+
+        if x_probs_out is not None and edge_probs_out is not None:
+            have_typed_probs = True
+            for j in range(len(x_probs_out)):
+                hyperedge_probs.append(x_probs_out[j].cpu().tolist())
+                graphedge_probs.append(edge_probs_out[j].cpu().tolist())
+
     output_columns = {
         "HyPER_HE_RAW": hyperedge_out,
         "HyPER_GE_RAW": graphedge_out,
@@ -237,7 +262,26 @@ def _build_raw_chunk_from_batches(
     if have_cls:
         output_columns["HyPER_CLS_RAW"] = cls_scores
 
+    if have_cls_targets:
+        output_columns["HyPER_CLS_T"] = cls_targets
+
+    if have_typed_probs:
+        output_columns["HyPER_HE_CLASS_PROBS"] = hyperedge_probs
+        output_columns["HyPER_GE_CLASS_PROBS"] = graphedge_probs
+
     return pd.DataFrame(output_columns)
+
+
+def _build_classifier_chunk(raw_chunk: pd.DataFrame) -> pd.DataFrame:
+    if "HyPER_CLS_RAW" not in raw_chunk.columns:
+        raise RuntimeError(
+            "predicting.output_mode=classifier requires a checkpoint with an "
+            "event-level classification head."
+        )
+    columns = ["HyPER_CLS_RAW"]
+    if "HyPER_CLS_T" in raw_chunk.columns:
+        columns.append("HyPER_CLS_T")
+    return raw_chunk.loc[:, columns].copy()
 
 
 def _build_raw_chunk_from_out(
@@ -343,12 +387,16 @@ def _format_output_chunk(
     global_event_index: int,
 ) -> pd.DataFrame:
     output_mode = str(output_mode).lower()
-    if output_mode not in {"selected", "raw", "both"}:
-        raise ValueError("predicting.output_mode must be one of: selected, raw, both")
+    if output_mode not in {"selected", "raw", "both", "classifier"}:
+        raise ValueError("predicting.output_mode must be one of: selected, raw, both, classifier")
 
-    if output_mode == "raw":
+    if output_mode == "classifier":
+        output = _build_classifier_chunk(raw_chunk)
+    elif output_mode == "raw":
         output = raw_chunk.copy()
     else:
+        if topology is None:
+            raise ValueError("A topology is required unless predicting.output_mode=classifier.")
         selected = topology(raw_chunk, classification=classification_enabled)
         if output_mode == "selected":
             output = selected
@@ -402,6 +450,11 @@ def _stream_prediction_chunks(
             hyperedge_order=hyperedge_order,
             desc=f"Post-processing {len(pending_batches)} streamed batches",
         )
+        if getattr(datamodule, "target_encoding", "binary") == "typed":
+            edge_names = list(getattr(datamodule, "edge_target_names", [])) + ["background"]
+            hyperedge_names = list(getattr(datamodule, "hyperedge_target_names", [])) + ["background"]
+            raw_chunk["HyPER_GE_CLASS_NAMES"] = [edge_names for _ in range(len(raw_chunk))]
+            raw_chunk["HyPER_HE_CLASS_NAMES"] = [hyperedge_names for _ in range(len(raw_chunk))]
         output_chunk = _format_output_chunk(
             raw_chunk=raw_chunk,
             topology=topology,
@@ -423,14 +476,38 @@ def _stream_prediction_chunks(
             prediction = model.predict_step(batch, batch_idx)
             if max_events is not None and processed_events + _prediction_batch_events(prediction) > int(max_events):
                 keep = int(max_events) - processed_events
-                x_out, edge_attr_out, N_nodes, encodings, x_class_out = prediction
-                prediction = (
-                    x_out[:keep],
-                    edge_attr_out[:keep],
-                    N_nodes[:keep],
-                    encodings[:keep],
-                    x_class_out[:keep] if x_class_out is not None else None,
-                )
+                if len(prediction) == 5:
+                    x_out, edge_attr_out, N_nodes, encodings, x_class_out = prediction
+                    prediction = (
+                        x_out[:keep],
+                        edge_attr_out[:keep],
+                        N_nodes[:keep],
+                        encodings[:keep],
+                        x_class_out[:keep] if x_class_out is not None else None,
+                    )
+                elif len(prediction) == 7:
+                    x_out, edge_attr_out, N_nodes, encodings, x_class_out, x_probs_out, edge_probs_out = prediction
+                    prediction = (
+                        x_out[:keep],
+                        edge_attr_out[:keep],
+                        N_nodes[:keep],
+                        encodings[:keep],
+                        x_class_out[:keep] if x_class_out is not None else None,
+                        x_probs_out[:keep] if x_probs_out is not None else None,
+                        edge_probs_out[:keep] if edge_probs_out is not None else None,
+                    )
+                else:
+                    x_out, edge_attr_out, N_nodes, encodings, x_class_out, x_probs_out, edge_probs_out, cls_t_out = prediction
+                    prediction = (
+                        x_out[:keep],
+                        edge_attr_out[:keep],
+                        N_nodes[:keep],
+                        encodings[:keep],
+                        x_class_out[:keep] if x_class_out is not None else None,
+                        x_probs_out[:keep] if x_probs_out is not None else None,
+                        edge_probs_out[:keep] if edge_probs_out is not None else None,
+                        cls_t_out[:keep] if cls_t_out is not None else None,
+                    )
             pending_batches.append(prediction)
             n_events = _prediction_batch_events(prediction)
             pending_events += n_events
@@ -503,11 +580,14 @@ def Predict(cfg: DictConfig) -> None:
     predict_model = _select(cfg, 'predicting.model_directory', 'predict_model', None)
     assert predict_model is not None, "No model directory is provided in `predict_model`/`predicting.model_directory`. Abort!"
 
+    checkpoint_dir = os.path.join(predict_model, "checkpoints")
     ckpt_files = sorted(
         filename
-        for filename in os.listdir(os.path.join(predict_model, "checkpoints"))
+        for filename in os.listdir(checkpoint_dir)
         if filename.startswith("epoch") and filename.endswith(".ckpt")
     )
+    if len(ckpt_files) == 0 and os.path.exists(os.path.join(checkpoint_dir, "last.ckpt")):
+        ckpt_files = ["last.ckpt"]
 
     if len(ckpt_files) > 1:
         warnings.warn(
@@ -518,7 +598,7 @@ def Predict(cfg: DictConfig) -> None:
     if len(ckpt_files) == 0:
         raise RuntimeError(f"No checkpoint files have been found in {predict_model}.")
 
-    ckpt_file = os.path.join(predict_model, "checkpoints", ckpt_files[-1])
+    ckpt_file = os.path.join(checkpoint_dir, ckpt_files[-1])
 
     hparams_file = os.path.join(predict_model, "hparams.yaml")
     assert os.path.isfile(hparams_file), f"`hparams.yaml` is not found in {predict_model}."
@@ -537,9 +617,13 @@ def Predict(cfg: DictConfig) -> None:
     print(f"Checkpoint:    {ckpt_file}")
     print("================================")
 
+    output_mode = str(_select(cfg, "predicting.output_mode", default="selected")).lower()
+    # ``classifier`` is an S/B-only prediction mode. It writes event-level
+    # classifier scores and truth labels when available, and intentionally
+    # bypasses topology reconstruction/post-processing.
     hyperedge_order = int(_select(cfg, 'model.hyperedge_order', 'hyperedge_order', 3))
     topology_name = _select(cfg, 'predicting.topology', 'topology')
-    topology = _topology_func(topology_name)
+    topology = None if output_mode == "classifier" else _topology_func(topology_name)
 
     requested_classification = _as_bool(
         _select(
@@ -557,6 +641,11 @@ def Predict(cfg: DictConfig) -> None:
             UserWarning,
         )
     classification_enabled = requested_classification and model_has_classification
+    if output_mode == "classifier" and not classification_enabled:
+        raise RuntimeError(
+            "predicting.output_mode=classifier requires classification.enabled=true "
+            "and a checkpoint with a classification head."
+        )
 
     predict_output = _select(cfg, 'predicting.save_as', 'predict_output', None)
     if predict_output is None:
@@ -567,7 +656,6 @@ def Predict(cfg: DictConfig) -> None:
     if chunk_size is None:
         chunk_size = _select(cfg, "predicting.chunk_size", default=None)
     chunk_batches = _select(cfg, "predicting.chunk_batches", default=None)
-    output_mode = _select(cfg, "predicting.output_mode", default="selected")
     memory_log_every_batches = int(_select(cfg, "predicting.memory_log_every_batches", default=500) or 0)
     max_events = _select(cfg, "predicting.max_events", default=None)
     overwrite = _as_bool(_select(cfg, "predicting.overwrite", default=True))

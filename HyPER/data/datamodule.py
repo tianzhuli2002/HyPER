@@ -67,9 +67,21 @@ class HyPERDataModule(LightningDataModule):
         self.node_in_channels = len(parsed_inputs['input']['node_features']) + 1
         self.edge_in_channels = len(parsed_inputs['input']['edge_features'])
         self.global_in_channels = len(parsed_inputs['input']['global_features'])
+        target_cfg = parsed_inputs.get('target', {})
+        self.target_encoding = str(target_cfg.get('encoding', 'binary')).strip().lower()
+        if self.target_encoding not in {'binary', 'typed'}:
+            raise ValueError("target.encoding must be either 'binary' or 'typed'.")
+        edge_targets = target_cfg.get('edge', {}) or {}
+        hyperedge_targets = target_cfg.get('hyperedge', {}) or {}
+        self.edge_target_names = list(edge_targets.keys())
+        self.hyperedge_target_names = list(hyperedge_targets.keys())
+        self.edge_out_channels = len(self.edge_target_names) + 1 if self.target_encoding == 'typed' else 1
+        self.hyperedge_out_channels = len(self.hyperedge_target_names) + 1 if self.target_encoding == 'typed' else 1
+        self.edge_background_class = self.edge_out_channels - 1 if self.target_encoding == 'typed' else None
+        self.hyperedge_background_class = self.hyperedge_out_channels - 1 if self.target_encoding == 'typed' else None
         
         # Track if hyperedges are used (for conditional follow_batch)
-        self._use_hyperedge = len(parsed_inputs['target']['hyperedge'].values()) > 0 if 'target' in parsed_inputs else False
+        self._use_hyperedge = len(hyperedge_targets) > 0
 
         self.index_range = None
         self.train_data = None
@@ -210,6 +222,9 @@ class HyPERDataModule(LightningDataModule):
             table.add_row("N node attributes", str(self.node_in_channels))
             table.add_row("N edge attributes", str(self.edge_in_channels))
             table.add_row("N glob attributes", str(self.global_in_channels))
+            table.add_row("Target encoding", str(self.target_encoding))
+            table.add_row("Edge output channels", str(self.edge_out_channels))
+            table.add_row("Hyperedge output channels", str(self.hyperedge_out_channels))
             console.print(table)
 
         except ImportError:

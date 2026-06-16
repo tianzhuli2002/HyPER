@@ -123,6 +123,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--write-event-csv", action="store_true")
     parser.add_argument("--skip-event-csv", action="store_true")
     parser.add_argument("--max-plot-points", type=int, default=1000000)
+    parser.add_argument(
+        "--plot-scope",
+        choices=["fully_matched", "signal_split", "all_split", "all"],
+        default="fully_matched",
+        help=(
+            "Observable plotting scope. fully_matched preserves the existing "
+            "signal fully matched selection; split modes add suffixed inclusive plots."
+        ),
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -917,11 +926,97 @@ def plot_hist(
     save_fig(output_dir, name, formats)
 
 
-def plot_observables(evaluation: pd.DataFrame, output_dir: Path, formats: list[str]) -> None:
-    evaluation = evaluation.loc[evaluation["reco_eval_event"] == 1].copy()
+def plot_scope_masks(evaluation: pd.DataFrame, plot_scope: str) -> dict[str, np.ndarray]:
+    signal = evaluation["is_signal"].to_numpy(dtype=int) == 1
+    background = evaluation["is_signal"].to_numpy(dtype=int) == 0
+    fully_matched_signal = evaluation["reco_eval_event"].to_numpy(dtype=bool)
+    unmatched_signal = signal & ~fully_matched_signal
+
+    if plot_scope == "fully_matched":
+        return {"fully_matched": fully_matched_signal}
+    if plot_scope == "signal_split":
+        return {
+            "signal_fully_matched": fully_matched_signal,
+            "signal_not_fully_matched": unmatched_signal,
+        }
+    if plot_scope == "all_split":
+        return {
+            "signal_fully_matched": fully_matched_signal,
+            "signal_not_fully_matched": unmatched_signal,
+            "background": background,
+        }
+    if plot_scope == "all":
+        return {"all": np.ones(len(evaluation), dtype=bool)}
+    raise ValueError(f"Unsupported plot scope: {plot_scope}")
+
+
+def print_plot_scope_counts(evaluation: pd.DataFrame, plot_scope: str) -> dict[str, int | str]:
+    signal = evaluation["is_signal"].to_numpy(dtype=int) == 1
+    background = evaluation["is_signal"].to_numpy(dtype=int) == 0
+    fully_matched = evaluation["fully_matched"].to_numpy(dtype=int) == 1
+    fully_matched_signal = evaluation["reco_eval_event"].to_numpy(dtype=bool)
+    counts = {
+        "plot_scope": plot_scope,
+        "total_events": int(len(evaluation)),
+        "signal_events": int(np.sum(signal)),
+        "background_events": int(np.sum(background)),
+        "fully_matched_signal_events": int(np.sum(fully_matched_signal)),
+        "unmatched_signal_events": int(np.sum(signal & ~fully_matched)),
+    }
+    print("Plot category counts:", counts)
+    LOGGER.info("Plot category counts: %s", counts)
+    return counts
+
+
+def plot_hist_by_scope(
+    evaluation: pd.DataFrame,
+    values: np.ndarray,
+    xlabel: str,
+    title: str,
+    output_dir: Path,
+    name: str,
+    formats: list[str],
+    plot_scope: str,
+) -> None:
+    masks = plot_scope_masks(evaluation, plot_scope)
+    any_values = False
+    plt.figure(figsize=(6.0, 4.2))
+    for label, mask in masks.items():
+        scoped = np.asarray(values, dtype=float)[mask]
+        scoped = scoped[np.isfinite(scoped)]
+        if len(scoped) == 0:
+            continue
+        any_values = True
+        plt.hist(scoped, bins=50, histtype="step", linewidth=1.5, label=label.replace("_", " "))
+    if not any_values:
+        plt.close()
+        return
+    plt.xlabel(xlabel)
+    plt.ylabel("Events")
+    plt.title(title)
+    if len(masks) > 1:
+        plt.legend()
+    plt.tight_layout()
+    save_fig(output_dir, f"{name}_{plot_scope}", formats)
+
+
+def plot_observables(
+    evaluation: pd.DataFrame,
+    output_dir: Path,
+    formats: list[str],
+    plot_scope: str = "fully_matched",
+) -> None:
+    if plot_scope == "fully_matched":
+        evaluation = evaluation.loc[evaluation["reco_eval_event"] == 1].copy()
+    else:
+        evaluation = evaluation.copy()
 
     for name in ("m_Whad", "m_thad", "m_tlep_visible", "m_ttbar_visible"):
-        plot_hist(evaluation[name].to_numpy(), name, name, output_dir, name, formats)
+        values = evaluation[name].to_numpy(dtype=float)
+        if plot_scope == "fully_matched":
+            plot_hist(values, name, name, output_dir, name, formats)
+        else:
+            plot_hist_by_scope(evaluation, values, name, name, output_dir, name, formats, plot_scope)
 
         truth_name = f"{name}_truth"
         if truth_name in evaluation.columns:
@@ -930,18 +1025,36 @@ def plot_observables(evaluation: pd.DataFrame, output_dir: Path, formats: list[s
             mask = np.isfinite(pred) & np.isfinite(truth)
             if np.any(mask):
                 resolution = pred[mask] - truth[mask]
-                plot_hist(
-                    resolution,
-                    f"{name} - truth [GeV]",
-                    f"{name} resolution",
-                    output_dir,
-                    f"{name}_resolution",
-                    formats,
-                )
+                if plot_scope == "fully_matched":
+                    plot_hist(
+                        resolution,
+                        f"{name} - truth [GeV]",
+                        f"{name} resolution",
+                        output_dir,
+                        f"{name}_resolution",
+                        formats,
+                    )
+                else:
+                    resolution_values = np.full(len(evaluation), np.nan, dtype=float)
+                    resolution_values[mask] = resolution
+                    plot_hist_by_scope(
+                        evaluation,
+                        resolution_values,
+                        f"{name} - truth [GeV]",
+                        f"{name} resolution",
+                        output_dir,
+                        f"{name}_resolution",
+                        formats,
+                        plot_scope,
+                    )
 
     for name in ("event_reco_score", "top_had_score", "top_lep_score", "w_had_score", "w_lep_score"):
         output_name = name if name != "event_reco_score" else "reco_score_distribution"
-        plot_hist(evaluation[name].to_numpy(), name, name, output_dir, output_name, formats)
+        values = evaluation[name].to_numpy(dtype=float)
+        if plot_scope == "fully_matched":
+            plot_hist(values, name, name, output_dir, output_name, formats)
+        else:
+            plot_hist_by_scope(evaluation, values, name, name, output_dir, output_name, formats, plot_scope)
 
 
 def binary_roc(labels: np.ndarray, scores: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
@@ -1310,9 +1423,17 @@ def main() -> None:
     )
     eff_rows = counters_to_eff_rows(eff_counters)
 
+    plot_counts = print_plot_scope_counts(evaluation_sample, args.plot_scope) if len(evaluation_sample) else {
+        "plot_scope": args.plot_scope,
+        "total_events": 0,
+        "signal_events": 0,
+        "background_events": 0,
+        "fully_matched_signal_events": 0,
+        "unmatched_signal_events": 0,
+    }
     plot_efficiencies(eff_rows, output_dir, args.formats)
     if len(evaluation_sample):
-        plot_observables(evaluation_sample, output_dir, args.formats)
+        plot_observables(evaluation_sample, output_dir, args.formats, args.plot_scope)
 
     sb_summary, sb_skip_reason = make_sb_plots(
         evaluation=evaluation_sample,
@@ -1346,6 +1467,8 @@ def main() -> None:
         "chunk_size": int(args.chunk_size),
         "event_csv": "written" if event_csv_written else "skipped",
         "max_plot_points": int(args.max_plot_points),
+        "plot_scope": args.plot_scope,
+        "plot_category_counts": plot_counts,
         "plot_sample_events": int(len(evaluation_sample)),
         "event_alignment": alignment_mode,
         "event_alignment_policy": (

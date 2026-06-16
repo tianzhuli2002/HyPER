@@ -21,15 +21,26 @@ def _select(cfg: DictConfig, path: str, legacy: str = None, default=None):
     return default
 
 
-class _ReconstructionOnlyONNX(torch.nn.Module):
-    def __init__(self, model):
+class _ONNXOutputAdapter(torch.nn.Module):
+    def __init__(self, model, include_classification: bool = True):
         super().__init__()
         self.model = model
+        self.include_classification = bool(include_classification)
+
+    def _reco_score(self, logits):
+        if getattr(self.model, "target_encoding", "binary") == "typed":
+            probs = torch.softmax(logits, dim=1)
+            return 1.0 - probs[:, -1:]
+        return torch.sigmoid(logits)
 
     def forward(self, x, edge_index, edge_attr, u, batch, hyperedge_index, hyperedge_index_batch):
-        p_hyper, batch_hyperedge, p_edge, _ = self.model(
+        p_hyper, batch_hyperedge, p_edge, cls_out = self.model(
             x, edge_index, edge_attr, u, batch, hyperedge_index, hyperedge_index_batch
         )
+        p_hyper = self._reco_score(p_hyper)
+        p_edge = self._reco_score(p_edge)
+        if self.include_classification:
+            return p_hyper, batch_hyperedge, p_edge, cls_out
         return p_hyper, batch_hyperedge, p_edge
 
 
@@ -69,11 +80,10 @@ def Onnx(cfg : DictConfig) -> None:
     )
 
     model.eval()
-    export_model = model
     classification_enabled = bool(getattr(model, 'classification_enabled', True))
+    export_model = _ONNXOutputAdapter(model, include_classification=classification_enabled)
     output_names = ['hyperedge_prime','batch_hyperedge','edge_prime','classification_score']
     if not classification_enabled:
-        export_model = _ReconstructionOnlyONNX(model)
         output_names = ['hyperedge_prime','batch_hyperedge','edge_prime']
 
     onnx_program = torch.onnx.export(

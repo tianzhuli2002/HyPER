@@ -1,6 +1,6 @@
 import torch
 
-from torch.nn import Sequential as Seq, Linear, BCELoss, Sigmoid
+from torch.nn import Sequential as Seq, Linear, BCELoss
 from torch.optim import lr_scheduler, Adam, AdamW
 from torch_geometric.utils import unbatch, degree
 from lightning import LightningModule
@@ -65,9 +65,13 @@ class HyPERModel(LightningModule):
             classification_enabled: Optional[bool] = True,
             #classification_input_mode: Optional[str] = "edge_hyperedge",
             classification_loss_weight: Optional[float] = None,
+            reconstruction_enabled: Optional[bool] = True,
             reconstruction_weighting: Optional[str] = "legacy",
             positive_weight_cap: Optional[float] = 50.0,
             negative_weight_cap: Optional[float] = 5.0,
+            edge_out_channels: int = 1,
+            hyperedge_out_channels: int = 1,
+            target_encoding: str = "binary",
         ):
         super().__init__()
 
@@ -76,12 +80,22 @@ class HyPERModel(LightningModule):
 
         self.save_hyperparameters()
         self.classification_enabled = bool(classification_enabled)
+        self.reconstruction_enabled = bool(reconstruction_enabled)
+        if not self.reconstruction_enabled and not self.classification_enabled:
+            raise ValueError(
+                "Invalid HyPERModel configuration: reconstruction.enabled=false "
+                "requires classification.enabled=true. Refusing to train a model "
+                "with no active loss."
+            )
         self.classification_loss_weight = (
             self.hparams.beta if classification_loss_weight is None else float(classification_loss_weight)
         )
         self.reconstruction_weighting = str(reconstruction_weighting or "legacy").lower()
         self.positive_weight_cap = None if positive_weight_cap is None else float(positive_weight_cap)
         self.negative_weight_cap = None if negative_weight_cap is None else float(negative_weight_cap)
+        self.target_encoding = str(target_encoding or "binary").strip().lower()
+        if self.target_encoding not in {"binary", "typed"}:
+            raise ValueError("target_encoding must be either 'binary' or 'typed'.")
 
         for i in range(self.hparams.message_passing_recurrent):
             if i == 0:
@@ -125,8 +139,50 @@ class HyPERModel(LightningModule):
                 dropout=self.hparams.dropout
             )
 
-        self.he_head  = Seq(Linear(self.hparams.contraction_feats, 1), Sigmoid()) # last layer for hyperedges
-        self.ge_head  = Seq(Linear(self.hparams.message_feats, 1), Sigmoid()) # last layer for edges
+        self.he_head = Seq(Linear(self.hparams.contraction_feats, int(self.hparams.hyperedge_out_channels)))
+        self.ge_head = Seq(Linear(self.hparams.message_feats, int(self.hparams.edge_out_channels)))
+
+
+    def freeze_for_probe(self, trainable_prefixes=("Classification.",)):
+        """Freeze all parameters except the named trainable prefixes."""
+        prefixes = tuple(str(prefix) for prefix in trainable_prefixes)
+        trainable_names = []
+        frozen_names = []
+
+        for name, parameter in self.named_parameters():
+            trainable = any(name.startswith(prefix) for prefix in prefixes)
+            parameter.requires_grad = trainable
+            if trainable:
+                trainable_names.append(name)
+            else:
+                frozen_names.append(name)
+
+        if not trainable_names:
+            raise RuntimeError(
+                "Probe freezing left no trainable parameters. "
+                f"Requested trainable prefixes: {prefixes}"
+            )
+        if not frozen_names:
+            raise RuntimeError("Probe freezing did not freeze any non-classification parameters.")
+        bad_trainable = [
+            name for name in trainable_names
+            if not any(name.startswith(prefix) for prefix in prefixes)
+        ]
+        if bad_trainable:
+            raise RuntimeError(f"Unexpected trainable parameters after probe freeze: {bad_trainable}")
+
+        total_params = sum(parameter.numel() for parameter in self.parameters())
+        trainable_params = sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
+        print("================================")
+        print("Frozen-probe parameter summary")
+        print(f"Trainable prefixes: {prefixes}")
+        print(f"Trainable parameters: {trainable_params}")
+        print(f"Total parameters:     {total_params}")
+        print("Trainable parameter names:")
+        for name in trainable_names:
+            print(f"  {name}")
+        print("================================")
+        return trainable_names, frozen_names
 
 
     def forward(self, x, edge_index, edge_attr, u, batch, hyperedge_index, hyperedge_index_batch):
@@ -157,9 +213,10 @@ class HyPERModel(LightningModule):
                 batch_HE=batch_hyperedge,
                 batch_N=batch,
             )
-        # Last layer + sigmoid
-        p_hyper = self.he_head(x_hat)             # [N_he, 1]
-        p_edge  = self.ge_head(edge_attr_prime)    # [N_ge, 1]
+        # Reconstruction heads return logits. Convert to probabilities only for
+        # metrics, prediction, or external consumers.
+        p_hyper = self.he_head(x_hat)
+        p_edge = self.ge_head(edge_attr_prime)
 
         return p_hyper, batch_hyperedge, p_edge, x_class
 
@@ -182,6 +239,30 @@ class HyPERModel(LightningModule):
         return cls_t
 
     def _combined_loss(self, loss_hyperedge, loss_edge, loss_class, cls_t, loss_hyperedge_masks, loss_edge_masks):
+        if not self.reconstruction_enabled:
+            if loss_class is None or cls_t is None or loss_class.numel() == 0:
+                raise RuntimeError(
+                    "Classifier-only training requires non-empty S/B classification "
+                    "targets and classification loss."
+                )
+
+            # Classifier-only mode: preserve the existing class-balanced
+            # ClassificationLoss handling inside CombinedLoss, but force the
+            # reconstruction contribution to zero.
+            dummy_reco = loss_hyperedge.new_zeros(1)
+            dummy_mask = torch.zeros(1, dtype=torch.bool, device=loss_hyperedge.device)
+            return CombinedLoss(
+                dummy_reco,
+                dummy_reco,
+                loss_class,
+                cls_t,
+                alpha=0.5,
+                beta=1.0,
+                reduction=self.hparams.reduction,
+                loss_hyperedge_masks=dummy_mask,
+                loss_edge_masks=dummy_mask,
+            )
+
         return CombinedLoss(
             loss_hyperedge,
             loss_edge,
@@ -200,16 +281,31 @@ class HyPERModel(LightningModule):
             "weighting": self.reconstruction_weighting,
             "positive_weight_cap": self.positive_weight_cap,
             "negative_weight_cap": self.negative_weight_cap,
+            "target_encoding": self.target_encoding,
         }
 
-    @staticmethod
-    def _positive_negative_counts(target, batch, num_graphs):
+    def _target_positive_mask(self, target: torch.Tensor) -> torch.Tensor:
+        if self.target_encoding == "typed":
+            if target.ndim != 2 or target.size(1) == 0:
+                return torch.zeros(target.size(0), dtype=torch.bool, device=target.device)
+            return target.argmax(dim=1) != (target.size(1) - 1)
+        return target.float().flatten() > 0.5
+
+    def _reco_scalar_score(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.target_encoding == "typed":
+            if logits.ndim != 2 or logits.size(1) == 0:
+                return logits.new_zeros((logits.size(0), 1))
+            probs = torch.softmax(logits, dim=1)
+            return (1.0 - probs[:, -1:]).float()
+        return torch.sigmoid(logits.float())
+
+    def _positive_negative_counts(self, target, batch, num_graphs):
         if target is None or target.numel() == 0 or batch is None or batch.numel() == 0:
             device = batch.device if batch is not None and batch.numel() else torch.device("cpu")
             return torch.zeros(num_graphs, device=device), torch.zeros(num_graphs, device=device)
-        target_flat = target.float().flatten()
+        target_flat = self._target_positive_mask(target)
         batch_flat = batch.flatten().to(torch.long)
-        positive = target_flat > 0.5
+        positive = target_flat.bool()
         positive_counts = scatter(positive.float(), batch_flat, dim=0, dim_size=num_graphs, reduce="sum")
         negative_counts = scatter((~positive).float(), batch_flat, dim=0, dim_size=num_graphs, reduce="sum")
         return positive_counts, negative_counts
@@ -241,6 +337,16 @@ class HyPERModel(LightningModule):
         if values.numel() == 0:
             return fallback.new_tensor(0.0)
         return values.mean()
+
+    @staticmethod
+    def _align_graph_mask(mask: torch.Tensor, size: int, device: torch.device) -> torch.Tensor:
+        mask = mask.flatten().bool().to(device)
+        if mask.numel() == size:
+            return mask
+        if mask.numel() < size:
+            pad = torch.zeros(size - mask.numel(), dtype=torch.bool, device=device)
+            return torch.cat([mask, pad], dim=0)
+        return mask[:size]
 
     @staticmethod
     def _positive_recall(pred: torch.Tensor, target: torch.Tensor, threshold: float, fallback: torch.Tensor) -> torch.Tensor:
@@ -304,9 +410,10 @@ class HyPERModel(LightningModule):
         )
         for name, pred, target, candidate_batch, active_mask in metric_specs:
             pred = pred.flatten()
-            target = target.float().flatten()
+            target = self._target_positive_mask(target).float().flatten()
             candidate_batch = candidate_batch.flatten().to(torch.long)
-            active_mask = active_mask.flatten().bool().to(pred.device)
+            active_size = int(candidate_batch.max().item()) + 1 if candidate_batch.numel() else 0
+            active_mask = self._align_graph_mask(active_mask, active_size, pred.device)
             keep = active_mask[candidate_batch] if active_mask.numel() else torch.zeros_like(candidate_batch, dtype=torch.bool)
             pred_keep = pred[keep]
             target_keep = target[keep]
@@ -347,11 +454,17 @@ class HyPERModel(LightningModule):
         lr = float(self.hparams.lr)
         weight_decay = float(self.hparams.weight_decay or 0.0)
         print(f"Configuring optimizer: name={optimizer_name}, lr={lr}, weight_decay={weight_decay}")
+        trainable_parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
+        if not trainable_parameters:
+            raise RuntimeError("No trainable parameters are available for the optimizer.")
+        trainable_count = sum(parameter.numel() for parameter in trainable_parameters)
+        total_count = sum(parameter.numel() for parameter in self.parameters())
+        print(f"Optimizer parameter count: trainable={trainable_count}, total={total_count}")
 
         if optimizer_name == 'adam':
-            optimizer = Adam(self.parameters(), lr=lr, weight_decay=weight_decay)
+            optimizer = Adam(trainable_parameters, lr=lr, weight_decay=weight_decay)
         elif optimizer_name == 'adamw':
-            optimizer = AdamW(self.parameters(), lr=lr, weight_decay=weight_decay)
+            optimizer = AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
         else:
             raise ValueError("Supported optimizers are: adam, adamw.")
 
@@ -389,45 +502,41 @@ class HyPERModel(LightningModule):
     def training_step(self, train_batch, batch_idx):
         x_hat, batch_hyperedge, edge_attr_prime, x_class = self._shared_step(train_batch)
 
-        # Train Loss Calculation
-        if str(self.hparams.criterion_edge).lower() == 'bce':
-            criterion_edge = BCELoss(reduction='none')
-        # ------- custom loss functions -------
-        # elif
-        # -------------------------------------
-        else:
-            raise ValueError("Supported edge loss functions are: `torch.BCELoss`.")
-
-        if str(self.hparams.criterion_hyperedge).lower() == 'bce':
-            criterion_hyperedge = BCELoss(reduction='none')
-        # ------- custom loss functions -------
-        # elif
-        # -------------------------------------
-        else:
-            raise ValueError("Supported edge loss functions are: `torch.BCELoss`.")
-
-        loss_edge,loss_edge_masks = EdgeLoss(edge_attr_prime, train_batch.edge_attr_t, train_batch.edge_attr_batch, criterion=criterion_edge, **self._reco_loss_kwargs())
-        loss_hyperedge, loss_hyperedge_masks = HyperedgeLoss(x_hat, train_batch.hyperedge_attr_t.float(), batch_hyperedge, criterion_hyperedge, **self._reco_loss_kwargs())
         cls_t = self._require_class_targets(train_batch, "training") if self.classification_enabled else None
         loss_class = (
             ClassificationLoss(x_class, cls_t, criterion=BCELoss(reduction='none'))
             if self.classification_enabled else None
         )
+
+        if self.reconstruction_enabled:
+            criterion_edge = BCELoss(reduction='none')
+            criterion_hyperedge = BCELoss(reduction='none')
+
+            loss_edge,loss_edge_masks = EdgeLoss(edge_attr_prime, train_batch.edge_attr_t, train_batch.edge_attr_batch, criterion=criterion_edge, **self._reco_loss_kwargs())
+            loss_hyperedge, loss_hyperedge_masks = HyperedgeLoss(x_hat, train_batch.hyperedge_attr_t.float(), batch_hyperedge, criterion_hyperedge, **self._reco_loss_kwargs())
+            self._log_reco_target_stats("train", train_batch, batch_hyperedge, on_step=True, on_epoch=True)
+            self._log_reco_score_metrics(
+                "train",
+                self._reco_scalar_score(edge_attr_prime),
+                train_batch.edge_attr_t,
+                train_batch.edge_attr_batch,
+                loss_edge_masks,
+                self._reco_scalar_score(x_hat),
+                train_batch.hyperedge_attr_t,
+                batch_hyperedge,
+                loss_hyperedge_masks,
+                on_step=True,
+                on_epoch=True,
+            )
+        else:
+            loss_edge = edge_attr_prime.new_zeros(1)
+            loss_hyperedge = x_hat.new_zeros(1)
+            loss_edge_masks = torch.zeros(1, dtype=torch.bool, device=edge_attr_prime.device)
+            loss_hyperedge_masks = torch.zeros(1, dtype=torch.bool, device=x_hat.device)
+
         loss = self._combined_loss(loss_hyperedge, loss_edge, loss_class, cls_t, loss_hyperedge_masks, loss_edge_masks)
-        self._log_reco_target_stats("train", train_batch, batch_hyperedge, on_step=True, on_epoch=True)
-        self._log_reco_score_metrics(
-            "train",
-            edge_attr_prime,
-            train_batch.edge_attr_t,
-            train_batch.edge_attr_batch,
-            loss_edge_masks,
-            x_hat,
-            train_batch.hyperedge_attr_t,
-            batch_hyperedge,
-            loss_hyperedge_masks,
-            on_step=True,
-            on_epoch=True,
-        )
+        if not loss.requires_grad:
+            loss = loss + (edge_attr_prime.sum() + x_hat.sum()) * 0.0
 
         # Logging
         self.log('loss/train_loss', loss, batch_size=len(train_batch), on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
@@ -441,57 +550,41 @@ class HyPERModel(LightningModule):
         fast_validation = str(self.hparams.validation_mode).lower() == 'fast'
         val_on_step = not fast_validation
 
-        # Validation Loss Calculation
-        if str(self.hparams.criterion_edge).lower() == 'bce':
-            criterion_edge = BCELoss(reduction='none')
-        # ------- custom loss functions -------
-        # elif
-        # -------------------------------------
-        else:
-            raise ValueError("Supported edge loss functions are: `torch.BCELoss`.")
-
-        if str(self.hparams.criterion_hyperedge).lower() == 'bce':
-            criterion_hyperedge = BCELoss(reduction='none')
-        # ------- custom loss functions -------
-        # elif
-        # -------------------------------------
-        else:
-            raise ValueError("Supported edge loss functions are: `torch.BCELoss`.")
-
-        loss_edge,loss_edge_masks = EdgeLoss(edge_attr_prime, val_batch.edge_attr_t, val_batch.edge_attr_batch, criterion=criterion_edge, **self._reco_loss_kwargs())
-        loss_hyperedge, loss_hyperedge_masks = HyperedgeLoss(x_hat, val_batch.hyperedge_attr_t.float(), batch_hyperedge, criterion_hyperedge, **self._reco_loss_kwargs())
         cls_t = self._require_class_targets(val_batch, "validation") if self.classification_enabled else None
         loss_class = (
             ClassificationLoss(x_class, cls_t, criterion=BCELoss(reduction='none'))
             if self.classification_enabled else None
         )
+
+        if self.reconstruction_enabled:
+            criterion_edge = BCELoss(reduction='none')
+            criterion_hyperedge = BCELoss(reduction='none')
+
+            loss_edge,loss_edge_masks = EdgeLoss(edge_attr_prime, val_batch.edge_attr_t, val_batch.edge_attr_batch, criterion=criterion_edge, **self._reco_loss_kwargs())
+            loss_hyperedge, loss_hyperedge_masks = HyperedgeLoss(x_hat, val_batch.hyperedge_attr_t.float(), batch_hyperedge, criterion_hyperedge, **self._reco_loss_kwargs())
+            self._log_reco_target_stats("validation", val_batch, batch_hyperedge, on_step=val_on_step, on_epoch=True)
+            self._log_reco_score_metrics(
+                "validation",
+                self._reco_scalar_score(edge_attr_prime),
+                val_batch.edge_attr_t,
+                val_batch.edge_attr_batch,
+                loss_edge_masks,
+                self._reco_scalar_score(x_hat),
+                val_batch.hyperedge_attr_t,
+                batch_hyperedge,
+                loss_hyperedge_masks,
+                on_step=val_on_step,
+                on_epoch=True,
+            )
+        else:
+            loss_edge = edge_attr_prime.new_zeros(1)
+            loss_hyperedge = x_hat.new_zeros(1)
+            loss_edge_masks = torch.zeros(1, dtype=torch.bool, device=edge_attr_prime.device)
+            loss_hyperedge_masks = torch.zeros(1, dtype=torch.bool, device=x_hat.device)
+
         loss = self._combined_loss(loss_hyperedge, loss_edge, loss_class, cls_t, loss_hyperedge_masks, loss_edge_masks)
-        self._log_reco_target_stats("validation", val_batch, batch_hyperedge, on_step=val_on_step, on_epoch=True)
-        self._log_reco_score_metrics(
-            "validation",
-            edge_attr_prime,
-            val_batch.edge_attr_t,
-            val_batch.edge_attr_batch,
-            loss_edge_masks,
-            x_hat,
-            val_batch.hyperedge_attr_t,
-            batch_hyperedge,
-            loss_hyperedge_masks,
-            on_step=val_on_step,
-            on_epoch=True,
-        )
-        
-        # Validation Accuracy Calculation
-        
-        # Not considering bkg events for the reco accuracy
-        # if cls_t is not None:
-        #     graph_mask = cls_t.view(-1) == 1
-        # else:
-        #     graph_mask = torch.ones(int(val_batch.num_graphs), dtype=torch.bool, device=edge_attr_prime.device)
-        # ge_keep  = graph_mask[val_batch.edge_attr_batch]      
-        edge_reco_mask = loss_edge_masks.to(edge_attr_prime.device)
-        ge_keep = edge_reco_mask[val_batch.edge_attr_batch]
-        accuracy_edge  = BinaryAccuracy(ignore_index=0).to(edge_attr_prime)
+        if not loss.requires_grad:
+            loss = loss + (edge_attr_prime.sum() + x_hat.sum()) * 0.0
 
         # Logging
         self.log('val_loss', loss, batch_size=len(val_batch), on_step=val_on_step, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
@@ -499,21 +592,36 @@ class HyPERModel(LightningModule):
         if loss_class is not None and loss_class.numel() > 0:
             self.log('loss/validation_classification_loss', loss_class.mean(), batch_size=len(val_batch), on_step=val_on_step, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
-        pred_edge = edge_attr_prime.flatten()[ge_keep]
-        tgt_edge = val_batch.edge_attr_t.float().flatten()[ge_keep]
+        if self.reconstruction_enabled:
+            # Validation Accuracy Calculation
 
-        # guard against empty masked tensors
-        if pred_edge.numel() > 0 and tgt_edge.numel() > 0:
-            self.log(
-                'fuzzy_accuracy/validation_accuracy_edge',
-                accuracy_edge(pred_edge, tgt_edge),
-                batch_size=len(val_batch),
-                on_step=val_on_step,
-                on_epoch=True,
-                prog_bar=False,
-                logger=True,
-                sync_dist=True,
-            )
+            # Not considering bkg events for the reco accuracy
+            # if cls_t is not None:
+            #     graph_mask = cls_t.view(-1) == 1
+            # else:
+            #     graph_mask = torch.ones(int(val_batch.num_graphs), dtype=torch.bool, device=edge_attr_prime.device)
+            # ge_keep  = graph_mask[val_batch.edge_attr_batch]
+            edge_reco_mask = loss_edge_masks.to(edge_attr_prime.device)
+            num_graphs = int(getattr(val_batch, "num_graphs", len(val_batch)))
+            edge_reco_mask = self._align_graph_mask(edge_reco_mask, num_graphs, edge_attr_prime.device)
+            ge_keep = edge_reco_mask[val_batch.edge_attr_batch]
+            accuracy_edge  = BinaryAccuracy(ignore_index=0).to(edge_attr_prime)
+
+            pred_edge = self._reco_scalar_score(edge_attr_prime).flatten()[ge_keep]
+            tgt_edge = self._target_positive_mask(val_batch.edge_attr_t).float().flatten()[ge_keep]
+
+            # guard against empty masked tensors
+            if pred_edge.numel() > 0 and tgt_edge.numel() > 0:
+                self.log(
+                    'fuzzy_accuracy/validation_accuracy_edge',
+                    accuracy_edge(pred_edge, tgt_edge),
+                    batch_size=len(val_batch),
+                    on_step=val_on_step,
+                    on_epoch=True,
+                    prog_bar=False,
+                    logger=True,
+                    sync_dist=True,
+                )
 
         # --- Compute simple S/B counts for the event-level classifier (x_class) ---
         # x_class shape: [N_events, 1] or [N_events]
@@ -550,17 +658,25 @@ class HyPERModel(LightningModule):
         # print(batch.batch)
         #print(x_hat, batch_hyperedge, edge_attr_prime, x_class)
         x_hat, batch_hyperedge, edge_attr_prime, x_class = self._shared_step(batch)
+        x_score = self._reco_scalar_score(x_hat)
+        edge_score = self._reco_scalar_score(edge_attr_prime)
+        x_probs = torch.softmax(x_hat, dim=1) if self.target_encoding == "typed" else None
+        edge_probs = torch.softmax(edge_attr_prime, dim=1) if self.target_encoding == "typed" else None
 
         # Unbatch results
-        x_out         = unbatch(x_hat, batch_hyperedge.type(torch.int64), 0)
-        edge_attr_out = unbatch(edge_attr_prime, batch.edge_attr_batch, 0)
+        x_out = unbatch(x_score, batch_hyperedge.type(torch.int64), 0)
+        edge_attr_out = unbatch(edge_score, batch.edge_attr_batch, 0)
+        x_probs_out = unbatch(x_probs, batch_hyperedge.type(torch.int64), 0) if x_probs is not None else None
+        edge_probs_out = unbatch(edge_probs, batch.edge_attr_batch, 0) if edge_probs is not None else None
         N_nodes       = degree(batch.batch).cpu().flatten().tolist()
         encodings     = unbatch(batch.x[:,-1].reshape(-1,1),batch.batch, 0)
         x_class_out = x_class.squeeze(-1) if x_class is not None else None
+        cls_t = self._class_targets(batch)
+        cls_t_out = cls_t.squeeze(-1) if cls_t is not None else None
         # print("PREDICTION STEP OUTPUTS")
         # print("x_out:", x_out)
         # print("edge_attr_out:", edge_attr_out)
         # print("N_nodes:", N_nodes)
         # print("encodings:", encodings)
         # print("x_class_out:", x_class_out)
-        return x_out, edge_attr_out, N_nodes, encodings, x_class_out
+        return x_out, edge_attr_out, N_nodes, encodings, x_class_out, x_probs_out, edge_probs_out, cls_t_out

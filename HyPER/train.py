@@ -1,4 +1,5 @@
 import hydra
+import json
 import torch
 import torch_geometric
 import lightning.pytorch as pl
@@ -71,6 +72,115 @@ def _classification_loss_weight(cfg: DictConfig):
     return 0.5
 
 
+def _as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    if OmegaConf.is_config(value):
+        return [str(item) for item in OmegaConf.to_container(value, resolve=True)]
+    return [str(value)]
+
+
+def _resolve_checkpoint_path(checkpoint_path=None, model_directory=None):
+    if checkpoint_path is not None:
+        checkpoint_path = str(checkpoint_path).strip()
+        if checkpoint_path:
+            if not os.path.isfile(checkpoint_path):
+                raise FileNotFoundError(f"Probe checkpoint not found: {checkpoint_path}")
+            return checkpoint_path
+
+    if model_directory is None:
+        return None
+
+    model_directory = str(model_directory).strip()
+    if not model_directory:
+        return None
+    checkpoint_dir = os.path.join(model_directory, "checkpoints")
+    if not os.path.isdir(checkpoint_dir):
+        raise FileNotFoundError(f"Probe model checkpoint directory not found: {checkpoint_dir}")
+
+    candidates = [
+        os.path.join(checkpoint_dir, name)
+        for name in os.listdir(checkpoint_dir)
+        if name.endswith(".ckpt")
+    ]
+    if not candidates:
+        raise FileNotFoundError(f"No checkpoint files found in {checkpoint_dir}")
+
+    epoch_candidates = [
+        path for path in candidates
+        if os.path.basename(path).startswith("epoch")
+    ]
+    if epoch_candidates:
+        return sorted(epoch_candidates)[-1]
+    return sorted(candidates)[-1]
+
+
+def _load_probe_backbone(model: HyPERModel, checkpoint_path: str, skip_prefixes=("Classification.",)):
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    source_state = checkpoint.get("state_dict", checkpoint)
+    target_state = model.state_dict()
+    skip_prefixes = tuple(str(prefix) for prefix in skip_prefixes)
+
+    loadable = {}
+    skipped_prefix = []
+    skipped_missing = []
+    skipped_shape = []
+
+    for name, tensor in source_state.items():
+        if any(name.startswith(prefix) for prefix in skip_prefixes):
+            skipped_prefix.append(name)
+            continue
+        if name not in target_state:
+            skipped_missing.append(name)
+            continue
+        if tuple(tensor.shape) != tuple(target_state[name].shape):
+            skipped_shape.append((name, tuple(tensor.shape), tuple(target_state[name].shape)))
+            continue
+        loadable[name] = tensor
+
+    if not loadable:
+        raise RuntimeError(f"No matching non-classification checkpoint weights found in {checkpoint_path}")
+
+    result = model.load_state_dict(loadable, strict=False)
+    print("================================")
+    print("Loaded frozen-probe backbone checkpoint")
+    print(f"Checkpoint:              {checkpoint_path}")
+    print(f"Loaded tensors:          {len(loadable)}")
+    print(f"Skipped by prefix:       {len(skipped_prefix)}")
+    print(f"Skipped missing target:  {len(skipped_missing)}")
+    print(f"Skipped shape mismatch:  {len(skipped_shape)}")
+    print(f"Missing after load:      {len(result.missing_keys)}")
+    print(f"Unexpected after load:   {len(result.unexpected_keys)}")
+    if skipped_prefix:
+        print("Skipped prefix tensors:")
+        for name in skipped_prefix[:20]:
+            print(f"  {name}")
+        if len(skipped_prefix) > 20:
+            print(f"  ... {len(skipped_prefix) - 20} more")
+    if skipped_shape:
+        print("Shape mismatches:")
+        for name, source_shape, target_shape in skipped_shape[:20]:
+            print(f"  {name}: checkpoint={source_shape}, model={target_shape}")
+        if len(skipped_shape) > 20:
+            print(f"  ... {len(skipped_shape) - 20} more")
+    print("================================")
+
+    return {
+        "checkpoint_path": checkpoint_path,
+        "loaded_tensors": sorted(loadable),
+        "skipped_prefix": sorted(skipped_prefix),
+        "skipped_missing_target": sorted(skipped_missing),
+        "skipped_shape_mismatch": [
+            {"name": name, "checkpoint_shape": list(source_shape), "model_shape": list(target_shape)}
+            for name, source_shape, target_shape in skipped_shape
+        ],
+        "missing_keys_after_load": list(result.missing_keys),
+        "unexpected_keys_after_load": list(result.unexpected_keys),
+    }
+
+
 def worker_init_fn(worker_id: int) -> None:
     """Initialize worker process with unique random seed for reproducibility."""
     import numpy as np
@@ -131,6 +241,9 @@ def Train(cfg : DictConfig) -> None:
         node_in_channels = datamodule.node_in_channels,
         edge_in_channels = datamodule.edge_in_channels,
         global_in_channels = datamodule.global_in_channels,
+        edge_out_channels = datamodule.edge_out_channels,
+        hyperedge_out_channels = datamodule.hyperedge_out_channels,
+        target_encoding = datamodule.target_encoding,
         message_feats = _select(cfg, 'model.message_feats', 'message_feats', 32),
         dropout = _select(cfg, 'model.dropout', 'dropout', 0.01),
         message_passing_recurrent = _select(cfg, 'model.message_passing_recurrent', 'num_message_layers', 3),
@@ -156,10 +269,50 @@ def Train(cfg : DictConfig) -> None:
         classification_enabled = _select(cfg, 'classification.enabled', default=True),
         # = _select(cfg, 'classification.input_mode', default='edge_hyperedge'),
         classification_loss_weight = classification_loss_weight,
+        reconstruction_enabled = _select(cfg, 'reconstruction.enabled', default=True),
         reconstruction_weighting = _select(cfg, 'loss.reconstruction_weighting', default='legacy'),
         positive_weight_cap = _select(cfg, 'loss.positive_weight_cap', default=50.0),
         negative_weight_cap = _select(cfg, 'loss.negative_weight_cap', default=5.0),
     )
+
+    probe_enabled = bool(_select(cfg, 'probe.enabled', default=False))
+    probe_manifest = None
+    probe_trainable_names = []
+    probe_frozen_names = []
+    if probe_enabled:
+        if not bool(_select(cfg, 'classification.enabled', default=True)):
+            raise ValueError("probe.enabled=true requires classification.enabled=true.")
+        pretrained_checkpoint = _resolve_checkpoint_path(
+            checkpoint_path=_select(cfg, 'probe.pretrained_checkpoint_path', default=None),
+            model_directory=_select(cfg, 'probe.pretrained_model_directory', default=None),
+        )
+        if pretrained_checkpoint is None:
+            raise ValueError(
+                "probe.enabled=true requires probe.pretrained_checkpoint_path "
+                "or probe.pretrained_model_directory."
+            )
+        trainable_prefixes = _as_list(
+            _select(cfg, 'probe.trainable_parameter_prefixes', default=["Classification."])
+        )
+        if not trainable_prefixes:
+            trainable_prefixes = ["Classification."]
+        load_manifest = _load_probe_backbone(
+            model,
+            pretrained_checkpoint,
+            skip_prefixes=tuple(trainable_prefixes),
+        )
+        probe_trainable_names, probe_frozen_names = model.freeze_for_probe(
+            trainable_prefixes=tuple(trainable_prefixes),
+        )
+        probe_manifest = {
+            "probe_enabled": True,
+            "trainable_parameter_prefixes": trainable_prefixes,
+            "trainable_parameter_names": probe_trainable_names,
+            "n_trainable_parameters": int(sum(p.numel() for p in model.parameters() if p.requires_grad)),
+            "n_total_parameters": int(sum(p.numel() for p in model.parameters())),
+            "n_frozen_parameter_tensors": int(len(probe_frozen_names)),
+            "pretrained": load_manifest,
+        }
 
     checkpoint_mode = str(trainer_cfg.get('checkpoint_mode', 'keep_best_last')).lower()
 
@@ -173,16 +326,16 @@ def Train(cfg : DictConfig) -> None:
         save_top_k = 1
         save_last = True
 
-    callbacks = [
-        ModelCheckpoint(
+    checkpoint_callback = ModelCheckpoint(
             verbose=True,
             monitor=_select(cfg, 'checkpoint.monitor', default='val_loss'),
             save_top_k=save_top_k,
             mode=_select(cfg, 'checkpoint.mode', default='min'),
             save_last=save_last,
             save_on_train_epoch_end=False,
-        ),
-    ]
+        )
+
+    callbacks = [checkpoint_callback]
 
     early_stopping_enabled = _select(cfg, 'early_stopping.enabled', 'trainer.enable_early_stopping', True)
     if early_stopping_enabled:
@@ -262,6 +415,27 @@ def Train(cfg : DictConfig) -> None:
     
     else:
         trainer.fit(model, datamodule=datamodule)
+
+    if probe_manifest is not None:
+        probe_manifest.update(
+            {
+                "best_model_path": checkpoint_callback.best_model_path,
+                "best_model_score": (
+                    float(checkpoint_callback.best_model_score.detach().cpu())
+                    if checkpoint_callback.best_model_score is not None
+                    else None
+                ),
+                "last_model_path": getattr(checkpoint_callback, "last_model_path", None),
+                "log_dir": getattr(trainer.logger, "log_dir", None),
+            }
+        )
+        manifest_dir = getattr(trainer.logger, "log_dir", None) or os.getcwd()
+        os.makedirs(manifest_dir, exist_ok=True)
+        manifest_path = os.path.join(manifest_dir, "frozen_probe_manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(probe_manifest, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        print(f"Wrote frozen-probe manifest: {manifest_path}")
 
 
 if __name__ == '__main__':

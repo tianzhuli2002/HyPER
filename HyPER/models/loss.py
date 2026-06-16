@@ -3,6 +3,7 @@ import torch
 from contextlib import nullcontext
 from torch import Tensor
 from torch.nn import BCELoss
+import torch.nn.functional as F
 from torch_scatter import scatter
 
 from typing import Optional
@@ -35,6 +36,10 @@ def _safe_bce(
 
     with _autocast_disabled_like(pred):
         return criterion(pred.float(), target.float())
+
+
+def _safe_bce_with_logits(pred: Tensor, target: Tensor) -> Tensor:
+    return F.binary_cross_entropy_with_logits(pred.float(), target.float(), reduction="none")
 
 
 def _align_mask_to_loss(loss: Tensor, mask: Tensor | None) -> Tensor | None:
@@ -86,9 +91,96 @@ def _normalise_weighting_name(weighting: str | None) -> str:
     if weighting is None:
         return "legacy"
     name = str(weighting).strip().lower()
-    if name in {"", "none"}:
+    if name == "":
         return "legacy"
     return name
+
+
+def _typed_class_weight(
+    target_class: Tensor,
+    num_classes: int,
+    weighting: str | None,
+    cap: float | None,
+) -> Tensor | None:
+    name = _normalise_weighting_name(weighting)
+    if name in {"none", "unweighted", "no_class_weight", "no_class_weights"}:
+        return None
+    if name not in {"legacy", "batch_class", "batch_class_weight", "event_balanced_bce"}:
+        raise ValueError(f"Unsupported reconstruction weighting: {weighting!r}")
+
+    counts = torch.bincount(target_class, minlength=num_classes).float()
+    total = counts.sum()
+    weights = torch.where(
+        counts > 0,
+        total / (float(num_classes) * counts.clamp(min=1.0)),
+        torch.zeros_like(counts),
+    )
+    if cap is not None and float(cap) > 0:
+        weights = weights.clamp(max=float(cap))
+    return weights.to(target_class.device)
+
+
+def _typed_reconstruction_loss(
+    logits: Tensor,
+    target: Tensor,
+    batch: Tensor,
+    reduction: str,
+    weighting: str | None,
+    class_weight_cap: float | None,
+) -> tuple[Tensor, Tensor]:
+    if (
+        logits is None
+        or logits.numel() == 0
+        or target is None
+        or target.numel() == 0
+        or batch is None
+        or batch.numel() == 0
+    ):
+        if logits is not None:
+            device = logits.device
+        elif target is not None:
+            device = target.device
+        else:
+            device = torch.device("cpu")
+        return torch.zeros(1, device=device), torch.zeros(1, dtype=torch.bool, device=device)
+
+    if target.ndim != 2 or logits.ndim != 2:
+        raise ValueError(
+            f"Typed reconstruction expects 2D logits/targets, got logits={tuple(logits.shape)}, "
+            f"target={tuple(target.shape)}"
+        )
+    if logits.size(1) != target.size(1):
+        raise ValueError(
+            f"Typed reconstruction channel mismatch: logits={tuple(logits.shape)}, target={tuple(target.shape)}"
+        )
+
+    target = target.float()
+    target_class = target.argmax(dim=1).to(torch.long)
+    background_class = target.size(1) - 1
+    batch_flat = batch.flatten().to(torch.long)
+    dim_size = int(batch_flat.max().item()) + 1
+
+    class_weight = _typed_class_weight(
+        target_class,
+        num_classes=target.size(1),
+        weighting=weighting,
+        cap=class_weight_cap,
+    )
+    loss = F.cross_entropy(
+        logits.float(),
+        target_class,
+        reduction="none",
+        weight=class_weight,
+    )
+    per_event_loss = scatter(loss, batch_flat, dim=0, dim_size=dim_size, reduce=reduction)
+    active_events = scatter(
+        (target_class != background_class).float(),
+        batch_flat,
+        dim=0,
+        dim_size=dim_size,
+        reduce="sum",
+    ) > 0
+    return per_event_loss, active_events
 
 
 def _event_balanced_bce_per_event(
@@ -106,7 +198,7 @@ def _event_balanced_bce_per_event(
     event-level S/B classification loss elsewhere.
     """
     target = target.float().view_as(pred)
-    loss = _safe_bce(pred, target, criterion=criterion).flatten()
+    loss = _safe_bce_with_logits(pred, target).flatten()
     target_flat = target.flatten()
     batch_flat = batch.flatten().to(torch.long)
 
@@ -182,6 +274,7 @@ def EdgeLoss(
     weighting: str | None = "legacy",
     positive_weight_cap: float | None = None,
     negative_weight_cap: float | None = None,
+    target_encoding: str = "binary",
 ) -> tuple[Tensor, Tensor]:
     """Calculate per-graph edge loss.
 
@@ -202,8 +295,18 @@ def EdgeLoss(
             torch.zeros(1, dtype=torch.bool, device=edge_attr_out.device),
         )
 
-    target = edge_attr_t.float().view_as(edge_attr_out)
     batch_flat = edge_attr_batch.flatten().to(torch.long)
+    if str(target_encoding).strip().lower() == "typed":
+        return _typed_reconstruction_loss(
+            edge_attr_out,
+            edge_attr_t,
+            batch_flat,
+            reduction=str(reduction or "mean"),
+            weighting=weighting,
+            class_weight_cap=positive_weight_cap,
+        )
+
+    target = edge_attr_t.float().view_as(edge_attr_out)
 
     if _normalise_weighting_name(weighting) == "event_balanced_bce":
         per_event_loss, loss_masks, _, _ = _event_balanced_bce_per_event(
@@ -216,10 +319,10 @@ def EdgeLoss(
         )
         return per_event_loss, loss_masks
 
-    if _normalise_weighting_name(weighting) != "legacy":
+    if _normalise_weighting_name(weighting) not in {"legacy", "none", "unweighted"}:
         raise ValueError(f"Unsupported reconstruction weighting: {weighting!r}")
 
-    loss = _safe_bce(edge_attr_out, target, criterion=criterion)
+    loss = _safe_bce_with_logits(edge_attr_out, target)
     target_flat = target.flatten()
     loss_flat = loss.flatten()
     loss_masks = scatter(target_flat, batch_flat, reduce="sum") > 0
@@ -237,6 +340,7 @@ def HyperedgeLoss(
     weighting: str | None = "legacy",
     positive_weight_cap: float | None = None,
     negative_weight_cap: float | None = None,
+    target_encoding: str = "binary",
 ) -> tuple[Tensor, Tensor]:
     """Calculate per-graph hyperedge loss.
 
@@ -257,8 +361,18 @@ def HyperedgeLoss(
             torch.zeros(1, dtype=torch.bool, device=x_out.device),
         )
 
-    target = x_t.float().view_as(x_out)
     batch_flat = x_t_batch.flatten().to(torch.long)
+    if str(target_encoding).strip().lower() == "typed":
+        return _typed_reconstruction_loss(
+            x_out,
+            x_t,
+            batch_flat,
+            reduction=str(reduction or "mean"),
+            weighting=weighting,
+            class_weight_cap=positive_weight_cap,
+        )
+
+    target = x_t.float().view_as(x_out)
 
     if _normalise_weighting_name(weighting) == "event_balanced_bce":
         per_event_loss, loss_masks, _, _ = _event_balanced_bce_per_event(
@@ -271,10 +385,10 @@ def HyperedgeLoss(
         )
         return per_event_loss, loss_masks
 
-    if _normalise_weighting_name(weighting) != "legacy":
+    if _normalise_weighting_name(weighting) not in {"legacy", "none", "unweighted"}:
         raise ValueError(f"Unsupported reconstruction weighting: {weighting!r}")
 
-    loss = _safe_bce(x_out, target, criterion=criterion)
+    loss = _safe_bce_with_logits(x_out, target)
     target_flat = target.flatten()
     loss_flat = loss.flatten()
     loss_masks = scatter(target_flat, batch_flat, reduce="sum") > 0
@@ -342,7 +456,7 @@ def CombinedLoss(
             reco_loss = sum(w * term for w, term in zip(reco_weights, reco_terms)) / weight_sum
     else:
         # No reconstructable targets in this batch.
-        reco_loss = loss_hyperedge.new_tensor(0.0)
+        reco_loss = loss_hyperedge.sum() * 0.0 + loss_edge.sum() * 0.0
 
     has_class_targets = (
         cls_target is not None

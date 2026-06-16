@@ -25,6 +25,30 @@ def _score_or_zero(scores, idx):
     return float(scores[idx])
 
 
+def _normalise_class_name(name):
+    return str(name).strip().lower()
+
+
+def _class_index(names, class_name):
+    if names is None:
+        return None
+    wanted = _normalise_class_name(class_name)
+    for idx, name in enumerate(list(names)):
+        if _normalise_class_name(name) == wanted:
+            return idx
+    return None
+
+
+def _class_scores(raw_scores, class_probs, class_names, class_name):
+    class_idx = _class_index(class_names, class_name)
+    if class_probs is None or class_idx is None:
+        return np.asarray(raw_scores, dtype=float), False
+    probs = np.asarray(class_probs, dtype=float)
+    if probs.ndim != 2 or class_idx >= probs.shape[1]:
+        return np.asarray(raw_scores, dtype=float), False
+    return probs[:, class_idx], True
+
+
 def _vct_counts(vct):
     values = _as_list(vct)
     return {
@@ -128,6 +152,7 @@ def _default_assignment():
         "wlep_idx": None,
         "wlep_nodes": [-1, -1],
         "wlep_score": 0.0,
+        "wlep_derived": False,
         "blep_node": -1,
         "bhad_node": -1,
         "whad_j1": -1,
@@ -160,6 +185,21 @@ def _fill_wlep(assignment, GE_IDX, GE_RAW, GE_VCT):
     assignment["wlep_idx"] = wlep_idx
     assignment["wlep_nodes"] = wlep_nodes
     assignment["wlep_score"] = wlep_score
+    assignment["wlep_derived"] = False
+    return assignment
+
+
+def _derive_wlep_from_tlep(assignment, HE_VCT):
+    tlep_idx = assignment.get("tlep_idx")
+    if tlep_idx is None:
+        return assignment
+    nonjet_nodes = _nonjet_nodes_from_vct(assignment["tlep_nodes"], HE_VCT[tlep_idx])
+    if len(nonjet_nodes) != 2:
+        return assignment
+    assignment["wlep_idx"] = None
+    assignment["wlep_nodes"] = nonjet_nodes
+    assignment["wlep_score"] = assignment["tlep_score"]
+    assignment["wlep_derived"] = True
     return assignment
 
 
@@ -174,18 +214,29 @@ def _score_global_assignment(
     max_thad_candidates,
     max_pair_candidates,
     max_wlep_candidates,
+    HE_THAD_RAW=None,
+    GE_WHAD_RAW=None,
+    GE_HIGGS_RAW=None,
+    GE_WLEP_RAW=None,
 ):
+    HE_THAD_RAW = HE_RAW if HE_THAD_RAW is None else HE_THAD_RAW
+    GE_WHAD_RAW = GE_RAW if GE_WHAD_RAW is None else GE_WHAD_RAW
+    GE_HIGGS_RAW = GE_RAW if GE_HIGGS_RAW is None else GE_HIGGS_RAW
+    GE_WLEP_RAW = GE_RAW if GE_WLEP_RAW is None else GE_WLEP_RAW
     tlep_candidates = _candidate_hyperedges(
         HE_IDX, HE_RAW, HE_VCT, _is_tlep_hyperedge, max_tlep_candidates
     )
     thad_candidates = _candidate_hyperedges(
-        HE_IDX, HE_RAW, HE_VCT, _is_thad_hyperedge, max_thad_candidates
+        HE_IDX, HE_THAD_RAW, HE_VCT, _is_thad_hyperedge, max_thad_candidates
     )
-    pair_candidates = _candidate_edges(
-        GE_IDX, GE_RAW, GE_VCT, _is_whad_or_higgs_edge, max_pair_candidates
+    whad_candidates = _candidate_edges(
+        GE_IDX, GE_WHAD_RAW, GE_VCT, _is_whad_or_higgs_edge, max_pair_candidates
+    )
+    higgs_candidates = _candidate_edges(
+        GE_IDX, GE_HIGGS_RAW, GE_VCT, _is_whad_or_higgs_edge, max_pair_candidates
     )
     wlep_candidates = _candidate_edges(
-        GE_IDX, GE_RAW, GE_VCT, _is_wlep_edge, max_wlep_candidates
+        GE_IDX, GE_WLEP_RAW, GE_VCT, _is_wlep_edge, max_wlep_candidates
     )
 
     best = None
@@ -205,7 +256,7 @@ def _score_global_assignment(
 
             whad_options = [
                 (idx, nodes, score)
-                for idx, nodes, score in pair_candidates
+                for idx, nodes, score in whad_candidates
                 if set(nodes).issubset(thad_set)
             ]
             if not whad_options:
@@ -213,7 +264,7 @@ def _score_global_assignment(
 
             higgs_options = [
                 (idx, nodes, score)
-                for idx, nodes, score in pair_candidates
+                for idx, nodes, score in higgs_candidates
                 if blep_node not in set(nodes) and not thad_set.intersection(nodes)
             ]
             if not higgs_options:
@@ -344,6 +395,7 @@ def ttH_single_lep(
     HyPER_best_wlep_prob = []
     HyPER_best_whad_prob = []
     HyPER_best_higgs_prob = []
+    HyPER_best_wlep_derived = []
 
     reco_valid = []
     tlep_valid = []
@@ -359,13 +411,23 @@ def ttH_single_lep(
         GE_RAW = results["HyPER_GE_RAW"][i]
         HE_VCT = results["HyPER_HE_VCT"][i]
         GE_VCT = results["HyPER_GE_VCT"][i]
+        HE_PROBS = results["HyPER_HE_CLASS_PROBS"][i] if "HyPER_HE_CLASS_PROBS" in results.columns else None
+        GE_PROBS = results["HyPER_GE_CLASS_PROBS"][i] if "HyPER_GE_CLASS_PROBS" in results.columns else None
+        HE_CLASS_NAMES = results["HyPER_HE_CLASS_NAMES"][i] if "HyPER_HE_CLASS_NAMES" in results.columns else None
+        GE_CLASS_NAMES = results["HyPER_GE_CLASS_NAMES"][i] if "HyPER_GE_CLASS_NAMES" in results.columns else None
+
+        HE_TLEP_RAW, _ = _class_scores(HE_RAW, HE_PROBS, HE_CLASS_NAMES, "tlep")
+        HE_THAD_RAW, _ = _class_scores(HE_RAW, HE_PROBS, HE_CLASS_NAMES, "thad")
+        GE_WHAD_RAW, _ = _class_scores(GE_RAW, GE_PROBS, GE_CLASS_NAMES, "Whad")
+        GE_HIGGS_RAW, _ = _class_scores(GE_RAW, GE_PROBS, GE_CLASS_NAMES, "H")
+        GE_WLEP_RAW, has_wlep_class = _class_scores(GE_RAW, GE_PROBS, GE_CLASS_NAMES, "Wlep")
 
         assignment = _default_assignment()
 
         if strategy == "score_global":
             assignment = _score_global_assignment(
                 HE_IDX,
-                HE_RAW,
+                HE_TLEP_RAW,
                 HE_VCT,
                 GE_IDX,
                 GE_RAW,
@@ -374,12 +436,16 @@ def ttH_single_lep(
                 max_thad_candidates=max_thad_candidates,
                 max_pair_candidates=max_pair_candidates,
                 max_wlep_candidates=max_wlep_candidates,
+                HE_THAD_RAW=HE_THAD_RAW,
+                GE_WHAD_RAW=GE_WHAD_RAW,
+                GE_HIGGS_RAW=GE_HIGGS_RAW,
+                GE_WLEP_RAW=GE_WLEP_RAW,
             )
         else:
             # 1. Select leptonic top: b_lep + lepton + MET.
             tlep_idx, tlep_nodes, tlep_score = _select_best_hyperedge(
                 HE_IDX,
-                HE_RAW,
+                HE_TLEP_RAW,
                 HE_VCT,
                 predicate=_is_tlep_hyperedge,
             )
@@ -403,7 +469,7 @@ def ttH_single_lep(
             thad_forbidden = {blep_node} if blep_node >= 0 else set()
             thad_idx, thad_nodes, thad_score = _select_best_hyperedge(
                 HE_IDX,
-                HE_RAW,
+                HE_THAD_RAW,
                 HE_VCT,
                 predicate=_is_thad_hyperedge,
                 forbidden_nodes=thad_forbidden,
@@ -421,7 +487,7 @@ def ttH_single_lep(
             # 3. Select Whad: best two-jet edge inside THAD.
             whad_idx, whad_nodes, whad_score = _select_best_edge(
                 GE_IDX,
-                GE_RAW,
+                GE_WHAD_RAW,
                 GE_VCT,
                 predicate=_is_whad_or_higgs_edge,
                 required_subset=thad_node_set if thad_idx is not None else None,
@@ -444,7 +510,7 @@ def ttH_single_lep(
 
             higgs_idx, higgs_nodes, higgs_score = _select_best_edge(
                 GE_IDX,
-                GE_RAW,
+                GE_HIGGS_RAW,
                 GE_VCT,
                 predicate=_is_whad_or_higgs_edge,
                 forbidden_nodes=higgs_forbidden,
@@ -461,8 +527,13 @@ def ttH_single_lep(
                 }
             )
 
-            # 5. Select Wlep: best lepton-MET edge.
-            assignment = _fill_wlep(assignment, GE_IDX, GE_RAW, GE_VCT)
+            # 5. Select Wlep if it is a trained edge class. For ttH_SL typed
+            # models it is derived from the selected tlep hyperedge.
+            assignment = (
+                _fill_wlep(assignment, GE_IDX, GE_WLEP_RAW, GE_VCT)
+                if has_wlep_class or GE_PROBS is None
+                else _derive_wlep_from_tlep(assignment, HE_VCT)
+            )
         elif strategy == "higgs_first":
             # 2. Select H first: best two-jet edge disjoint from b_lep.
             blep_node = assignment["blep_node"]
@@ -470,7 +541,7 @@ def ttH_single_lep(
 
             higgs_idx, higgs_nodes, higgs_score = _select_best_edge(
                 GE_IDX,
-                GE_RAW,
+                GE_HIGGS_RAW,
                 GE_VCT,
                 predicate=_is_whad_or_higgs_edge,
                 forbidden_nodes=higgs_forbidden,
@@ -496,7 +567,7 @@ def ttH_single_lep(
 
             thad_idx, thad_nodes, thad_score = _select_best_hyperedge(
                 HE_IDX,
-                HE_RAW,
+                HE_THAD_RAW,
                 HE_VCT,
                 predicate=_is_thad_hyperedge,
                 forbidden_nodes=thad_forbidden,
@@ -514,7 +585,7 @@ def ttH_single_lep(
             # 4. Select Whad inside thad.
             whad_idx, whad_nodes, whad_score = _select_best_edge(
                 GE_IDX,
-                GE_RAW,
+                GE_WHAD_RAW,
                 GE_VCT,
                 predicate=_is_whad_or_higgs_edge,
                 required_subset=thad_node_set if thad_idx is not None else None,
@@ -527,7 +598,13 @@ def ttH_single_lep(
                 }
             )
             assignment = _finish_thad_assignment(assignment)
-            assignment = _fill_wlep(assignment, GE_IDX, GE_RAW, GE_VCT)
+            assignment = (
+                _fill_wlep(assignment, GE_IDX, GE_WLEP_RAW, GE_VCT)
+                if has_wlep_class or GE_PROBS is None
+                else _derive_wlep_from_tlep(assignment, HE_VCT)
+            )
+        if strategy == "score_global" and GE_PROBS is not None and not has_wlep_class:
+            assignment = _derive_wlep_from_tlep(assignment, HE_VCT)
 
         tlep_idx = assignment["tlep_idx"]
         tlep_nodes = assignment["tlep_nodes"]
@@ -544,6 +621,7 @@ def ttH_single_lep(
         wlep_idx = assignment["wlep_idx"]
         wlep_nodes = assignment["wlep_nodes"]
         wlep_score = assignment["wlep_score"]
+        wlep_derived = assignment["wlep_derived"]
         blep_node = assignment["blep_node"]
         bhad_node = assignment["bhad_node"]
         whad_j1 = assignment["whad_j1"]
@@ -555,7 +633,7 @@ def ttH_single_lep(
         this_thad_valid = int(thad_idx is not None)
         this_whad_valid = int(whad_idx is not None and bhad_node >= 0)
         this_higgs_valid = int(higgs_idx is not None)
-        this_wlep_valid = int(wlep_idx is not None)
+        this_wlep_valid = int((wlep_idx is not None) or bool(wlep_derived))
 
         this_reco_valid = int(
             this_tlep_valid
@@ -582,6 +660,7 @@ def ttH_single_lep(
         HyPER_best_wlep_prob.append(wlep_score)
         HyPER_best_whad_prob.append(whad_score)
         HyPER_best_higgs_prob.append(higgs_score)
+        HyPER_best_wlep_derived.append(bool(wlep_derived))
 
         reco_valid.append(this_reco_valid)
         tlep_valid.append(this_tlep_valid)
@@ -608,6 +687,7 @@ def ttH_single_lep(
     results["HyPER_best_wlep_prob"] = HyPER_best_wlep_prob
     results["HyPER_best_whad_prob"] = HyPER_best_whad_prob
     results["HyPER_best_higgs_prob"] = HyPER_best_higgs_prob
+    results["HyPER_best_wlep_derived"] = HyPER_best_wlep_derived
 
     results["reco_valid"] = reco_valid
     results["tlep_valid"] = tlep_valid
@@ -634,6 +714,7 @@ def ttH_single_lep(
         "HyPER_best_wlep_prob",
         "HyPER_best_whad_prob",
         "HyPER_best_higgs_prob",
+        "HyPER_best_wlep_derived",
         "reco_valid",
         "tlep_valid",
         "thad_valid",

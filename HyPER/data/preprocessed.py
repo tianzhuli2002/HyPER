@@ -86,7 +86,7 @@ class PreprocessingWrite(IterableDataset):
         worker_id: int = 0,
         source_idx: Optional[int] = None,
         graph_time: Optional[float] = None,
-    ) -> None:
+    ) -> tuple[float, float, int]:
         t0 = time.time()
         graph_bytes = pickle.dumps(G, protocol=pickle.HIGHEST_PROTOCOL)
         payload = np.frombuffer(graph_bytes, dtype=np.uint8)
@@ -103,6 +103,7 @@ class PreprocessingWrite(IterableDataset):
                 file=sys.stderr,
                 flush=True,
             )
+        return t_pickle, t_write, len(graph_bytes)
 
     def __iter__(self):
         worker_info = get_worker_info()
@@ -127,6 +128,14 @@ class PreprocessingWrite(IterableDataset):
         f, db = self.create_db(db_path, int(iter_end - iter_start))
 
         local_index = 0
+        total_graph_time = 0.0
+        total_pickle_time = 0.0
+        total_write_time = 0.0
+        total_bytes = 0
+        total_edges = 0
+        total_hyperedges = 0
+        processed = 0
+        wall_start = time.time()
         progress = tqdm(range(iter_start, iter_end),
                         desc=f"Worker {worker_id if worker_info else 'main'}",
                         total=iter_end-iter_start,
@@ -139,10 +148,11 @@ class PreprocessingWrite(IterableDataset):
             t0 = time.time()
             graphs = self.master.processing_chunk(chunk_start, chunk_end)
             t_graph = time.time() - t0
+            total_graph_time += t_graph
             graph_time = t_graph / max(1, len(graphs))
             for offset, G in enumerate(graphs):
                 idx = chunk_start + offset
-                self.write_graph(
+                t_pickle, t_write, nbytes = self.write_graph(
                     db,
                     local_index,
                     G,
@@ -150,12 +160,37 @@ class PreprocessingWrite(IterableDataset):
                     source_idx=idx,
                     graph_time=graph_time,
                 )
+                total_pickle_time += t_pickle
+                total_write_time += t_write
+                total_bytes += nbytes
+                total_edges += int(G.edge_index.shape[1]) if hasattr(G, "edge_index") else 0
+                total_hyperedges += int(G.hyperedge_index.shape[1]) if hasattr(G, "hyperedge_index") else 0
+                processed += 1
                 local_index += 1
                 progress.update(1)
                 yield 1
         progress.close()
 
         f.close()
+        wall = time.time() - wall_start
+        if processed > 0:
+            print(
+                "[HYPER_DB_PROFILE] "
+                f"worker={worker_id} events={processed} total_time={wall:.3f}s "
+                f"events_per_s={processed / max(wall, 1e-9):.2f} "
+                f"avg_graph_s={total_graph_time / processed:.6f} "
+                f"avg_pickle_s={total_pickle_time / processed:.6f} "
+                f"avg_write_s={total_write_time / processed:.6f} "
+                f"avg_edges={total_edges / processed:.1f} "
+                f"avg_hyperedges={total_hyperedges / processed:.1f} "
+                f"avg_payload_bytes={total_bytes / processed:.1f} "
+                f"target_encoding={getattr(self.master, 'target_encoding', 'binary')} "
+                f"vectorized_chunks={getattr(self.master, 'use_vectorized_chunks', False)} "
+                f"chunk_size={chunk_size} "
+                f"rebuilt=True db_part={db_path}",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 class GraphDB():
@@ -231,6 +266,15 @@ class GraphDB():
             print(f"Using existing HyPER graph database {self.db_path}.")
             master = HyPERDataset(root=root, name=name, training=training, force_reload=False, config=self.config)
             self.dataset_vars = vars(master)
+            print(
+                "[HYPER_DB_PROFILE] "
+                f"events=reused total_time=0.000s events_per_s=inf "
+                f"target_encoding={getattr(master, 'target_encoding', 'binary')} "
+                f"vectorized_chunks={getattr(master, 'use_vectorized_chunks', False)} "
+                f"rebuilt=False db_path={self.db_path}",
+                file=sys.stderr,
+                flush=True,
+            )
 
         with h5py.File(self.db_path, 'r') as db_file:
             self.size = len(db_file['Graphs'])
@@ -256,8 +300,11 @@ class GraphDB():
                 with h5py.File(input_file, 'r') as input_f:
                     input_db = input_f['Graphs']
                     num_events = len(input_db)
-                    for offset in range(num_events):
-                        output_db[current_index + offset] = input_db[offset]
+                    try:
+                        output_db[current_index:current_index + num_events] = input_db[:]
+                    except (TypeError, ValueError):
+                        for offset in range(num_events):
+                            output_db[current_index + offset] = input_db[offset]
                     current_index += num_events
 
     def cleanup(self):
