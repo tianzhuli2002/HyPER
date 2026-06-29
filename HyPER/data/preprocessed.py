@@ -221,8 +221,12 @@ class GraphDB():
 
         self.root = root
         self.name = name
-        self.config = deepcopy(config) if config is not None else None
+        self.config = HyPERDataset._resolve_graph_config(
+            root=root,
+            config=deepcopy(config) if config is not None else None,
+        )
         self.config_hash = self._config_hash(self.config)
+        self.feature_layout = HyPERDataset.feature_layout_from_config(self.config)
 
         if force_reload and os.path.exists(self.db_path):
             os.remove(self.db_path)
@@ -400,6 +404,7 @@ class GraphDB():
             "name": self.name,
             "config_hash": self.config_hash,
             "db_format": DB_FORMAT,
+            "feature_layout": self.feature_layout,
         }
         with open(self.manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2, sort_keys=True)

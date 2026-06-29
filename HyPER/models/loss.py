@@ -10,15 +10,7 @@ from typing import Optional
 
 
 def _autocast_disabled_like(tensor: Tensor):
-    """Disable AMP autocast around BCE-on-probabilities.
-
-    This avoids:
-      RuntimeError: binary_cross_entropy and BCELoss are unsafe to autocast
-
-    This is needed because the model currently applies Sigmoid() in the heads
-    and then uses BCELoss. A cleaner future refactor would remove the Sigmoid()
-    heads and use BCEWithLogitsLoss.
-    """
+    """Disable AMP autocast around legacy BCE-on-probabilities helpers."""
     device_type = tensor.device.type
     if device_type in {"cuda", "cpu", "xpu", "mps"}:
         return torch.amp.autocast(device_type=device_type, enabled=False)
@@ -87,6 +79,62 @@ def _masked_mean(loss: Tensor, mask: Tensor | None) -> tuple[Tensor, Tensor]:
     return loss[keep].mean(), torch.tensor(True, device=loss.device)
 
 
+def _masked_mean_no_sync(loss: Tensor, mask: Tensor | None) -> tuple[Tensor, Tensor]:
+    """Return masked mean and an active flag without CPU/GPU sync.
+
+    Semantics:
+      - inactive entries do not contribute;
+      - inactive NaN/Inf entries are neutralised so they cannot poison the loss;
+      - active NaN/Inf entries deliberately propagate NaN instead of being
+        silently dropped and converted into a zero loss;
+      - the active flag is computed from the unclamped active count.
+    """
+    loss = loss.flatten()
+
+    if loss.numel() == 0:
+        zero = loss.new_tensor(0.0)
+        return zero, zero
+
+    if mask is None:
+        active_mask = torch.ones_like(loss, dtype=torch.bool, device=loss.device)
+    else:
+        aligned = _align_mask_to_loss(loss, mask)
+        assert aligned is not None
+        active_mask = aligned.flatten().bool().to(loss.device)
+
+    active_f = active_mask.to(loss.dtype)
+    active_count = active_f.sum()
+    denom = active_count.clamp_min(1.0)
+    active = (active_count > 0).to(loss.dtype)
+
+    finite = torch.isfinite(loss)
+    active_bad = active_mask & (~finite)
+
+    # Neutralise inactive non-finite entries. Do not use torch.where directly
+    # on the original loss, because inactive NaN branches can still be awkward
+    # in autograd. Active non-finite entries are handled below and deliberately
+    # make the returned value NaN.
+    safe_loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
+    value = (safe_loss * active_f).sum() / denom
+
+    # If any active entry was non-finite, propagate NaN. This avoids the
+    # previous failure mode where all non-finite active entries could be filtered
+    # away and the reconstruction loss became exactly zero.
+    has_active_bad = active_bad.to(loss.dtype).sum() > 0
+    value = torch.where(
+        has_active_bad,
+        loss.new_tensor(float("nan")),
+        value,
+    )
+
+    # If there are no active entries, return a differentiable zero. This should
+    # be a rare/no-target batch case, not a way to hide active non-finite losses.
+    zero = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0).sum() * 0.0
+    value = torch.where(active_count > 0, value, zero)
+
+    return value, active
+
+
 def _normalise_weighting_name(weighting: str | None) -> str:
     if weighting is None:
         return "legacy"
@@ -127,6 +175,10 @@ def _typed_reconstruction_loss(
     reduction: str,
     weighting: str | None,
     class_weight_cap: float | None,
+    target_class: Tensor | None = None,
+    active_events: Tensor | None = None,
+    validate_cached_targets: bool = False,
+    dim_size: int | None = None,
 ) -> tuple[Tensor, Tensor]:
     if (
         logits is None
@@ -155,10 +207,29 @@ def _typed_reconstruction_loss(
         )
 
     target = target.float()
-    target_class = target.argmax(dim=1).to(torch.long)
+    computed_target_class = None
+    if target_class is None:
+        target_class = target.argmax(dim=1).to(torch.long)
+    else:
+        target_class = target_class.flatten().to(device=target.device, dtype=torch.long)
+        if target_class.numel() != target.size(0):
+            raise ValueError(
+                "Cached typed target class length mismatch: "
+                f"target_class={tuple(target_class.shape)}, target={tuple(target.shape)}"
+            )
+        if validate_cached_targets:
+            computed_target_class = target.argmax(dim=1).to(torch.long)
+            if not torch.equal(target_class, computed_target_class):
+                raise ValueError("Cached typed target classes do not match target.argmax(dim=1).")
     background_class = target.size(1) - 1
     batch_flat = batch.flatten().to(torch.long)
-    dim_size = int(batch_flat.max().item()) + 1
+    if active_events is not None:
+        active_events = active_events.flatten().to(device=target.device, dtype=torch.bool)
+        dim_size = int(active_events.numel())
+    elif dim_size is not None:
+        dim_size = int(dim_size)
+    else:
+        dim_size = int(batch_flat.max().item()) + 1
 
     class_weight = _typed_class_weight(
         target_class,
@@ -173,13 +244,14 @@ def _typed_reconstruction_loss(
         weight=class_weight,
     )
     per_event_loss = scatter(loss, batch_flat, dim=0, dim_size=dim_size, reduce=reduction)
-    active_events = scatter(
-        (target_class != background_class).float(),
-        batch_flat,
-        dim=0,
-        dim_size=dim_size,
-        reduce="sum",
-    ) > 0
+    if active_events is None:
+        active_events = scatter(
+            (target_class != background_class).float(),
+            batch_flat,
+            dim=0,
+            dim_size=dim_size,
+            reduce="sum",
+        ) > 0
     return per_event_loss, active_events
 
 
@@ -246,9 +318,9 @@ def _event_balanced_bce_per_event(
 def ClassificationLoss(
     cls_out: Tensor,
     cls_t: Tensor,
-    criterion: Optional[callable] = BCELoss(reduction="none"),
+    criterion: Optional[callable] = None,
 ) -> Tensor:
-    """Per-event S/B classification loss.
+    """Per-event S/B classification loss from raw logits.
 
     This is applied to all events that have class targets.
     """
@@ -261,8 +333,11 @@ def ClassificationLoss(
     cls_t = cls_t.float().view(-1, 1)
     cls_out = cls_out.view_as(cls_t)
 
-    loss = _safe_bce(cls_out, cls_t, criterion=criterion)
-    return loss.flatten()
+    return F.binary_cross_entropy_with_logits(
+        cls_out.float(),
+        cls_t.float(),
+        reduction="none",
+    ).flatten()
 
 
 def EdgeLoss(
@@ -275,6 +350,10 @@ def EdgeLoss(
     positive_weight_cap: float | None = None,
     negative_weight_cap: float | None = None,
     target_encoding: str = "binary",
+    target_class: Tensor | None = None,
+    active_events: Tensor | None = None,
+    validate_cached_targets: bool = False,
+    dim_size: int | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Calculate per-graph edge loss.
 
@@ -304,6 +383,10 @@ def EdgeLoss(
             reduction=str(reduction or "mean"),
             weighting=weighting,
             class_weight_cap=positive_weight_cap,
+            target_class=target_class,
+            active_events=active_events,
+            validate_cached_targets=validate_cached_targets,
+            dim_size=dim_size,
         )
 
     target = edge_attr_t.float().view_as(edge_attr_out)
@@ -341,6 +424,10 @@ def HyperedgeLoss(
     positive_weight_cap: float | None = None,
     negative_weight_cap: float | None = None,
     target_encoding: str = "binary",
+    target_class: Tensor | None = None,
+    active_events: Tensor | None = None,
+    validate_cached_targets: bool = False,
+    dim_size: int | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Calculate per-graph hyperedge loss.
 
@@ -370,6 +457,10 @@ def HyperedgeLoss(
             reduction=str(reduction or "mean"),
             weighting=weighting,
             class_weight_cap=positive_weight_cap,
+            target_class=target_class,
+            active_events=active_events,
+            validate_cached_targets=validate_cached_targets,
+            dim_size=dim_size,
         )
 
     target = x_t.float().view_as(x_out)
@@ -430,33 +521,30 @@ def CombinedLoss(
     loss_edge = loss_edge.flatten()
     loss_hyperedge = loss_hyperedge.flatten()
 
-    edge_loss, has_edge = _masked_mean(loss_edge, loss_edge_masks)
-    hyper_loss, has_hyper = _masked_mean(loss_hyperedge, loss_hyperedge_masks)
+    edge_loss, has_edge = _masked_mean_no_sync(loss_edge, loss_edge_masks)
+    hyper_loss, has_hyper = _masked_mean_no_sync(loss_hyperedge, loss_hyperedge_masks)
 
     # Combine only active reconstruction components.
     # If only edge truth exists, edge gets full weight.
     # If only hyperedge truth exists, hyperedge gets full weight.
     # If both exist, use alpha for hyperedge and 1-alpha for edge.
-    reco_terms = []
-    reco_weights = []
+    edge_w = has_edge * loss_edge.new_tensor(1.0 - alpha)
+    hyper_w = has_hyper * loss_hyperedge.new_tensor(alpha)
+    weight_sum = edge_w + hyper_w
+    edge_loss_for_term = torch.where(has_edge > 0, edge_loss, torch.nan_to_num(edge_loss, nan=0.0, posinf=0.0, neginf=0.0))
+    hyper_loss_for_term = torch.where(has_hyper > 0, hyper_loss, torch.nan_to_num(hyper_loss, nan=0.0, posinf=0.0, neginf=0.0))
+    edge_term = edge_w * edge_loss_for_term
+    hyper_term = hyper_w * hyper_loss_for_term
 
-    if bool(has_hyper):
-        reco_terms.append(hyper_loss)
-        reco_weights.append(alpha)
-
-    if bool(has_edge):
-        reco_terms.append(edge_loss)
-        reco_weights.append(1.0 - alpha)
-
-    if reco_terms:
-        weight_sum = sum(reco_weights)
-        if weight_sum <= 0.0:
-            reco_loss = torch.stack(reco_terms).mean()
-        else:
-            reco_loss = sum(w * term for w, term in zip(reco_weights, reco_terms)) / weight_sum
-    else:
-        # No reconstructable targets in this batch.
-        reco_loss = loss_hyperedge.sum() * 0.0 + loss_edge.sum() * 0.0
+    zero_reco = (
+        torch.where(torch.isfinite(loss_hyperedge), loss_hyperedge, loss_hyperedge.new_zeros(())).sum() * 0.0
+        + torch.where(torch.isfinite(loss_edge), loss_edge, loss_edge.new_zeros(())).sum() * 0.0
+    )
+    reco_loss = torch.where(
+        weight_sum > 0,
+        (edge_term + hyper_term) / weight_sum.clamp_min(1e-8),
+        zero_reco,
+    )
 
     has_class_targets = (
         cls_target is not None

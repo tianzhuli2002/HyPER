@@ -8,10 +8,107 @@ import re
 from pathlib import Path
 from collections.abc import Iterator
 
+import h5py
+import numpy as np
 import pandas as pd
 
 
 LOGGER = logging.getLogger(__name__)
+SOURCE_INDEX_COLUMNS = ("HYPER_SOURCE_INDEX", "source_event_index")
+
+
+def source_index_column(frame: pd.DataFrame) -> str | None:
+    for column in SOURCE_INDEX_COLUMNS:
+        if column in frame.columns:
+            return column
+    return None
+
+
+def coerce_source_indices(
+    frame: pd.DataFrame,
+    n_h5_events: int,
+    allow_duplicates: bool = False,
+) -> tuple[np.ndarray, list[str]]:
+    column = source_index_column(frame)
+    if column is None:
+        raise ValueError(
+            "Length mismatch and no HYPER_SOURCE_INDEX available. Re-run prediction "
+            "with source-index export enabled, or predict the full H5."
+        )
+
+    values = pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float)
+    warnings: list[str] = []
+    if values.size != len(frame):
+        raise ValueError(f"{column} length does not match prediction rows.")
+    if not np.all(np.isfinite(values)):
+        raise ValueError(f"{column} contains non-finite values.")
+    indices = values.astype(np.int64)
+    if not np.allclose(values, indices):
+        raise ValueError(f"{column} contains non-integer values.")
+    if indices.size and int(indices.min()) < 0:
+        raise ValueError(f"{column} contains a negative source index: {int(indices.min())}.")
+    if indices.size and int(indices.max()) >= int(n_h5_events):
+        raise ValueError(
+            f"{column} contains source index {int(indices.max())}, "
+            f"but H5 has only {int(n_h5_events)} rows."
+        )
+    unique_count = int(np.unique(indices).size)
+    if unique_count != int(indices.size):
+        message = f"{column} contains duplicate source indices ({indices.size - unique_count} duplicates)."
+        if allow_duplicates:
+            warnings.append(message)
+        else:
+            raise ValueError(message)
+    return indices, warnings
+
+
+def read_h5_rows(
+    handle: h5py.File,
+    dataset_paths: dict[str, str],
+    source_indices: np.ndarray,
+    chunk_size: int = 100000,
+    max_span_factor: int = 20,
+) -> dict[str, np.ndarray]:
+    indices = np.asarray(source_indices, dtype=np.int64).reshape(-1)
+    if indices.size == 0:
+        return {name: handle[path][:0] for name, path in dataset_paths.items()}
+
+    order = np.argsort(indices, kind="mergesort")
+    sorted_indices = indices[order]
+    unique_indices, inverse_sorted = np.unique(sorted_indices, return_inverse=True)
+    restore = np.empty_like(order)
+    restore[order] = np.arange(order.size)
+    chunk_size = max(1, int(chunk_size))
+    max_span = max(chunk_size, int(chunk_size) * max(1, int(max_span_factor)))
+
+    groups: list[np.ndarray] = []
+    start = 0
+    while start < unique_indices.size:
+        stop = min(unique_indices.size, start + chunk_size)
+        while stop > start + 1 and int(unique_indices[stop - 1] - unique_indices[start] + 1) > max_span:
+            stop = start + max(1, (stop - start) // 2)
+        groups.append(unique_indices[start:stop])
+        start = stop
+
+    output: dict[str, np.ndarray] = {}
+    for name, path in dataset_paths.items():
+        if path not in handle:
+            raise KeyError(f"Missing required dataset {path}")
+        dataset = handle[path]
+        chunks = []
+        for group in groups:
+            first = int(group[0])
+            last = int(group[-1])
+            span = last - first + 1
+            # Reading one contiguous slice and gathering in memory is much
+            # faster than h5py fancy indexing for large sparse-but-sorted
+            # prediction subsets. The span is bounded above by max_span.
+            block = dataset[first : last + 1]
+            chunks.append(block[group - first] if span != group.size else block)
+        unique_values = np.concatenate(chunks, axis=0) if chunks else dataset[:0]
+        sorted_values = unique_values[inverse_sorted]
+        output[name] = sorted_values[restore]
+    return output
 
 
 def _natural_part_key(path: Path) -> tuple:
@@ -55,19 +152,23 @@ def _part_files(parts_dir: Path) -> list[Path]:
 
 
 def _manifest_n_events(parts_dir: Path) -> int | None:
-    manifest_path = parts_dir / "manifest.json"
-    if not manifest_path.exists():
-        return None
-    try:
-        with manifest_path.open("r", encoding="utf-8") as handle:
-            manifest = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return None
-    n_events = manifest.get("n_events")
-    try:
-        return int(n_events) if n_events is not None else None
-    except (TypeError, ValueError):
-        return None
+    for filename in ("manifest.json", "prediction_manifest.json"):
+        manifest_path = parts_dir / filename
+        if not manifest_path.exists():
+            continue
+        try:
+            with manifest_path.open("r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        for key in ("n_events", "n_prediction_rows"):
+            value = manifest.get(key)
+            try:
+                if value is not None:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
+    return None
 
 
 def _load_pickle_parts(parts_dir: Path, max_events: int | None = None) -> pd.DataFrame:

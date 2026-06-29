@@ -1,12 +1,6 @@
 from types import ModuleType
 from importlib import import_module
 
-import HyPER.data
-import HyPER.models
-import HyPER.utils
-import HyPER.evaluation
-import HyPER.topology
-
 # python/util/lazy_loader.py
 class LazyLoader(ModuleType):
     def __init__(self, local_name, parent_module_globals, name):

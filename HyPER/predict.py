@@ -2,9 +2,13 @@ import json
 import os
 import shutil
 import resource
+import socket
+import subprocess
 import hydra
 import torch
 import warnings
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 import lightning.pytorch as pl
@@ -56,6 +60,27 @@ def _as_bool(value):
     return bool(value)
 
 
+def _normalise_split_name(value):
+    if value is None:
+        return None
+    name = str(value).strip().lower()
+    if name in {"", "none", "null", "external"}:
+        return None
+    if name in {"validation", "valid"}:
+        return "val"
+    if name not in {"train", "val", "test"}:
+        raise ValueError("predicting.split / dataset.split.predict_split must be one of train, val, test, external, null.")
+    return name
+
+
+def _as_plain_container(value, default=None):
+    if value is None:
+        return {} if default is None else default
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=True)
+    return value
+
+
 def _graph_config_from_cfg(cfg: DictConfig):
     if OmegaConf.select(cfg, 'input', default=None) is None and OmegaConf.select(cfg, 'target', default=None) is None:
         return None
@@ -97,7 +122,7 @@ class ChunkedPickleWriter:
     This avoids creating one huge final pickle in memory.
     """
 
-    def __init__(self, output_path: str, overwrite: bool = True):
+    def __init__(self, output_path: str, overwrite: bool = True, metadata: dict | None = None):
         self.output_path = output_path
         if str(output_path).endswith(".pkl.parts"):
             self.parts_dir = output_path
@@ -107,6 +132,7 @@ class ChunkedPickleWriter:
         self.part_files = []
         self.n_parts = 0
         self.n_events = 0
+        self.metadata = dict(metadata or {})
 
         if os.path.exists(self.parts_dir):
             if not overwrite:
@@ -141,6 +167,7 @@ class ChunkedPickleWriter:
             "n_parts": self.n_parts,
             "n_events": self.n_events,
         }
+        manifest.update(self.metadata)
 
         manifest_path = os.path.join(self.parts_dir, "manifest.json")
         with open(manifest_path, "w") as f:
@@ -154,6 +181,104 @@ class ChunkedPickleWriter:
         print(f"Number of events:  {self.n_events}")
         print(f"Manifest:          {manifest_path}")
         print("================================")
+        return manifest
+
+
+def _git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def _prediction_metadata(
+    cfg: DictConfig,
+    ckpt_file: str,
+    predict_output: str,
+    output_mode: str,
+    topology_name: str | None,
+    chunk_size_events,
+    n_events=None,
+    datamodule=None,
+    predict_split: str | None = None,
+    max_events=None,
+) -> dict:
+    dataset_root = str(_select(cfg, "dataset.root", "dataset", ""))
+    train_set = str(_select(cfg, "dataset.train_set", "train_set", ""))
+    predict_set = str(_select(cfg, "dataset.predict_set", "predict_set", ""))
+    source_h5 = None
+    if datamodule is not None and getattr(datamodule, "split_metadata", None):
+        source_h5 = datamodule.split_metadata.get("source_h5_path")
+    if source_h5 is None and dataset_root and predict_set:
+        source_h5 = str(Path(dataset_root) / "raw" / f"{predict_set}.h5")
+    return {
+        "config_name": str(OmegaConf.select(cfg, "hydra.job.config_name", default="unknown")),
+        "model_dir": str(_select(cfg, "predicting.model_directory", "predict_model", "")),
+        "checkpoint": str(ckpt_file),
+        "source_h5": source_h5,
+        "dataset_root": dataset_root,
+        "train_set": train_set,
+        "predict_set": predict_set,
+        "predict_split": None if predict_split is None else str(predict_split),
+        "predicting.split": None if predict_split is None else str(predict_split),
+        "dataset.split.predict_split": str(_select(cfg, "dataset.split.predict_split", default="")),
+        "topology": None if topology_name is None else str(topology_name),
+        "output_mode": str(output_mode),
+        "prediction_output_mode": str(output_mode),
+        "prediction_output": str(predict_output),
+        "predicting.max_events": None if max_events is None else max_events,
+        "dataset.max_n_events": _select(cfg, "dataset.max_n_events", "max_n_events", None),
+        "split_cache_path": None if datamodule is None else getattr(datamodule, "split_cache_path", None),
+        "n_events": None if n_events is None else int(n_events),
+        "n_prediction_rows": None if n_events is None else int(n_events),
+        "has_HYPER_SOURCE_INDEX": None,
+        "min_HYPER_SOURCE_INDEX": None,
+        "max_HYPER_SOURCE_INDEX": None,
+        "chunk_size_events": None if chunk_size_events is None else int(chunk_size_events),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "git_commit": _git_commit(),
+        "hostname": socket.gethostname(),
+    }
+
+
+def _write_prediction_manifest(predict_output: str, metadata: dict, n_events: int | None = None) -> None:
+    manifest = dict(metadata)
+    if n_events is not None:
+        manifest["n_events"] = int(n_events)
+        manifest["n_prediction_rows"] = int(n_events)
+    output_path = os.path.abspath(str(predict_output))
+    if output_path.endswith(".pkl.parts"):
+        manifest_path = os.path.join(output_path, "prediction_manifest.json")
+    elif output_path.endswith(".parts") and os.path.isdir(output_path):
+        manifest_path = os.path.join(output_path, "prediction_manifest.json")
+    else:
+        manifest_path = os.path.join(os.path.dirname(output_path) or ".", "prediction_manifest.json")
+    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    print(f"Wrote prediction manifest: {manifest_path}")
+
+
+def _update_source_index_metadata(metadata: dict, frame: pd.DataFrame) -> None:
+    if "HYPER_SOURCE_INDEX" not in frame.columns or len(frame) == 0:
+        if metadata.get("has_HYPER_SOURCE_INDEX") is None:
+            metadata["has_HYPER_SOURCE_INDEX"] = False
+        return
+    values = pd.to_numeric(frame["HYPER_SOURCE_INDEX"], errors="coerce")
+    metadata["has_HYPER_SOURCE_INDEX"] = True
+    if values.notna().any():
+        current_min = int(values.min())
+        current_max = int(values.max())
+        old_min = metadata.get("min_HYPER_SOURCE_INDEX")
+        old_max = metadata.get("max_HYPER_SOURCE_INDEX")
+        metadata["min_HYPER_SOURCE_INDEX"] = current_min if old_min is None else min(int(old_min), current_min)
+        metadata["max_HYPER_SOURCE_INDEX"] = current_max if old_max is None else max(int(old_max), current_max)
 
 
 def _memory_rss_mb() -> float:
@@ -191,10 +316,12 @@ def _build_raw_chunk_from_batches(
     hyperedge_probs = []
     graphedge_probs = []
     cls_targets = []
+    source_event_indices = []
 
     have_cls = False
     have_typed_probs = False
     have_cls_targets = False
+    have_source_event_index = False
 
     for prediction in tqdm(
         prediction_batches,
@@ -206,11 +333,16 @@ def _build_raw_chunk_from_batches(
             x_probs_out = None
             edge_probs_out = None
             cls_t_out = None
+            source_event_index_out = None
         elif len(prediction) == 7:
             x_out, edge_attr_out, N_nodes, encodings, x_class_out, x_probs_out, edge_probs_out = prediction
             cls_t_out = None
-        else:
+            source_event_index_out = None
+        elif len(prediction) == 8:
             x_out, edge_attr_out, N_nodes, encodings, x_class_out, x_probs_out, edge_probs_out, cls_t_out = prediction
+            source_event_index_out = None
+        else:
+            x_out, edge_attr_out, N_nodes, encodings, x_class_out, x_probs_out, edge_probs_out, cls_t_out, source_event_index_out = prediction
 
         for j in range(len(x_out)):
             n_nodes = int(N_nodes[j])
@@ -244,6 +376,10 @@ def _build_raw_chunk_from_batches(
             have_cls_targets = True
             cls_targets.extend(cls_t_out.cpu().flatten().tolist())
 
+        if source_event_index_out is not None:
+            have_source_event_index = True
+            source_event_indices.extend(source_event_index_out.cpu().flatten().tolist())
+
         if x_probs_out is not None and edge_probs_out is not None:
             have_typed_probs = True
             for j in range(len(x_probs_out)):
@@ -265,6 +401,10 @@ def _build_raw_chunk_from_batches(
     if have_cls_targets:
         output_columns["HyPER_CLS_T"] = cls_targets
 
+    if have_source_event_index:
+        output_columns["HYPER_SOURCE_INDEX"] = source_event_indices
+        output_columns["source_event_index"] = source_event_indices
+
     if have_typed_probs:
         output_columns["HyPER_HE_CLASS_PROBS"] = hyperedge_probs
         output_columns["HyPER_GE_CLASS_PROBS"] = graphedge_probs
@@ -279,6 +419,10 @@ def _build_classifier_chunk(raw_chunk: pd.DataFrame) -> pd.DataFrame:
             "event-level classification head."
         )
     columns = ["HyPER_CLS_RAW"]
+    if "HYPER_SOURCE_INDEX" in raw_chunk.columns:
+        columns.insert(0, "HYPER_SOURCE_INDEX")
+    if "source_event_index" in raw_chunk.columns:
+        columns.insert(1 if "HYPER_SOURCE_INDEX" in columns else 0, "source_event_index")
     if "HyPER_CLS_T" in raw_chunk.columns:
         columns.append("HyPER_CLS_T")
     return raw_chunk.loc[:, columns].copy()
@@ -385,6 +529,7 @@ def _format_output_chunk(
     classification_enabled: bool,
     output_mode: str,
     global_event_index: int,
+    predict_split_label: str,
 ) -> pd.DataFrame:
     output_mode = str(output_mode).lower()
     if output_mode not in {"selected", "raw", "both", "classifier"}:
@@ -398,22 +543,44 @@ def _format_output_chunk(
         if topology is None:
             raise ValueError("A topology is required unless predicting.output_mode=classifier.")
         selected = topology(raw_chunk, classification=classification_enabled)
+        if "HYPER_SOURCE_INDEX" in raw_chunk.columns and "HYPER_SOURCE_INDEX" not in selected.columns:
+            selected.insert(0, "HYPER_SOURCE_INDEX", raw_chunk["HYPER_SOURCE_INDEX"].to_numpy())
+        if "source_event_index" in raw_chunk.columns and "source_event_index" not in selected.columns:
+            insert_at = 1 if "HYPER_SOURCE_INDEX" in selected.columns else 0
+            selected.insert(insert_at, "source_event_index", raw_chunk["source_event_index"].to_numpy())
+        if classification_enabled and "HyPER_CLS_T" in raw_chunk.columns and "HyPER_CLS_T" not in selected.columns:
+            selected["HyPER_CLS_T"] = raw_chunk["HyPER_CLS_T"].to_numpy()
         if output_mode == "selected":
             output = selected
         else:
+            raw_extra = raw_chunk.drop(columns=[c for c in raw_chunk.columns if c in selected.columns])
             output = pd.concat(
                 [
                     selected.reset_index(drop=True),
-                    raw_chunk.reset_index(drop=True),
+                    raw_extra.reset_index(drop=True),
                 ],
                 axis=1,
             )
 
-    output.insert(
-        0,
-        "event_index",
-        range(global_event_index, global_event_index + len(output)),
-    )
+    if "event_index" in output.columns:
+        output = output.drop(columns=["event_index"])
+    if "HYPER_PREDICT_ORDER" in output.columns:
+        output = output.drop(columns=["HYPER_PREDICT_ORDER"])
+    if "HYPER_PREDICT_SPLIT" in output.columns:
+        output = output.drop(columns=["HYPER_PREDICT_SPLIT"])
+    output.insert(0, "event_index", range(global_event_index, global_event_index + len(output)))
+    output.insert(1, "HYPER_PREDICT_ORDER", range(global_event_index, global_event_index + len(output)))
+    output.insert(2, "HYPER_PREDICT_SPLIT", str(predict_split_label))
+    if "HYPER_SOURCE_INDEX" not in output.columns:
+        if "source_event_index" not in output.columns:
+            raise RuntimeError(
+                "Prediction output is missing source-event metadata. Refusing to "
+                "write output without HYPER_SOURCE_INDEX; split/subset plots would "
+                "not be self-aligning."
+            )
+        output.insert(3, "HYPER_SOURCE_INDEX", output["source_event_index"].astype("int64").to_numpy())
+    if "source_event_index" not in output.columns:
+        output.insert(4, "source_event_index", output["HYPER_SOURCE_INDEX"].astype("int64").to_numpy())
     return output
 
 
@@ -430,7 +597,8 @@ def _stream_prediction_chunks(
     memory_log_every_batches: int,
     max_events: int | None = None,
 ):
-    datamodule.setup("predict")
+    if getattr(datamodule, "predict_data", None) is None:
+        datamodule.setup("predict")
     loader = datamodule.predict_dataloader()
     model.to(device)
     model.eval()
@@ -440,6 +608,7 @@ def _stream_prediction_chunks(
     processed_batches = 0
     processed_events = 0
     global_event_index = 0
+    predict_split_label = str(getattr(datamodule, "resolved_predict_split", None) or "all")
 
     def flush_pending():
         nonlocal pending_batches, pending_events, global_event_index
@@ -461,6 +630,7 @@ def _stream_prediction_chunks(
             classification_enabled=classification_enabled,
             output_mode=output_mode,
             global_event_index=global_event_index,
+            predict_split_label=predict_split_label,
         )
         global_event_index += len(output_chunk)
         pending_batches = []
@@ -496,7 +666,7 @@ def _stream_prediction_chunks(
                         x_probs_out[:keep] if x_probs_out is not None else None,
                         edge_probs_out[:keep] if edge_probs_out is not None else None,
                     )
-                else:
+                elif len(prediction) == 8:
                     x_out, edge_attr_out, N_nodes, encodings, x_class_out, x_probs_out, edge_probs_out, cls_t_out = prediction
                     prediction = (
                         x_out[:keep],
@@ -507,6 +677,19 @@ def _stream_prediction_chunks(
                         x_probs_out[:keep] if x_probs_out is not None else None,
                         edge_probs_out[:keep] if edge_probs_out is not None else None,
                         cls_t_out[:keep] if cls_t_out is not None else None,
+                    )
+                else:
+                    x_out, edge_attr_out, N_nodes, encodings, x_class_out, x_probs_out, edge_probs_out, cls_t_out, source_event_index_out = prediction
+                    prediction = (
+                        x_out[:keep],
+                        edge_attr_out[:keep],
+                        N_nodes[:keep],
+                        encodings[:keep],
+                        x_class_out[:keep] if x_class_out is not None else None,
+                        x_probs_out[:keep] if x_probs_out is not None else None,
+                        edge_probs_out[:keep] if edge_probs_out is not None else None,
+                        cls_t_out[:keep] if cls_t_out is not None else None,
+                        source_event_index_out[:keep] if source_event_index_out is not None else None,
                     )
             pending_batches.append(prediction)
             n_events = _prediction_batch_events(prediction)
@@ -549,6 +732,9 @@ def Predict(cfg: DictConfig) -> None:
     )
 
     batch_size = _select(cfg, 'predicting.batch_size', 'batch_size', 128)
+    predict_split = _normalise_split_name(
+        _select(cfg, "predicting.split", "dataset.split.predict_split", None)
+    )
 
     # Keep old default behaviour unless explicitly overridden.
     pin_memory = _select(cfg, "dataset.pin_memory", default=None)
@@ -562,10 +748,11 @@ def Predict(cfg: DictConfig) -> None:
 
     datamodule = HyPERDataModule(
         root=_select(cfg, 'dataset.root', 'dataset'),
-        train_set=None,
+        train_set=_select(cfg, 'dataset.train_set', 'train_set', None) if predict_split is not None else None,
         val_set=None,
         predict_set=_select(cfg, 'dataset.predict_set', 'predict_set'),
         batch_size=batch_size,
+        max_n_events=_select(cfg, 'dataset.max_n_events', 'max_n_events', -1),
         percent_valid_samples=1 - float(_select(cfg, 'dataset.train_val_split', 'train_val_split', 0.95)),
         pin_memory=pin_memory,
         drop_last=False,
@@ -573,6 +760,8 @@ def Predict(cfg: DictConfig) -> None:
         force_reload=_select(cfg, 'dataset.force_reload', 'datamodule.force_reload', False),
         use_ondisk=_select(cfg, 'dataset.use_ondisk', 'datamodule.use_ondisk', True),
         graph_config=_graph_config_from_cfg(cfg),
+        split_config=_as_plain_container(_select(cfg, 'dataset.split', default={})),
+        predict_split=predict_split,
     )
 
     map_location = torch.device('cuda') if str(device).lower() == "gpu" else torch.device('cpu')
@@ -677,6 +866,18 @@ def Predict(cfg: DictConfig) -> None:
     print(f"Max events:              {max_events}")
     print(f"Output:                  {predict_output}")
     print("================================")
+    datamodule.setup("predict")
+    prediction_metadata = _prediction_metadata(
+        cfg=cfg,
+        ckpt_file=ckpt_file,
+        predict_output=predict_output,
+        output_mode=output_mode,
+        topology_name=topology_name,
+        chunk_size_events=chunk_size if chunking_enabled else None,
+        datamodule=datamodule,
+        predict_split=predict_split,
+        max_events=max_events,
+    )
 
     torch_device = _resolve_torch_device(device, _select(cfg, 'trainer.devices', 'num_devices', 1))
     prediction_chunks = _stream_prediction_chunks(
@@ -694,29 +895,38 @@ def Predict(cfg: DictConfig) -> None:
     )
 
     if output_str.endswith(".pkl.parts"):
-        writer = ChunkedPickleWriter(predict_output, overwrite=overwrite)
+        writer = ChunkedPickleWriter(predict_output, overwrite=overwrite, metadata=prediction_metadata)
 
         for results_chunk in prediction_chunks:
+            _update_source_index_metadata(writer.metadata, results_chunk)
             writer.write(results_chunk)
             print(f"[predict] wrote_part rows={len(results_chunk)} total_rows={writer.n_events}", flush=True)
             del results_chunk
 
-        writer.close()
+        manifest = writer.close()
+        _write_prediction_manifest(predict_output, manifest, n_events=writer.n_events)
 
     elif output_str.endswith(".pkl"):
         if chunking_enabled:
-            writer = ChunkedPickleWriter(predict_output, overwrite=overwrite)
+            warnings.warn(
+                "Chunked `.pkl` output writes a `.parts` directory. Use an explicit "
+                "`.pkl.parts` output path for production so event_index alignment is obvious.",
+                UserWarning,
+            )
+            writer = ChunkedPickleWriter(predict_output, overwrite=overwrite, metadata=prediction_metadata)
             for results_chunk in prediction_chunks:
+                _update_source_index_metadata(writer.metadata, results_chunk)
                 writer.write(results_chunk)
                 print(f"[predict] wrote_part rows={len(results_chunk)} total_rows={writer.n_events}", flush=True)
                 del results_chunk
-            writer.close()
+            manifest = writer.close()
+            _write_prediction_manifest(writer.parts_dir, manifest, n_events=writer.n_events)
         else:
             chunks = list(prediction_chunks)
             results = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
-            if "event_index" in results.columns:
-                results = results.drop(columns=["event_index"])
+            _update_source_index_metadata(prediction_metadata, results)
             results.to_pickle(predict_output)
+            _write_prediction_manifest(predict_output, prediction_metadata, n_events=len(results))
             print(f"Wrote {predict_output} with {len(results)} events")
 
     elif output_str.endswith(".h5"):
@@ -729,9 +939,9 @@ def Predict(cfg: DictConfig) -> None:
 
         chunks = list(prediction_chunks)
         results = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
-        if "event_index" in results.columns:
-            results = results.drop(columns=["event_index"])
+        _update_source_index_metadata(prediction_metadata, results)
         _write_h5_single_chunk_or_warn(results, predict_output)
+        _write_prediction_manifest(predict_output, prediction_metadata, n_events=len(results))
 
     else:
         raise ValueError("You must provide a file extension: `.h5`, `.pkl`, or `.pkl.parts`.")

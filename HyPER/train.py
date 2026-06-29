@@ -19,6 +19,7 @@ from lightning.pytorch.callbacks import (
 
 from HyPER.data import HyPERDataModule
 from HyPER.models import HyPERModel
+from HyPER.utils.timing import TrainingTimingCallback
 from omegaconf import DictConfig, OmegaConf
 from packaging import version
 import os
@@ -80,6 +81,14 @@ def _as_list(value):
     if OmegaConf.is_config(value):
         return [str(item) for item in OmegaConf.to_container(value, resolve=True)]
     return [str(value)]
+
+
+def _as_plain_container(value, default=None):
+    if value is None:
+        return {} if default is None else default
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=True)
+    return value
 
 
 def _resolve_checkpoint_path(checkpoint_path=None, model_directory=None):
@@ -189,8 +198,21 @@ def worker_init_fn(worker_id: int) -> None:
     os.environ['PYTHONHASHSEED'] = str(42 + worker_id)
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="default")
-def Train(cfg : DictConfig) -> None:
+def _metric_to_float(value):
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach().cpu()
+        if value.numel() == 1:
+            return float(value)
+        return value.tolist()
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def run_training(cfg: DictConfig, extra_callbacks=None, logger_name="", return_metrics=True):
     r"""Perform network training using parameters defined in 
     `option_file`.
 
@@ -232,10 +254,13 @@ def Train(cfg : DictConfig) -> None:
         force_reload = force_reload,
         use_ondisk = use_ondisk,
         graph_config = graph_config,
+        split_config = _as_plain_container(_select(cfg, 'dataset.split', default={})),
+        predict_split = _select(cfg, 'predicting.split', 'dataset.split.predict_split', None),
     )
 
     trainer_cfg = cfg.get('trainer', {})
     check_val_every_n_epoch = trainer_cfg.get('check_val_every_n_epoch', 1)
+    lr_scheduler_default_frequency = check_val_every_n_epoch if check_val_every_n_epoch is not None else 1
 
     model = HyPERModel(
         node_in_channels = datamodule.node_in_channels,
@@ -261,7 +286,7 @@ def Train(cfg : DictConfig) -> None:
         lr_scheduler_factor = _select(cfg, 'lr_scheduler.factor', default=0.8),
         lr_scheduler_patience = _select(cfg, 'lr_scheduler.patience', default=10),
         lr_scheduler_min_lr = _select(cfg, 'lr_scheduler.min_lr', default=0.0),
-        lr_scheduler_frequency = _select(cfg, 'lr_scheduler.frequency', default=check_val_every_n_epoch),
+        lr_scheduler_frequency = _select(cfg, 'lr_scheduler.frequency', default=lr_scheduler_default_frequency),
         alpha = _select(cfg, 'loss.alpha', 'alpha', 0.5),
         beta = classification_loss_weight,
         reduction = _select(cfg, 'loss.reduction', 'loss_reduction', 'mean'),
@@ -273,6 +298,22 @@ def Train(cfg : DictConfig) -> None:
         reconstruction_weighting = _select(cfg, 'loss.reconstruction_weighting', default='legacy'),
         positive_weight_cap = _select(cfg, 'loss.positive_weight_cap', default=50.0),
         negative_weight_cap = _select(cfg, 'loss.negative_weight_cap', default=5.0),
+        log_reco_diagnostics = _select(cfg, 'metrics.log_reco_diagnostics', default=True),
+        log_reco_score_metrics = _select(cfg, 'metrics.log_reco_score_metrics', default=True),
+        log_validation_topk = _select(cfg, 'metrics.log_validation_topk', default=True),
+        log_classification_batch_sb = _select(cfg, 'metrics.log_classification_batch_sb', default=True),
+        classification_debug_finite_checks = _select(cfg, 'classification.debug_finite_checks', default=False),
+        classification_debug_range_checks = _select(cfg, 'classification.debug_range_checks', default=False),
+        profile_reco_sections_enabled = _select(cfg, 'profiling.reco_sections_enabled', default=False),
+        profile_reco_sections_batches = _select(cfg, 'profiling.reco_sections_batches', default=50),
+        profile_reco_sections_cuda_synchronize = _select(cfg, 'profiling.reco_sections_cuda_synchronize', default=True),
+        profile_reco_sections_log_every_n_steps = _select(cfg, 'profiling.reco_sections_log_every_n_steps', default=1),
+        validate_cached_target_classes = _select(cfg, 'loss.validate_cached_target_classes', default=False),
+        debug_finite_checks = _select(cfg, 'debug.finite_checks', default=False),
+        debug_stop_on_nonfinite = _select(cfg, 'debug.stop_on_nonfinite', default=True),
+        debug_log_tensor_ranges = _select(cfg, 'debug.log_tensor_ranges', default=False),
+        debug_log_loss_components = _select(cfg, 'debug.log_loss_components', default=False),
+        debug_log_reco_target_activity = _select(cfg, 'debug.log_reco_target_activity', default=False),
     )
 
     probe_enabled = bool(_select(cfg, 'probe.enabled', default=False))
@@ -336,27 +377,49 @@ def Train(cfg : DictConfig) -> None:
         )
 
     callbacks = [checkpoint_callback]
+    if extra_callbacks:
+        callbacks.extend(extra_callbacks)
 
     early_stopping_enabled = _select(cfg, 'early_stopping.enabled', 'trainer.enable_early_stopping', True)
+    early_stopping_monitor = _select(cfg, 'early_stopping.monitor', default='val_loss')
+    early_stopping_mode = _select(cfg, 'early_stopping.mode', default='min')
+    early_stopping_patience = _select(cfg, 'early_stopping.patience', 'trainer.patience', 30)
+    print(
+        "Configuring early stopping: "
+        f"enabled={early_stopping_enabled}, "
+        f"monitor={early_stopping_monitor}, "
+        f"mode={early_stopping_mode}, "
+        f"patience={early_stopping_patience}",
+        flush=True,
+    )
     if early_stopping_enabled:
         callbacks.append(EarlyStopping(
-            monitor=_select(cfg, 'early_stopping.monitor', default='val_loss'),
-            mode=_select(cfg, 'early_stopping.mode', default='min'),
+            monitor=early_stopping_monitor,
+            mode=early_stopping_mode,
             min_delta=_select(cfg, 'early_stopping.min_delta', default=0.00),
-            patience=_select(cfg, 'early_stopping.patience', 'trainer.patience', 30),
+            patience=early_stopping_patience,
             verbose=False,
             strict=False,
             check_on_train_epoch_end=False,
         ))
 
-    callbacks += [
-        LearningRateMonitor(),
-        RichProgressBar() if _RICH_AVAILABLE else TQDMProgressBar(),
-        RichModelSummary(max_depth=1) if _RICH_AVAILABLE else ModelSummary(max_depth=1)
-    ]
+    callbacks.append(LearningRateMonitor())
+    if _select(cfg, 'trainer.enable_progress_bar', default=True):
+        callbacks.append(RichProgressBar() if _RICH_AVAILABLE else TQDMProgressBar())
+    callbacks.append(RichModelSummary(max_depth=1) if _RICH_AVAILABLE else ModelSummary(max_depth=1))
 
     if trainer_cfg.get('enable_device_stats', False):
         callbacks.append(DeviceStatsMonitor())
+
+    profiling_enabled = bool(_select(cfg, 'profiling.enabled', default=False))
+    if profiling_enabled:
+        callbacks.append(
+            TrainingTimingCallback(
+                log_every_n_steps=int(_select(cfg, 'profiling.log_every_n_steps', default=50) or 0),
+                cuda_synchronize=bool(_select(cfg, 'profiling.cuda_synchronize', default=False)),
+                output_json=_select(cfg, 'profiling.output_json', default=None),
+            )
+        )
 
     # Extract trainer settings
     precision = trainer_cfg.get("precision", "32-true")
@@ -369,12 +432,13 @@ def Train(cfg : DictConfig) -> None:
         callbacks = callbacks,
         logger = TensorBoardLogger(
             save_dir=_select(cfg, 'paths.savedir', 'savedir', 'HyPER_logs'),
-            name="",
+            name=logger_name,
             log_graph=trainer_cfg.get('log_graph', False),
         ),
         log_every_n_steps = trainer_cfg.get('log_every_n_steps', 50),
         num_sanity_val_steps = trainer_cfg.get('num_sanity_val_steps', 0),
         check_val_every_n_epoch = check_val_every_n_epoch,
+        enable_progress_bar = bool(_select(cfg, 'trainer.enable_progress_bar', default=True)),
     )
     
     # Add optional trainer controls
@@ -387,6 +451,10 @@ def Train(cfg : DictConfig) -> None:
         trainer_kwargs['limit_train_batches'] = trainer_cfg['limit_train_batches']
     if trainer_cfg.get('val_check_interval', None) is not None:
         trainer_kwargs['val_check_interval'] = trainer_cfg['val_check_interval']
+    if trainer_cfg.get('max_steps', None) is not None:
+        trainer_kwargs['max_steps'] = trainer_cfg['max_steps']
+    if trainer_cfg.get('max_time', None) is not None:
+        trainer_kwargs['max_time'] = trainer_cfg['max_time']
     
     trainer = pl.Trainer(**trainer_kwargs)
 
@@ -437,8 +505,32 @@ def Train(cfg : DictConfig) -> None:
             handle.write("\n")
         print(f"Wrote frozen-probe manifest: {manifest_path}")
 
+    if not return_metrics:
+        return None
 
-if __name__ == '__main__':
+    metrics = {
+        key: _metric_to_float(value)
+        for key, value in trainer.callback_metrics.items()
+    }
+    metrics.update(
+        {
+            "best_model_path": checkpoint_callback.best_model_path,
+            "best_model_score": _metric_to_float(checkpoint_callback.best_model_score),
+            "last_model_path": getattr(checkpoint_callback, "last_model_path", None),
+            "log_dir": getattr(trainer.logger, "log_dir", None),
+        }
+    )
+    if "val_loss" not in metrics or metrics["val_loss"] is None:
+        raise RuntimeError("Training completed but `val_loss` was not found in trainer.callback_metrics.")
+    return metrics
+
+
+@hydra.main(version_base=None, config_path="../configs", config_name="default")
+def Train(cfg: DictConfig) -> None:
+    run_training(cfg, return_metrics=False)
+
+
+def setup_torch_runtime() -> None:
     torch.set_float32_matmul_precision('medium')
 
     # Required for loading PyG Data objects with PyTorch 2.6+ safe unpickling.
@@ -454,4 +546,7 @@ if __name__ == '__main__':
     tqdm.tqdm.monitor_interval = 0
     tqdm.tqdm.set_lock(multiprocessing.RLock())
 
+
+if __name__ == '__main__':
+    setup_torch_runtime()
     Train()

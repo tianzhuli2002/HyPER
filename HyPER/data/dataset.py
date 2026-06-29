@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Sequence
 from warnings import warn
 from copy import deepcopy
@@ -22,6 +23,21 @@ from .transform import TransformFeatures
 from .filter import TargetConnectivityFilter
 from .edge_features import EDGE_FEATURE_TRANSFORMS
 from .transforms import TRANSFORM_REGISTRY
+
+
+@dataclass(frozen=True)
+class FeatureOutput:
+    name: str
+    source: str
+    transform: str = "identity"
+
+
+@dataclass(frozen=True)
+class FeaturePlan:
+    raw_features: List[str]
+    resolved_features: List[str]
+    outputs: List[FeatureOutput]
+    builders: dict
 
 
 class HyPERDataset(Dataset):
@@ -69,9 +85,30 @@ class HyPERDataset(Dataset):
         self.node_input_names = list(parsed_inputs['input']['nodes'].keys())
         self.input_id = parsed_inputs['input']['nodes']
         self.input_pad_size = parsed_inputs['input']['padding']
-        self.node_feature_names = list(parsed_inputs['input']['node_features'])
+        self.node_feature_plan = self._resolve_feature_plan(
+            parsed_inputs['input'].get('node_features', []),
+            parsed_inputs['input'].get('node_feature_transforms', {}),
+            "input.node_feature_transforms",
+        )
+        self.global_feature_plan = self._resolve_feature_plan(
+            parsed_inputs['input'].get('global_features', []),
+            parsed_inputs['input'].get('global_feature_transforms', {}),
+            "input.global_feature_transforms",
+        )
+        self.reco_feature_plan = self._resolve_feature_plan(
+            parsed_inputs['input'].get('reco_features', []),
+            parsed_inputs['input'].get('reco_feature_transforms', {}),
+            "input.reco_feature_transforms",
+        )
+        self.raw_node_feature_names = list(self.node_feature_plan.raw_features)
+        self.node_feature_names = list(self.node_feature_plan.resolved_features)
+        self.raw_global_feature_names = list(self.global_feature_plan.raw_features)
+        self.global_feature_names = list(self.global_feature_plan.resolved_features)
         self._node_feature_index = {
             name: idx for idx, name in enumerate(self.node_feature_names)
+        }
+        self._node_raw_feature_index = {
+            name: idx for idx, name in enumerate(self.raw_node_feature_names)
         }
         self._graph_config_for_debug = {
             'input': deepcopy(parsed_inputs['input']),
@@ -100,10 +137,13 @@ class HyPERDataset(Dataset):
 
         # 4-vector setup. The model-facing node feature list may use periodic
         # sin/cos phi inputs, but graph construction still needs an internal phi.
+        self._use_raw_EEtaPhiPt = self._has_raw_node_features('e', 'eta', 'phi', 'pt')
         self._use_EEtaPhiPt = self._has_node_features('e', 'eta', 'phi', 'pt')
         self._use_EEtaSinCosPhiPt = self._has_node_features('e', 'eta', 'sin_phi', 'cos_phi', 'pt')
         self._use_EPxPyPz = self._has_node_features('e', 'px', 'py', 'pz')
-        if self._use_EEtaSinCosPhiPt:
+        if self._use_raw_EEtaPhiPt:
+            self._phi_source = 'phi'
+        elif self._use_EEtaSinCosPhiPt:
             self._phi_source = 'atan2(sin_phi, cos_phi)'
         elif self._use_EEtaPhiPt:
             self._phi_source = 'phi'
@@ -133,21 +173,26 @@ class HyPERDataset(Dataset):
 
         if len(node_transform_names) != len(self.node_feature_names):
             raise ValueError(
-                "`input.node_transforms` must match `input.node_features`: "
-                f"{len(node_transform_names)} transforms for {len(self.node_feature_names)} features."
+                "`input.node_transforms` must match the resolved model-facing node features. "
+                f"raw features={self.raw_node_feature_names}, "
+                f"resolved features={self.node_feature_names}, "
+                f"scalar transform list length={len(node_transform_names)}, "
+                f"expected length={len(self.node_feature_names)}."
             )
-        global_feature_names = parsed_inputs['input'].get('global_features', [])
-        if len(global_transform_names) != len(global_feature_names):
+        if len(global_transform_names) != len(self.global_feature_names):
             raise ValueError(
-                "`input.global_transforms` must match `input.global_features`: "
-                f"{len(global_transform_names)} transforms for {len(global_feature_names)} features."
+                "`input.global_transforms` must match the resolved model-facing global features. "
+                f"raw features={self.raw_global_feature_names}, "
+                f"resolved features={self.global_feature_names}, "
+                f"scalar transform list length={len(global_transform_names)}, "
+                f"expected length={len(self.global_feature_names)}."
             )
 
         self._node_transforms = self._resolve_transforms(node_transform_names, "input.node_transforms")
         self._global_transforms = self._resolve_transforms(global_transform_names, "input.global_transforms")
         self.node_in_channels = len(self.node_feature_names) + 1
         self.edge_in_channels = len(self.edge_feature_names)
-        self.global_in_channels = len(global_feature_names)
+        self.global_in_channels = len(self.global_feature_names)
 
         # Build transform pipeline
         self._transforms = TransformFeatures(
@@ -175,6 +220,7 @@ class HyPERDataset(Dataset):
 
         # Get number of events by opening/closing briefly (safe at init)
         with h5py.File(self._h5_path, 'r') as _f:
+            self._validate_h5_feature_fields(_f["INPUTS"])
             self._num_events = len(_f["INPUTS"]["GLOBAL"])
         self.file = None
 
@@ -272,10 +318,7 @@ class HyPERDataset(Dataset):
         else:
             cantor_nodes_all = None
 
-        u_all = torch.tensor(
-            rf.structured_to_unstructured(inputs["GLOBAL"][start:end]),
-            dtype=torch.float32,
-        )
+        u_all = self._build_global_model_array(inputs, start, end)
         if u_all.ndim == 3 and u_all.shape[1] == 1:
             u_all = u_all[:, 0, :]
         if u_all.ndim == 1:
@@ -353,6 +396,7 @@ class HyPERDataset(Dataset):
                 edge_attr_t=edge_attr_t,
                 hyperedge_index=hyperedge_index,
                 hyperedge_attr_t=hyperedge_attr_t,
+                **self._cached_reco_target_fields(edge_attr_t, hyperedge_attr_t),
             )
 
             if self.transform:
@@ -461,10 +505,41 @@ class HyPERDataset(Dataset):
             edge_attr_t=edge_attr_t,
             hyperedge_index=hyperedge_index,
             hyperedge_attr_t=hyperedge_attr_t,
+            **self._cached_reco_target_fields(edge_attr_t, hyperedge_attr_t),
         )
 
 
     # === Static helper methods (all fork-compatible) ===
+
+    def _cached_reco_target_fields(self, edge_attr_t: torch.Tensor, hyperedge_attr_t: torch.Tensor) -> dict:
+        """Optional future cache fields; old graph DBs are still valid without them."""
+        fields = {}
+        if self.target_encoding == "typed":
+            if edge_attr_t is not None and edge_attr_t.numel() > 0 and edge_attr_t.ndim == 2:
+                edge_class = edge_attr_t.argmax(dim=1).to(torch.long)
+                fields["edge_attr_t_class"] = edge_class
+                fields["edge_reco_active"] = (edge_class != (edge_attr_t.size(1) - 1)).any().reshape(1)
+            else:
+                fields["edge_attr_t_class"] = torch.empty((0,), dtype=torch.long)
+                fields["edge_reco_active"] = torch.zeros((1,), dtype=torch.bool)
+
+            if hyperedge_attr_t is not None and hyperedge_attr_t.numel() > 0 and hyperedge_attr_t.ndim == 2:
+                hyper_class = hyperedge_attr_t.argmax(dim=1).to(torch.long)
+                fields["hyperedge_attr_t_class"] = hyper_class
+                fields["hyperedge_reco_active"] = (hyper_class != (hyperedge_attr_t.size(1) - 1)).any().reshape(1)
+            else:
+                fields["hyperedge_attr_t_class"] = torch.empty((0,), dtype=torch.long)
+                fields["hyperedge_reco_active"] = torch.zeros((1,), dtype=torch.bool)
+        else:
+            if edge_attr_t is not None and edge_attr_t.numel() > 0:
+                fields["edge_reco_active"] = (edge_attr_t.float().flatten() > 0.5).any().reshape(1)
+            else:
+                fields["edge_reco_active"] = torch.zeros((1,), dtype=torch.bool)
+            if hyperedge_attr_t is not None and hyperedge_attr_t.numel() > 0:
+                fields["hyperedge_reco_active"] = (hyperedge_attr_t.float().flatten() > 0.5).any().reshape(1)
+            else:
+                fields["hyperedge_reco_active"] = torch.zeros((1,), dtype=torch.bool)
+        return fields
 
     @staticmethod
     def _parse_config_file(filename):
@@ -582,6 +657,111 @@ class HyPERDataset(Dataset):
     def _has_node_features(self, *names: str) -> bool:
         return all(name in self._node_feature_index for name in names)
 
+    def _has_raw_node_features(self, *names: str) -> bool:
+        return all(name in self._node_raw_feature_index for name in names)
+
+    @staticmethod
+    def _normalise_feature_builder_name(name: str, config_key: str, feature: str) -> str:
+        normalised = str(name).strip().replace("_", "").lower()
+        if normalised == "sincos":
+            return "sincos"
+        raise ValueError(
+            f"Unknown feature-builder transform `{name}` for `{feature}` in `{config_key}`. "
+            "Known feature-builder transforms are: ['sincos', 'sin_cos', 'SinCos']."
+        )
+
+    @staticmethod
+    def _sincos_output_names(feature: str) -> Tuple[str, str]:
+        if feature == "phi":
+            return "sin_phi", "cos_phi"
+        return f"{feature}_sin", f"{feature}_cos"
+
+    @classmethod
+    def _resolve_feature_plan(
+        cls,
+        raw_features: Sequence[str],
+        feature_transforms,
+        config_key: str,
+    ) -> FeaturePlan:
+        raw_features = [str(feature) for feature in (raw_features or [])]
+        if feature_transforms is None:
+            feature_transforms = {}
+        if not isinstance(feature_transforms, dict):
+            raise TypeError(f"`{config_key}` must be a mapping from raw feature name to transform name.")
+
+        builders = {
+            str(feature): cls._normalise_feature_builder_name(transform, config_key, str(feature))
+            for feature, transform in feature_transforms.items()
+        }
+        unknown = [feature for feature in builders if feature not in raw_features]
+        if unknown:
+            raise ValueError(
+                f"`{config_key}` refers to raw feature(s) not present in the configured feature list: {unknown}. "
+                f"Raw feature list: {raw_features}."
+            )
+
+        outputs: List[FeatureOutput] = []
+        resolved_features: List[str] = []
+        for feature in raw_features:
+            builder = builders.get(feature)
+            if builder is None:
+                outputs.append(FeatureOutput(name=feature, source=feature))
+                resolved_features.append(feature)
+            elif builder == "sincos":
+                sin_name, cos_name = cls._sincos_output_names(feature)
+                outputs.append(FeatureOutput(name=sin_name, source=feature, transform="sin"))
+                outputs.append(FeatureOutput(name=cos_name, source=feature, transform="cos"))
+                resolved_features.extend([sin_name, cos_name])
+            else:
+                raise AssertionError(f"Unhandled feature-builder transform: {builder}")
+
+        return FeaturePlan(
+            raw_features=raw_features,
+            resolved_features=resolved_features,
+            outputs=outputs,
+            builders=builders,
+        )
+
+    @classmethod
+    def feature_layout_from_config(cls, config: Optional[dict]) -> dict:
+        parsed = deepcopy(config or {})
+        input_cfg = parsed.get("input", {})
+        node_plan = cls._resolve_feature_plan(
+            input_cfg.get("node_features", []),
+            input_cfg.get("node_feature_transforms", {}),
+            "input.node_feature_transforms",
+        )
+        global_plan = cls._resolve_feature_plan(
+            input_cfg.get("global_features", []),
+            input_cfg.get("global_feature_transforms", {}),
+            "input.global_feature_transforms",
+        )
+        reco_plan = cls._resolve_feature_plan(
+            input_cfg.get("reco_features", []),
+            input_cfg.get("reco_feature_transforms", {}),
+            "input.reco_feature_transforms",
+        )
+        return {
+            "node": {
+                "raw_features": node_plan.raw_features,
+                "resolved_features": node_plan.resolved_features,
+                "feature_builders": node_plan.builders,
+                "scalar_transforms": list(input_cfg.get("node_transforms", []) or []),
+            },
+            "global": {
+                "raw_features": global_plan.raw_features,
+                "resolved_features": global_plan.resolved_features,
+                "feature_builders": global_plan.builders,
+                "scalar_transforms": list(input_cfg.get("global_transforms", []) or []),
+            },
+            "reco": {
+                "raw_features": reco_plan.raw_features,
+                "resolved_features": reco_plan.resolved_features,
+                "feature_builders": reco_plan.builders,
+                "scalar_transforms": list(input_cfg.get("reco_transforms", []) or []),
+            },
+        }
+
     @staticmethod
     def _resolve_transforms(names: Sequence[str], config_key: str) -> List[Callable]:
         unknown = [name for name in names if name not in TRANSFORM_REGISTRY]
@@ -591,6 +771,83 @@ class HyPERDataset(Dataset):
                 f"Known transforms are: {sorted(TRANSFORM_REGISTRY)}"
             )
         return [TRANSFORM_REGISTRY[name] for name in names]
+
+    @staticmethod
+    def _format_missing_features_error(group_name: str, missing: Sequence[str], available: Sequence[str]) -> str:
+        return (
+            f"H5 INPUTS/{group_name} is missing raw feature field(s) required by the resolved feature plan: "
+            f"{list(missing)}. Available fields: {list(available)}."
+        )
+
+    def _validate_h5_feature_fields(self, inputs: h5py._hl.group.Group) -> None:
+        for obj in self.input_id.keys():
+            available = list(inputs[obj].dtype.names or [])
+            missing = [feature for feature in self.raw_node_feature_names if feature not in available]
+            if missing:
+                raise ValueError(self._format_missing_features_error(obj, missing, available))
+
+        available_global = list(inputs["GLOBAL"].dtype.names or [])
+        missing_global = [feature for feature in self.raw_global_feature_names if feature not in available_global]
+        if missing_global:
+            raise ValueError(self._format_missing_features_error("GLOBAL", missing_global, available_global))
+
+    @staticmethod
+    def _structured_raw_feature_array(arr: np.ndarray, raw_features: Sequence[str], group_name: str) -> np.ndarray:
+        available = list(arr.dtype.names or [])
+        missing = [feature for feature in raw_features if feature not in available]
+        if missing:
+            raise ValueError(HyPERDataset._format_missing_features_error(group_name, missing, available))
+        if not raw_features:
+            return np.empty(arr.shape + (0,), dtype=np.float32)
+        return np.stack([np.asarray(arr[feature]) for feature in raw_features], axis=-1).astype(np.float32, copy=False)
+
+    @staticmethod
+    def _apply_feature_plan(raw_values: np.ndarray, plan: FeaturePlan) -> np.ndarray:
+        if len(plan.outputs) == 0:
+            return np.empty(raw_values.shape[:-1] + (0,), dtype=np.float32)
+        raw_index = {name: idx for idx, name in enumerate(plan.raw_features)}
+        columns = []
+        for output in plan.outputs:
+            source = raw_values[..., raw_index[output.source]]
+            if output.transform == "identity":
+                columns.append(source)
+            elif output.transform == "sin":
+                columns.append(np.sin(source))
+            elif output.transform == "cos":
+                columns.append(np.cos(source))
+            else:
+                raise AssertionError(f"Unhandled feature-plan output transform: {output.transform}")
+        return np.stack(columns, axis=-1).astype(np.float32, copy=False)
+
+    def _build_node_raw_and_model_arrays(
+        self,
+        input_h5: h5py._hl.group.Group,
+        start: int,
+        end: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        raw_arrays = []
+        model_arrays = []
+        for name, uid in self.input_id.items():
+            arr = input_h5[name][start:end]
+            raw_np = self._structured_raw_feature_array(arr, self.raw_node_feature_names, name)
+            model_np = self._apply_feature_plan(raw_np, self.node_feature_plan)
+            raw_t = torch.tensor(raw_np, dtype=torch.float32)
+            model_t = torch.tensor(model_np, dtype=torch.float32)
+            uids = torch.full((model_t.shape[0], model_t.shape[1], 1), uid, dtype=torch.float32)
+            raw_arrays.append(raw_t)
+            model_arrays.append(torch.cat((model_t, uids), dim=2))
+        return torch.cat(raw_arrays, dim=1), torch.cat(model_arrays, dim=1)
+
+    def _build_global_model_array(
+        self,
+        input_h5: h5py._hl.group.Group,
+        start: int,
+        end: int,
+    ) -> torch.Tensor:
+        arr = input_h5["GLOBAL"][start:end]
+        raw_np = self._structured_raw_feature_array(arr, self.raw_global_feature_names, "GLOBAL")
+        model_np = self._apply_feature_plan(raw_np, self.global_feature_plan)
+        return torch.tensor(model_np, dtype=torch.float32)
 
 
     def assign_target_ids(self) -> Tuple[List, List]:
@@ -622,26 +879,25 @@ class HyPERDataset(Dataset):
         start: int,
         end: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]:
-        object_arrays = []
-
-        for name, uid in self.input_id.items():
-            arr = input_h5[name][start:end]
-            t = torch.tensor(
-                rf.structured_to_unstructured(arr),
-                dtype=torch.float32,
-            )
-            uids = torch.full((t.shape[0], t.shape[1], 1), uid, dtype=torch.float32)
-            object_arrays.append(torch.cat((t, uids), dim=2))
-
-        combined = torch.cat(object_arrays, dim=1)
-        remove_nan_mask = ~torch.any(combined.isnan(), dim=2)
+        raw_combined, combined = self._build_node_raw_and_model_arrays(input_h5, start, end)
+        remove_nan_mask = torch.isfinite(raw_combined).all(dim=2)
         Nobjects_chunk = torch.count_nonzero(remove_nan_mask, dim=1)
         x_chunk = combined[remove_nan_mask]
+        raw_x_chunk = raw_combined[remove_nan_mask]
 
         # Compute per-node 4-vector (e, px, py, pz) from named features rather
         # than positional assumptions, so sin_phi/cos_phi can remain model inputs.
-        e_col = x_chunk[:, self._node_feature_index['e']]
-        if self._use_EEtaSinCosPhiPt:
+        if self._use_raw_EEtaPhiPt:
+            e_col = raw_x_chunk[:, self._node_raw_feature_index['e']]
+            eta = raw_x_chunk[:, self._node_raw_feature_index['eta']]
+            phi = raw_x_chunk[:, self._node_raw_feature_index['phi']]
+            pt = raw_x_chunk[:, self._node_raw_feature_index['pt']]
+            px = pt * torch.cos(phi)
+            py = pt * torch.sin(phi)
+            pz = pt * torch.sinh(eta)
+        else:
+            e_col = x_chunk[:, self._node_feature_index['e']]
+        if (not self._use_raw_EEtaPhiPt) and self._use_EEtaSinCosPhiPt:
             eta = x_chunk[:, self._node_feature_index['eta']]
             sin_phi = x_chunk[:, self._node_feature_index['sin_phi']]
             cos_phi = x_chunk[:, self._node_feature_index['cos_phi']]
@@ -649,14 +905,14 @@ class HyPERDataset(Dataset):
             px = pt * cos_phi
             py = pt * sin_phi
             pz = pt * torch.sinh(eta)
-        elif self._use_EEtaPhiPt:
+        elif (not self._use_raw_EEtaPhiPt) and self._use_EEtaPhiPt:
             eta = x_chunk[:, self._node_feature_index['eta']]
             phi = x_chunk[:, self._node_feature_index['phi']]
             pt = x_chunk[:, self._node_feature_index['pt']]
             px = pt * torch.cos(phi)
             py = pt * torch.sin(phi)
             pz = pt * torch.sinh(eta)
-        else:
+        elif not self._use_raw_EEtaPhiPt:
             px = x_chunk[:, self._node_feature_index['px']]
             py = x_chunk[:, self._node_feature_index['py']]
             pz = x_chunk[:, self._node_feature_index['pz']]
@@ -667,8 +923,7 @@ class HyPERDataset(Dataset):
         return x_chunk, Nobjects_chunk, p4, remove_nan_mask.numpy()
 
     def build_global_attributes(self, input_h5: h5py._hl.group.Group, start: int, end: int) -> torch.Tensor:
-        arr = rf.structured_to_unstructured(input_h5["GLOBAL"][start:end])
-        u_chunk = torch.tensor(arr, dtype=torch.float32)
+        u_chunk = self._build_global_model_array(input_h5, start, end)
         return u_chunk.squeeze(0)
 
 
@@ -754,7 +1009,7 @@ class HyPERDataset(Dataset):
         for obj in self.input_id.keys():
             arr = inputs[obj][start:end]
             obj_mask = np.ones(arr.shape, dtype=bool)
-            for field in arr.dtype.names:
+            for field in self.raw_node_feature_names:
                 obj_mask &= np.isfinite(arr[field])
             masks.append(obj_mask)
         return np.concatenate(masks, axis=1)

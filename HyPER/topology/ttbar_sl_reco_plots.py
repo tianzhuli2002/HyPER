@@ -59,7 +59,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from prediction_io import iter_hyper_prediction_parts, load_hyper_prediction_output  # noqa: E402
+from prediction_io import coerce_source_indices, iter_hyper_prediction_parts, load_hyper_prediction_output, read_h5_rows, source_index_column  # noqa: E402
+from joint_reco_plotting import (  # noqa: E402
+    category_masks,
+    category_summary_from_counts,
+    plot_joint_sb,
+    plot_observable_pair,
+    write_category_diagnostics,
+)
 from ttbar import ttbar_single_lep  # noqa: E402
 
 
@@ -114,6 +121,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--formats", nargs="+", default=["pdf"])
     parser.add_argument("--no-sb", action="store_true")
     parser.add_argument("--strict-length", action="store_true")
+    parser.add_argument("--alignment", choices=["auto", "row_order", "source_index"], default="auto")
+    parser.add_argument("--allow-duplicate-source-index", action="store_true")
     parser.add_argument(
         "--classification",
         action="store_true",
@@ -339,8 +348,12 @@ def binary_labels_from_h5(
     data: dict[str, np.ndarray],
     label_field: str | None,
 ) -> tuple[np.ndarray | None, str | None]:
-    candidates = (label_field,) if label_field else LABEL_CANDIDATES
+    candidates = (label_field, *LABEL_CANDIDATES) if label_field else LABEL_CANDIDATES
+    seen: set[str] = set()
     for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
         if candidate and candidate in data:
             labels = flatten_labels(data[candidate]).astype(float)
             return np.where(labels > 0.5, 1, 0).astype(int), candidate
@@ -951,17 +964,16 @@ def plot_scope_masks(evaluation: pd.DataFrame, plot_scope: str) -> dict[str, np.
 
 
 def print_plot_scope_counts(evaluation: pd.DataFrame, plot_scope: str) -> dict[str, int | str]:
-    signal = evaluation["is_signal"].to_numpy(dtype=int) == 1
-    background = evaluation["is_signal"].to_numpy(dtype=int) == 0
-    fully_matched = evaluation["fully_matched"].to_numpy(dtype=int) == 1
-    fully_matched_signal = evaluation["reco_eval_event"].to_numpy(dtype=bool)
+    masks = category_masks(evaluation)
+    signal = masks["signal_fm"] | masks["signal_nonfm"]
+    background = masks["background"]
     counts = {
         "plot_scope": plot_scope,
         "total_events": int(len(evaluation)),
         "signal_events": int(np.sum(signal)),
         "background_events": int(np.sum(background)),
-        "fully_matched_signal_events": int(np.sum(fully_matched_signal)),
-        "unmatched_signal_events": int(np.sum(signal & ~fully_matched)),
+        "fully_matched_signal_events": int(np.sum(masks["signal_fm"])),
+        "unmatched_signal_events": int(np.sum(masks["signal_nonfm"])),
     }
     print("Plot category counts:", counts)
     LOGGER.info("Plot category counts: %s", counts)
@@ -1055,6 +1067,45 @@ def plot_observables(
             plot_hist(values, name, name, output_dir, output_name, formats)
         else:
             plot_hist_by_scope(evaluation, values, name, name, output_dir, output_name, formats, plot_scope)
+
+
+def plot_standard_observable_families(
+    evaluation: pd.DataFrame,
+    output_dir: Path,
+    formats: list[str],
+) -> dict[str, dict[str, int]]:
+    rows_used: dict[str, dict[str, int]] = {}
+    for column in ("m_Whad", "m_thad", "m_tlep_visible", "m_ttbar_visible"):
+        if column in evaluation.columns:
+            rows_used[column] = plot_observable_pair(
+                evaluation,
+                column,
+                column,
+                column,
+                column,
+                4,
+                output_dir,
+                formats,
+            )
+    for column in (
+        "event_reco_score",
+        "top_had_score",
+        "top_lep_score",
+        "w_had_score",
+        "w_lep_score",
+    ):
+        if column in evaluation.columns:
+            rows_used[column] = plot_observable_pair(
+                evaluation,
+                column,
+                column,
+                column,
+                column,
+                4,
+                output_dir,
+                formats,
+            )
+    return rows_used
 
 
 def binary_roc(labels: np.ndarray, scores: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
@@ -1198,6 +1249,22 @@ def read_h5_slice(path: str | Path, start: int, stop: int) -> dict[str, np.ndarr
     return data
 
 
+def read_h5_indexed(path: str | Path, source_indices: np.ndarray, chunk_size: int) -> dict[str, np.ndarray]:
+    with h5py.File(path, "r") as handle:
+        dataset_paths = {
+            "jets": "INPUTS/JET",
+            "leptons": "INPUTS/LEPTON",
+            "met": "INPUTS/MET",
+            "jet_labels": "LABELS/JET",
+        }
+        if "INPUTS/GLOBAL" in handle:
+            dataset_paths["global_inputs"] = "INPUTS/GLOBAL"
+        for candidate in LABEL_CANDIDATES:
+            if candidate in handle:
+                dataset_paths[candidate] = candidate
+        return read_h5_rows(handle, dataset_paths, source_indices, chunk_size=chunk_size)
+
+
 def update_efficiency_counters(counters: dict[str, Counter], rows: pd.DataFrame) -> None:
     base = rows.loc[rows["reco_eval_event"] == 1]
     for bin_name in NJET_BINS:
@@ -1278,13 +1345,15 @@ def main() -> None:
     sample_rows = 0
     signal_events = 0
     background_events = 0
+    signal_fm_events = 0
+    signal_nonfm_events = 0
     fully_matched_events = 0
     reco_eval_events = 0
     n_processed = 0
     n_prediction_loaded = 0
     n_prediction_events: int | None = None
     label_source: str | None = None
-    alignment_mode = "streaming_row_order_prefix_assumed"
+    alignment_mode = None
     event_csv_written = False
     event_csv_path = output_dir / "observables.csv"
     write_event_csv = bool(args.write_event_csv and not args.skip_event_csv)
@@ -1298,46 +1367,53 @@ def main() -> None:
             continue
         if n_prediction_events is None:
             n_prediction_events = int(prediction_chunk.attrs.get("hyper_total_rows", len(prediction_chunk)))
-            if args.strict_length and n_h5_events != n_prediction_events:
+            requested_alignment = str(args.alignment)
+            if requested_alignment == "auto":
+                if n_h5_events == n_prediction_events:
+                    alignment_mode = "row_order"
+                elif source_index_column(prediction_chunk) is not None:
+                    alignment_mode = "source_index"
+                else:
+                    raise ValueError(
+                        "Length mismatch and no HYPER_SOURCE_INDEX available. Re-run prediction "
+                        "with source-index export enabled, or predict the full H5."
+                    )
+            elif requested_alignment == "row_order":
+                alignment_mode = "row_order"
+            else:
+                alignment_mode = "source_index"
+            if alignment_mode == "row_order" and n_h5_events != n_prediction_events:
                 raise ValueError(
                     f"Length mismatch: H5 has {n_h5_events} events, "
                     f"prediction has {n_prediction_events} rows."
                 )
 
-        chunk_len = min(len(prediction_chunk), n_h5_events - n_processed)
+        assert alignment_mode is not None
+        if alignment_mode == "row_order":
+            chunk_len = min(len(prediction_chunk), n_h5_events - n_processed)
+        else:
+            chunk_len = len(prediction_chunk)
         if chunk_len <= 0:
             break
         prediction_chunk = prediction_chunk.iloc[:chunk_len].reset_index(drop=True)
-        start = n_processed
-        stop = start + chunk_len
 
-        if "event_index" in prediction_chunk.columns:
-            event_index = pd.to_numeric(prediction_chunk["event_index"], errors="coerce").to_numpy(dtype=float)
-            expected = np.arange(start, stop, dtype=np.int64)
-            if len(event_index) == chunk_len and np.all(np.isfinite(event_index)):
-                event_index_int = event_index.astype(np.int64)
-                if np.array_equal(event_index_int, expected):
-                    alignment_mode = "event_index_streaming_prefix_verified"
-                elif np.array_equal(np.sort(event_index_int), expected):
-                    prediction_chunk = prediction_chunk.iloc[np.argsort(event_index_int)].reset_index(drop=True)
-                    alignment_mode = "event_index_streaming_prefix_reordered"
-                else:
-                    warning = "Prediction event_index is not the expected streaming H5 prefix; assuming row-order alignment."
-                    if args.strict_length:
-                        raise ValueError(warning)
-                    if warning not in warnings_list:
-                        warnings_list.append(warning)
-                        LOGGER.warning(warning)
-            else:
-                warning = "Prediction event_index is invalid in a streaming chunk; assuming row-order alignment."
-                if args.strict_length:
-                    raise ValueError(warning)
+        reco = normalise_predictions(prediction_chunk, classification=args.classification).reset_index(drop=True)
+        if alignment_mode == "row_order":
+            start = n_processed
+            stop = start + chunk_len
+            source_indices = np.arange(start, stop, dtype=np.int64)
+            data = read_h5_slice(args.h5, start, stop)
+        else:
+            source_indices, index_warnings = coerce_source_indices(
+                prediction_chunk,
+                n_h5_events=n_h5_events,
+                allow_duplicates=bool(args.allow_duplicate_source_index),
+            )
+            for warning in index_warnings:
                 if warning not in warnings_list:
                     warnings_list.append(warning)
                     LOGGER.warning(warning)
-
-        reco = normalise_predictions(prediction_chunk, classification=args.classification).reset_index(drop=True)
-        data = read_h5_slice(args.h5, start, stop)
+            data = read_h5_indexed(args.h5, source_indices, chunk_size=args.chunk_size)
         labels, chunk_label_source = binary_labels_from_h5(data, args.label_field)
         if label_source is None and chunk_label_source is not None:
             label_source = chunk_label_source
@@ -1361,7 +1437,7 @@ def main() -> None:
             is_signal = None if signal_labels is None else int(signal_labels[local_idx])
             chunk_rows.append(
                 evaluate_event(
-                    event_idx=start + local_idx,
+                    event_idx=int(source_indices[local_idx]),
                     row=reco.iloc[local_idx],
                     jets_event=data["jets"][local_idx],
                     leptons_event=data["leptons"][local_idx],
@@ -1377,6 +1453,9 @@ def main() -> None:
         update_pattern_counters(patterns, evaluation_chunk)
         signal_events += int(np.sum(evaluation_chunk["is_signal"] == 1))
         background_events += int(np.sum(evaluation_chunk["is_signal"] == 0))
+        chunk_masks = category_masks(evaluation_chunk)
+        signal_fm_events += int(np.sum(chunk_masks["signal_fm"]))
+        signal_nonfm_events += int(np.sum(chunk_masks["signal_nonfm"]))
         fully_matched_events += int(np.sum(evaluation_chunk["fully_matched"] == 1))
         reco_eval_events += int(np.sum(evaluation_chunk["reco_eval_event"] == 1))
         reco_mask = evaluation_chunk["reco_eval_event"] == 1
@@ -1402,7 +1481,16 @@ def main() -> None:
 
         n_processed += chunk_len
         n_prediction_loaded += chunk_len
-        LOGGER.info("Processed plotting events %d:%d", start, stop)
+        if alignment_mode == "row_order":
+            LOGGER.info("Processed plotting events %d:%d", start, stop)
+        else:
+            LOGGER.info(
+                "Processed plotting prediction rows %d:%d using source_index range %d:%d",
+                n_processed - chunk_len,
+                n_processed,
+                int(source_indices.min()) if len(source_indices) else -1,
+                int(source_indices.max()) if len(source_indices) else -1,
+            )
         if args.max_events is not None and n_processed >= int(args.max_events):
             break
 
@@ -1412,8 +1500,9 @@ def main() -> None:
         n_prediction_events = n_prediction_loaded
     if n_h5_events != n_prediction_events:
         warning = (
-            f"Length mismatch: H5 has {n_h5_events} events, prediction has "
-            f"{n_prediction_events} rows; processed {n_processed} events."
+            f"Source H5 has {n_h5_events} events; prediction has "
+            f"{n_prediction_events} rows; processed {n_processed} rows using "
+            f"{alignment_mode} alignment with chunk size {args.chunk_size}."
         )
         LOGGER.warning(warning)
         warnings_list.append(warning)
@@ -1432,25 +1521,32 @@ def main() -> None:
         "unmatched_signal_events": 0,
     }
     plot_efficiencies(eff_rows, output_dir, args.formats)
+    observable_rows_used: dict[str, dict[str, int]] = {}
     if len(evaluation_sample):
-        plot_observables(evaluation_sample, output_dir, args.formats, args.plot_scope)
+        observable_rows_used = plot_standard_observable_families(
+            evaluation_sample, output_dir, args.formats
+        )
 
-    sb_summary, sb_skip_reason = make_sb_plots(
-        evaluation=evaluation_sample,
-        labels=(
-            evaluation_sample["is_signal"].to_numpy(dtype=int)
-            if len(evaluation_sample) and "is_signal" in evaluation_sample.columns
-            else None
-        ),
-        label_source=label_source,
-        score_field=args.score_field,
-        no_sb=args.no_sb,
-        output_dir=output_dir,
-        formats=args.formats,
-    )
+    if args.no_sb:
+        sb_summary = {"available": False, "reason": "disabled by --no-sb"}
+    else:
+        sb_summary = plot_joint_sb(
+            evaluation_sample, args.score_field, output_dir, args.formats
+        )
+    sb_skip_reason = None if sb_summary.get("available") else sb_summary.get("reason")
     if sb_skip_reason:
-        LOGGER.warning(sb_skip_reason)
-        warnings_list.append(sb_skip_reason)
+        LOGGER.warning("%s", sb_skip_reason)
+        warnings_list.append(str(sb_skip_reason))
+
+    category_summary = category_summary_from_counts(
+        n_processed,
+        signal_events,
+        background_events,
+        signal_fm_events,
+        signal_nonfm_events,
+        reco_eval_events,
+    )
+    write_category_diagnostics(category_summary, output_dir, args.formats)
 
     summary = {
         "h5": str(args.h5),
@@ -1468,16 +1564,28 @@ def main() -> None:
         "event_csv": "written" if event_csv_written else "skipped",
         "max_plot_points": int(args.max_plot_points),
         "plot_scope": args.plot_scope,
+        "observable_scope": [
+            "signal_fm_with_n_jets_gte_4",
+            "signal_fm_vs_signal_nonfm_vs_background_with_n_jets_gte_4",
+        ],
+        "score_scope": sb_summary.get("score_scope", []),
         "plot_category_counts": plot_counts,
         "plot_sample_events": int(len(evaluation_sample)),
         "event_alignment": alignment_mode,
         "event_alignment_policy": (
-            "event_index is verified/reordered when it describes the H5 prefix; "
-            "otherwise row-order prefix alignment is assumed unless --strict-length raises."
+            "auto uses row_order only when prediction length equals H5 length; "
+            "otherwise HYPER_SOURCE_INDEX is required and source-index H5 rows are read."
         ),
         "label_source": label_source,
         "signal_events": signal_events,
         "background_events": background_events,
+        "n_total_rows": category_summary["n_total_rows"],
+        "n_signal": category_summary["n_signal"],
+        "n_background": category_summary["n_background"],
+        "n_signal_fm": category_summary["n_signal_fm"],
+        "n_signal_nonfm": category_summary["n_signal_nonfm"],
+        "n_reco_eval_event": category_summary["n_reco_eval_event"],
+        "category_fractions": category_summary,
         "fully_matched_events": fully_matched_events,
         "fully_matched_fraction": float(fully_matched_events / n_processed) if n_processed else None,
         "reco_eval_events": reco_eval_events,
@@ -1532,6 +1640,11 @@ def main() -> None:
             for row in eff_rows
         ],
         "observable_available_counts": {key: int(value) for key, value in observable_counts.items()},
+        "n_rows_used_per_plot_family": {
+            "score": int(sb_summary.get("n_rows_with_finite_score", 0)),
+            "observables": observable_rows_used,
+            "truth_correct_efficiency": int(reco_eval_events),
+        },
         "sb_summary": (
             {key: clean_json_value(value) for key, value in sb_summary.items()}
             if sb_summary

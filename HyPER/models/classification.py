@@ -1,7 +1,7 @@
 import torch
 import math
 
-from torch.nn import Module, Sequential as Seq, Linear, ReLU, Dropout, Sigmoid, Parameter, init
+from torch.nn import Module, Sequential as Seq, Linear, ReLU, Dropout, Parameter, init
 from torch.nn.functional import relu
 from torch_geometric.utils import scatter
 from HyPER.utils.custom_scatter import custom_scatter
@@ -62,7 +62,6 @@ class classificationModel(Module):
             ReLU(),
             Dropout(p=dropout),
             Linear(hidden_feats, n_feats_out),
-            Sigmoid(),
         )
 
         self.reset_parameters()
@@ -85,7 +84,7 @@ class classificationModel(Module):
         batch_N:  [N_nodes]                 graph ids for nodes
 
         returns:
-            [N_events, n_feats_out]
+            [N_events, n_feats_out] raw logits
         """
         
         # Prefer feat_U to define the number of events, because global features
