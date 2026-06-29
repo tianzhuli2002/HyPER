@@ -1,0 +1,28 @@
+defaults:
+  - ttH_SL_typed
+  - _self_
+
+classification:
+  enabled: true
+  output_mode: logits
+  loss_mode: bce_with_logits
+  debug_finite_checks: false
+  debug_range_checks: false
+  loss_weight: 1.0
+
+reconstruction:
+  enabled: false
+
+predicting:
+  output_mode: classifier
+
+trainer:
+  checkpoint_mode: keep_best_last
+  check_val_every_n_epoch: 1
+  limit_val_batches: 1.0
+
+early_stopping:
+  enabled: true
+  monitor: val_loss
+  mode: min
+  patience: 20

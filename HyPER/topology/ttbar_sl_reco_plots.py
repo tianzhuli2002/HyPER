@@ -61,10 +61,13 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from prediction_io import coerce_source_indices, iter_hyper_prediction_parts, load_hyper_prediction_output, read_h5_rows, source_index_column  # noqa: E402
 from joint_reco_plotting import (  # noqa: E402
+    H5_LABEL_CANDIDATES,
+    binary_labels_from_h5_data,
     category_masks,
     category_summary_from_counts,
     plot_joint_sb,
     plot_observable_pair,
+    resolve_event_labels,
     write_category_diagnostics,
 )
 from ttbar import ttbar_single_lep  # noqa: E402
@@ -78,16 +81,9 @@ TTBAR_SL_ROLE_MAP = {
     "whad_j1": 3,
     "whad_j2": 4,
 }
+TTBAR_SL_ROLE_VALUES = set(TTBAR_SL_ROLE_MAP.values())
 
 NJET_BINS = ("overall", "4", "5", "6", "7", "8", "9+")
-
-LABEL_CANDIDATES = (
-    "LABELS/GLOBAL",
-    "LABELS/SIGNAL",
-    "LABELS/Y",
-    "LABELS/CLASS",
-    "LABELS/label",
-)
 
 SELECTED_COLUMNS = {
     "HyPER_best_top1",
@@ -331,33 +327,11 @@ def read_h5_prefix(path: str | Path, n_events: int) -> dict[str, np.ndarray]:
         if "INPUTS/GLOBAL" in handle:
             data["global_inputs"] = handle["INPUTS/GLOBAL"][:n_events]
 
-        for candidate in LABEL_CANDIDATES:
+        for candidate in H5_LABEL_CANDIDATES:
             if candidate in handle:
                 data[candidate] = handle[candidate][:n_events]
 
     return data
-
-
-def flatten_labels(values: np.ndarray) -> np.ndarray:
-    if getattr(values.dtype, "names", None):
-        values = values[values.dtype.names[0]]
-    return np.asarray(values).reshape(-1)
-
-
-def binary_labels_from_h5(
-    data: dict[str, np.ndarray],
-    label_field: str | None,
-) -> tuple[np.ndarray | None, str | None]:
-    candidates = (label_field, *LABEL_CANDIDATES) if label_field else LABEL_CANDIDATES
-    seen: set[str] = set()
-    for candidate in candidates:
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        if candidate and candidate in data:
-            labels = flatten_labels(data[candidate]).astype(float)
-            return np.where(labels > 0.5, 1, 0).astype(int), candidate
-    return None, None
 
 
 def jet_multiplicity(global_inputs: np.ndarray | None, jet_rows: np.ndarray) -> int:
@@ -467,7 +441,14 @@ def evaluate_event(
         for value in labels
         if np.isfinite(value) and int(value) > 0
     }
-    fully_matched = {1, 2, 3, 4}.issubset(finite_truth_labels)
+    n_truth_roles_matched = len(finite_truth_labels & TTBAR_SL_ROLE_VALUES)
+    fully_matched = TTBAR_SL_ROLE_VALUES.issubset(finite_truth_labels)
+    if fully_matched:
+        truth_match_category = "fully_matched"
+    elif n_truth_roles_matched > 0:
+        truth_match_category = "partially_matched"
+    else:
+        truth_match_category = "unmatched"
 
     # If no class label exists, fall back to fully_matched as the signal-like
     # reconstruction mask. If labels exist, use them explicitly.
@@ -614,6 +595,8 @@ def evaluate_event(
         "is_signal": int(is_signal_eval),
         "signal_label_source": signal_label_source,
         "fully_matched": int(fully_matched),
+        "n_truth_roles_matched": int(n_truth_roles_matched),
+        "truth_match_category": truth_match_category,
         "reco_eval_event": int(reco_eval_event),
         "reco_valid": int(reco_valid),
         "thad_valid": int(thad_valid),
@@ -1243,7 +1226,7 @@ def read_h5_slice(path: str | Path, start: int, stop: int) -> dict[str, np.ndarr
         }
         if "INPUTS/GLOBAL" in handle:
             data["global_inputs"] = handle["INPUTS/GLOBAL"][start:stop]
-        for candidate in LABEL_CANDIDATES:
+        for candidate in H5_LABEL_CANDIDATES:
             if candidate in handle:
                 data[candidate] = handle[candidate][start:stop]
     return data
@@ -1259,7 +1242,7 @@ def read_h5_indexed(path: str | Path, source_indices: np.ndarray, chunk_size: in
         }
         if "INPUTS/GLOBAL" in handle:
             dataset_paths["global_inputs"] = "INPUTS/GLOBAL"
-        for candidate in LABEL_CANDIDATES:
+        for candidate in H5_LABEL_CANDIDATES:
             if candidate in handle:
                 dataset_paths[candidate] = candidate
         return read_h5_rows(handle, dataset_paths, source_indices, chunk_size=chunk_size)
@@ -1347,6 +1330,8 @@ def main() -> None:
     background_events = 0
     signal_fm_events = 0
     signal_nonfm_events = 0
+    signal_partial_events = 0
+    signal_unmatched_events = 0
     fully_matched_events = 0
     reco_eval_events = 0
     n_processed = 0
@@ -1414,7 +1399,15 @@ def main() -> None:
                     warnings_list.append(warning)
                     LOGGER.warning(warning)
             data = read_h5_indexed(args.h5, source_indices, chunk_size=args.chunk_size)
-        labels, chunk_label_source = binary_labels_from_h5(data, args.label_field)
+        h5_labels, chunk_h5_label_source = binary_labels_from_h5_data(data, args.label_field)
+        labels, chunk_label_source = resolve_event_labels(
+            prediction_chunk,
+            h5_labels,
+            chunk_h5_label_source,
+            args.label_field,
+            warnings_list,
+            context=f"prediction rows {n_processed}:{n_processed + chunk_len}",
+        )
         if label_source is None and chunk_label_source is not None:
             label_source = chunk_label_source
         signal_labels = labels[:chunk_len] if labels is not None else None
@@ -1456,6 +1449,8 @@ def main() -> None:
         chunk_masks = category_masks(evaluation_chunk)
         signal_fm_events += int(np.sum(chunk_masks["signal_fm"]))
         signal_nonfm_events += int(np.sum(chunk_masks["signal_nonfm"]))
+        signal_partial_events += int(np.sum(chunk_masks["signal_partial"]))
+        signal_unmatched_events += int(np.sum(chunk_masks["signal_unmatched"]))
         fully_matched_events += int(np.sum(evaluation_chunk["fully_matched"] == 1))
         reco_eval_events += int(np.sum(evaluation_chunk["reco_eval_event"] == 1))
         reco_mask = evaluation_chunk["reco_eval_event"] == 1
@@ -1545,6 +1540,10 @@ def main() -> None:
         signal_fm_events,
         signal_nonfm_events,
         reco_eval_events,
+        signal_partial_events,
+        signal_unmatched_events,
+        label_source or "fallback_fully_matched",
+        label_source is None,
     )
     write_category_diagnostics(category_summary, output_dir, args.formats)
 
@@ -1576,7 +1575,8 @@ def main() -> None:
             "auto uses row_order only when prediction length equals H5 length; "
             "otherwise HYPER_SOURCE_INDEX is required and source-index H5 rows are read."
         ),
-        "label_source": label_source,
+        "label_source": label_source or "fallback_fully_matched",
+        "fallback_fully_matched_used": label_source is None,
         "signal_events": signal_events,
         "background_events": background_events,
         "n_total_rows": category_summary["n_total_rows"],
@@ -1584,6 +1584,11 @@ def main() -> None:
         "n_background": category_summary["n_background"],
         "n_signal_fm": category_summary["n_signal_fm"],
         "n_signal_nonfm": category_summary["n_signal_nonfm"],
+        "n_signal_partial": category_summary["n_signal_partial"],
+        "n_signal_unmatched": category_summary["n_signal_unmatched"],
+        "n_non_fully_matched_signal": category_summary["n_non_fully_matched_signal"],
+        "n_partially_matched_signal": category_summary["n_partially_matched_signal"],
+        "n_unmatched_signal": category_summary["n_unmatched_signal"],
         "n_reco_eval_event": category_summary["n_reco_eval_event"],
         "category_fractions": category_summary,
         "fully_matched_events": fully_matched_events,

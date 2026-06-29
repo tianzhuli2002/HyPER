@@ -1,0 +1,224 @@
+# Unified HyPER experiment config for the active ttbar single-lepton graph setup.
+# This embeds the graph-construction input/target sections that old workflows
+# kept in <dataset.root>/config.yaml, while keeping old external-config loading
+# available for legacy configs.
+
+general:
+  seed: 42
+
+dataset:
+  root: /mnt/iusers01/fatpou01/phy01/w00238tl/scratch/HyPER_24_2/HyPER_ttH_SL_typed/
+  train_set: hyper_converted_ttH_ttbb_train_10M_23May
+  val_set: ''
+  predict_set: hyper_converted_ttH_ttbb_train_10M_23May
+  batch_size: 4096
+  max_n_events: -1
+  drop_last: true
+  num_workers: 16
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  force_reload: false
+  use_ondisk: true
+  split:
+    enabled: true
+    train_fraction: 0.8
+    val_fraction: 0.1
+    test_fraction: 0.1
+    stratify: true
+    seed: 42
+    cache_path: null
+    predict_split: test
+    require_existing: false
+    allow_unstratified: false
+    allow_zero_test: false
+
+model:
+  message_feats: 64
+  contraction_feats: 128
+  dropout: 0.0089603395458858
+  message_passing_recurrent: 3
+  hyperedge_order: 3
+
+reconstruction:
+  enabled: true
+
+classification:
+  enabled: false
+  output_mode: logits
+  loss_mode: bce_with_logits
+  debug_finite_checks: false
+  debug_range_checks: false
+  # input_mode: edge_hyperedge
+  # User-facing coefficient of the S/B classification loss in the total loss.
+  # Legacy configs may still use loss.beta/beta for this same coefficient.
+  loss_weight: 0.02
+
+loss:
+  criterion_edge: BCE
+  criterion_hyperedge: BCE
+  alpha: 0.5
+  reduction: mean
+  reconstruction_weighting: batch_class_weight
+  #reconstruction_weighting: event_balanced_bce
+  positive_weight_cap: 50.0
+  negative_weight_cap: 5.0
+  validate_cached_target_classes: false
+
+optimizer:
+  # AdamW with a moderately higher LR is used to reduce very long 300+ epoch training runs.
+  name: adamw
+  learning_rate:  0.0007804629705858
+  weight_decay: 0.0007553503645583
+
+lr_scheduler:
+  enabled: true
+  method: reduce_on_plateau
+  monitor: val_loss
+  mode: min
+  factor: 0.7
+  patience: 5
+  min_lr: 1.0e-6
+  frequency: 2
+
+trainer:
+  accelerator: gpu
+  devices: 1
+  epochs: 500
+  patience: 20
+  precision: bf16-mixed
+  gradient_clip_val: 2.0
+  log_every_n_steps: 50
+  log_graph: false
+  enable_device_stats: false
+  enable_early_stopping: true
+  validation_mode: fast
+  checkpoint_mode: keep_best_last
+  check_val_every_n_epoch: 2
+  limit_train_batches: null
+  limit_val_batches: 0.1
+  val_check_interval: null
+  num_sanity_val_steps: 0
+  enable_progress_bar: true
+
+metrics:
+  log_reco_diagnostics: true
+  log_reco_score_metrics: true
+  log_validation_topk: true
+  log_classification_batch_sb: true
+
+profiling:
+  enabled: false
+  log_every_n_steps: 50
+  cuda_synchronize: false
+  output_json: null
+  reco_sections_enabled: false
+  reco_sections_batches: 50
+  reco_sections_cuda_synchronize: true
+  reco_sections_log_every_n_steps: 1
+
+debug:
+  finite_checks: false
+  stop_on_nonfinite: true
+  log_tensor_ranges: false
+  log_loss_components: false
+  log_reco_target_activity: false
+
+performance:
+  benchmark_dataloader: false
+  benchmark_model_step: false
+
+paths:
+  savedir: HyPER_logs
+  checkpoint: null
+
+training:
+  resume_from_checkpoint: null
+
+early_stopping:
+  enabled: true
+  monitor: val_loss
+  mode: min
+  patience: 20
+
+predicting:
+  accelerator: cpu
+  split: test
+  model_directory: null
+  save_as: null
+  topology: ttH
+
+  # Prediction-specific safety settings.
+  batch_size: 1024
+  chunk_size_events: 100000
+  max_events: null
+  output_mode: selected
+  memory_log_every_batches: 500
+  overwrite: false
+  strategy: higgs_first
+
+onnx_export:
+  accelerator: ${predicting.accelerator}
+  model_directory: null
+  save_as: HyPER.onnx
+
+input:
+  padding: 10
+  nodes:
+    JET: 1
+    LEPTON: 2
+    MET: 3
+  node_features:
+    - e
+    - eta
+    - sin_phi
+    - cos_phi
+    - pt
+    - btag
+    - charge
+    - id
+  node_transforms:
+    - torch.log(x)
+    - x
+    - x
+    - x
+    - torch.log(x)
+    - x/6
+    - x
+    - x/4
+  edge_features:
+    - delta_eta
+    - delta_phi
+    - delta_R
+    - M2
+  global_features:
+    - njet
+    - nBjets
+
+  global_transforms:
+    - x/8
+    - x/8
+  pre_transform: true
+
+target:
+  encoding: typed
+  edge:
+    tlep_b:
+      - '1-4'
+      - '2-1'
+    Whad:
+      - '1-2'
+      - '1-3'
+    H:
+      - '1-5'
+      - '1-6'
+
+  hyperedge:
+    tlep:
+      - '1-4'
+      - '2-1'
+      - '3-1'
+    thad:
+      - '1-1'
+      - '1-2'
+      - '1-3'

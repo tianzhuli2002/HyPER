@@ -1,0 +1,13 @@
+defaults:
+  - ttH_SL_typed
+  - _self_
+
+classification:
+  enabled: false
+  loss_weight: 0.0
+
+reconstruction:
+  enabled: true
+
+predicting:
+  output_mode: selected

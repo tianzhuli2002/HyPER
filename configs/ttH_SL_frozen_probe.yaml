@@ -1,0 +1,37 @@
+defaults:
+  - ttH_SL_typed
+  - _self_
+
+classification:
+  enabled: true
+  loss_weight: 1.0
+
+reconstruction:
+  enabled: false
+
+predicting:
+  output_mode: classifier
+
+probe:
+  enabled: true
+  pretrained_model_directory: null
+  pretrained_checkpoint_path: null
+  trainable_parameter_prefixes:
+    - Classification.
+
+optimizer:
+  name: adamw
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+
+trainer:
+  epochs: 50
+  checkpoint_mode: keep_best_last
+  check_val_every_n_epoch: 1
+  limit_val_batches: 1.0
+
+early_stopping:
+  enabled: true
+  monitor: val_loss
+  mode: min
+  patience: 10
