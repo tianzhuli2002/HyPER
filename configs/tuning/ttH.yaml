@@ -1,0 +1,53 @@
+tuning:
+  enabled: true
+  checkpointing: false
+  seed: 42
+  study_name: ttH_stage1_reconstruction
+  sqlite_path: /mnt/iusers01/fatpou01/phy01/w00238tl/scratch/HyPER_24_2/results/tuning_campaigns/stage1_v2/ttH/stage1/study.sqlite3
+  output_dir: /mnt/iusers01/fatpou01/phy01/w00238tl/scratch/HyPER_24_2/results/tuning_campaigns/stage1_v2/ttH/stage1
+  train_indices_file: null
+  validation_indices_file: null
+  subset_seed: 42
+  subset_manifest_path: null
+  train_count: 250000
+  validation_count: 50000
+  target_completed_trials: 24
+  max_attempted_trials: 32
+  trials_per_worker: 4
+  startup_trials: 5
+  max_epochs: 12
+  min_epochs: 4
+  early_stopping_patience: 3
+  pruner: median
+  pruning_warmup_epochs: 4
+  min_remaining_seconds: 7200
+  monitor: val_reconstruction_loss
+  direction: min
+  alpha_grid: [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
+  beta_grid: [0.01, 0.02, 0.03, 0.05, 0.07, 0.10, 0.30, 0.50, 0.70]
+  search_space:
+    optimizer.learning_rate: {type: float, low: 1.0e-5, high: 3.0e-3, log: true}
+    optimizer.weight_decay: {type: float, low: 1.0e-8, high: 1.0e-2, log: true}
+    model.dropout: {type: float, low: 0.0, high: 0.20}
+    model.message_feats: {type: categorical, values: [32, 64, 96, 128]}
+    model.contraction_feats: {type: categorical, values: [64, 128, 192, 256]}
+
+dataset:
+  root: /mnt/iusers01/fatpou01/phy01/w00238tl/scratch/HyPER_graph_dbs/schema2/ttH
+  source_h5_path: /mnt/iusers01/fatpou01/phy01/w00238tl/scratch/HyPER_24_2/HyPER_ttH_SL_typed/raw/hyper_converted_ttH_ttbb_train_10M_23May.h5
+  train_set: hyper_converted_ttH_ttbb_train_10M_23May
+  predict_set: hyper_converted_ttH_ttbb_train_10M_23May
+  split:
+    cache_path: /mnt/iusers01/fatpou01/phy01/w00238tl/scratch/HyPER_24_2/results/integration_validation/splits/ttH_full_schema4.npz
+    require_existing: true
+    predict_split: null
+  drop_last: false
+
+predicting:
+  split: null
+  source_indices_file: null
+
+trainer:
+  run_test_after_fit: false
+  num_sanity_val_steps: 0
+  check_val_every_n_epoch: 1

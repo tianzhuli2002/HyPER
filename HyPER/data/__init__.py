@@ -1,14 +1,11 @@
-from .dataset import HyPERDataset
-from .dataset_lazy import HyPERDatasetLazy
+from .dataset import HyPERData, HyPERDataset
 from .preprocessed import HyPEROnDiskDataset
-from .sampler import EventSampler
 from .datamodule import HyPERDataModule
 
 
 __all__ = [
+    'HyPERData',
     'HyPERDataset',
-    'HyPERDatasetLazy',
     'HyPEROnDiskDataset',
-    'EventSampler',
     'HyPERDataModule'
 ]

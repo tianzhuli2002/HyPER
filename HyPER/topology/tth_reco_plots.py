@@ -67,7 +67,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from prediction_io import coerce_source_indices, iter_hyper_prediction_parts, read_h5_rows, source_index_column  # noqa: E402
+from prediction_io import coerce_source_indices, iter_hyper_prediction_parts, read_h5_rows  # noqa: E402
 from joint_reco_plotting import (  # noqa: E402
     H5_LABEL_CANDIDATES,
     binary_labels_from_h5_data,
@@ -129,17 +129,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prediction-output", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-events", type=int, default=None)
-    parser.add_argument("--score-field", default="HyPER_CLS_RAW")
+    parser.add_argument("--score-field", default="HyPER_CLS_PROB")
     parser.add_argument("--label-field", default=None)
     parser.add_argument("--formats", nargs="+", default=["pdf"])
     parser.add_argument("--no-sb", action="store_true")
     parser.add_argument("--strict-length", action="store_true")
-    parser.add_argument("--alignment", choices=["auto", "row_order", "source_index"], default="auto")
+    parser.add_argument("--alignment", choices=["row_order", "source_index"], default="source_index")
     parser.add_argument("--allow-duplicate-source-index", action="store_true")
     parser.add_argument(
         "--classification",
         action="store_true",
-        help="Keep HyPER_CLS_RAW when reconstructing raw outputs.",
+        help="Keep HyPER_CLS_PROB when reconstructing raw outputs.",
     )
     parser.add_argument(
         "--strategy",
@@ -282,14 +282,23 @@ def normalise_predictions(
     if RAW_COLUMNS.issubset(predictions.columns):
         reco = ttH_single_lep(
             predictions,
-            classification=classification or ("HyPER_CLS_RAW" in predictions.columns),
+            classification=classification or ("HyPER_CLS_PROB" in predictions.columns),
             strategy=strategy,
         )
     elif SELECTED_COLUMNS.issubset(predictions.columns):
-        if strategy != "thad_first":
+        stored_strategies = (
+            {str(value) for value in predictions["reco_strategy"].dropna().unique()}
+            if "reco_strategy" in predictions.columns else set()
+        )
+        if stored_strategies and stored_strategies != {strategy}:
+            raise ValueError(
+                f"Selected ttH output was produced with {sorted(stored_strategies)}, "
+                f"but plotting requested strategy={strategy!r}."
+            )
+        if not stored_strategies and strategy != "thad_first":
             raise KeyError(
-                "Alternative ttH reconstruction strategies require raw HyPER columns. "
-                "This prediction output only contains selected ttH columns."
+                "Alternative ttH reconstruction strategies require either raw HyPER columns "
+                "or an explicit matching reco_strategy column in selected output."
             )
         reco = predictions.copy()
         if "reco_strategy" not in reco.columns:
@@ -303,72 +312,6 @@ def normalise_predictions(
             )
 
     return reco.reset_index(drop=True)
-
-
-def align_prediction_rows_to_h5_prefix(
-    predictions: pd.DataFrame,
-    n_processed: int,
-    start_event: int,
-    strict: bool,
-    warnings_list: list[str],
-) -> tuple[pd.DataFrame, str]:
-    """Verify or reorder prediction rows when a prefix event_index is available."""
-    predictions = predictions.iloc[:n_processed].reset_index(drop=True)
-
-    if "event_index" not in predictions.columns:
-        warning = (
-            "Prediction output has no event_index column; assuming row-order alignment "
-            "with the H5 prefix."
-        )
-        LOGGER.warning(warning)
-        warnings_list.append(warning)
-        return predictions, "row_order_prefix_assumed"
-
-    event_index = pd.to_numeric(predictions["event_index"], errors="coerce").to_numpy(dtype=float)
-
-    if len(event_index) != n_processed or not np.all(np.isfinite(event_index)):
-        warning = (
-            "Prediction event_index is invalid for some rows; assuming row-order "
-            "alignment with the H5 prefix."
-        )
-        if strict:
-            raise ValueError(warning)
-        LOGGER.warning(warning)
-        warnings_list.append(warning)
-        return predictions, "row_order_prefix_assumed_event_index_invalid"
-
-    event_index_int = event_index.astype(np.int64)
-
-    if not np.allclose(event_index, event_index_int):
-        warning = (
-            "Prediction event_index contains non-integer values; assuming row-order "
-            "alignment with the H5 prefix."
-        )
-        if strict:
-            raise ValueError(warning)
-        LOGGER.warning(warning)
-        warnings_list.append(warning)
-        return predictions, "row_order_prefix_assumed_event_index_invalid"
-
-    expected = np.arange(start_event, start_event + n_processed, dtype=np.int64)
-
-    if np.array_equal(event_index_int, expected):
-        return predictions, "event_index_prefix_verified"
-
-    if np.array_equal(np.sort(event_index_int), expected):
-        order = np.argsort(event_index_int)
-        return predictions.iloc[order].reset_index(drop=True), "event_index_prefix_reordered"
-
-    warning = (
-        "Prediction event_index is not the copied H5 prefix for this chunk; assuming "
-        "row-order alignment."
-    )
-    if strict:
-        raise ValueError(warning)
-
-    LOGGER.warning(warning)
-    warnings_list.append(warning)
-    return predictions, "row_order_prefix_assumed_event_index_nonprefix"
 
 
 def read_h5_indexed(handle: h5py.File, source_indices: np.ndarray, chunk_size: int) -> dict[str, np.ndarray]:
@@ -509,11 +452,9 @@ def evaluate_event(
         truth_match_category = "unmatched"
 
     if is_signal is None:
-        is_signal_eval = int(fully_matched)
-        signal_label_source = "fallback_fully_matched"
-    else:
-        is_signal_eval = int(is_signal == 1)
-        signal_label_source = "event_label"
+        raise ValueError("Explicit event-level signal/background label is required for reconstruction evaluation.")
+    is_signal_eval = int(is_signal == 1)
+    signal_label_source = "event_label"
 
     reco_eval_event = int(is_signal_eval == 1 and fully_matched and njet >= 6)
 
@@ -689,7 +630,7 @@ def evaluate_event(
         )
 
     return {
-        "event_index": int(event_idx),
+        "source_event_index": int(event_idx),
         "n_jets": int(njet),
         "njet_bin": njet_bin(njet),
         "is_signal": int(is_signal_eval),
@@ -746,7 +687,7 @@ def evaluate_event(
         "w_lep_score": w_lep_score,
         "higgs_score": higgs_score,
         "event_reco_score": event_reco_score,
-        "HyPER_CLS_RAW": finite_float(row.get("HyPER_CLS_RAW", np.nan)),
+        "HyPER_CLS_PROB": finite_float(row.get("HyPER_CLS_PROB", np.nan)),
     }
 
 
@@ -1161,7 +1102,8 @@ def print_plot_scope_counts(evaluation: pd.DataFrame, plot_scope: str) -> dict[s
         "signal_events": int(np.sum(signal)),
         "background_events": int(np.sum(background)),
         "fully_matched_signal_events": int(np.sum(masks["signal_fm"])),
-        "unmatched_signal_events": int(np.sum(masks["signal_nonfm"])),
+        "partially_matched_signal_events": int(np.sum(masks["signal_partial"])),
+        "unmatched_signal_events": int(np.sum(masks["signal_unmatched"])),
     }
     print("Plot category counts:", counts)
     LOGGER.info("Plot category counts: %s", counts)
@@ -1550,17 +1492,7 @@ def main() -> None:
                 n_reco_events = int(
                     prediction_chunk.attrs.get("hyper_total_rows", len(prediction_chunk))
                 )
-                if args.alignment == "auto":
-                    if n_h5_events == n_reco_events:
-                        alignment_mode = "row_order"
-                    elif source_index_column(prediction_chunk) is not None:
-                        alignment_mode = "source_index"
-                    else:
-                        raise ValueError(
-                            "Length mismatch and no HYPER_SOURCE_INDEX available. Re-run prediction "
-                            "with source-index export enabled, or predict the full H5."
-                        )
-                elif args.alignment == "row_order":
+                if args.alignment == "row_order":
                     alignment_mode = "row_order"
                 else:
                     alignment_mode = "source_index"
@@ -1590,13 +1522,8 @@ def main() -> None:
                 break
 
             if alignment_mode == "row_order":
-                aligned, mode = align_prediction_rows_to_h5_prefix(
-                    reco_chunk,
-                    n_process,
-                    start,
-                    args.strict_length,
-                    warnings_list,
-                )
+                aligned = reco_chunk.iloc[:n_process].reset_index(drop=True)
+                mode = "explicit_full_dataset_row_order"
                 source_indices = np.arange(start, start + n_process, dtype=np.int64)
                 jets = handle["INPUTS/JET"][start:stop]
                 leptons = handle["INPUTS/LEPTON"][start:stop]
@@ -1649,13 +1576,8 @@ def main() -> None:
 
             label_source = label_source or this_label_source
 
-            if signal_labels is None and not any("No event-level binary label found" in w for w in warnings_list):
-                warning = (
-                    "No event-level binary label found. Reconstruction efficiency will "
-                    "fall back to fully_matched == 1 as the signal mask."
-                )
-                LOGGER.warning(warning)
-                warnings_list.append(warning)
+            if signal_labels is None:
+                raise ValueError("No explicit event-level binary label found in prediction or H5 input.")
 
             chunk_rows = []
 
@@ -1776,8 +1698,8 @@ def main() -> None:
         n_reco_eval_total,
         n_signal_partial_total,
         n_signal_unmatched_total,
-        label_source or "fallback_fully_matched",
-        label_source is None,
+        label_source,
+        False,
     )
     write_category_diagnostics(category_summary, output_dir, args.formats)
 
@@ -1790,7 +1712,7 @@ def main() -> None:
                 "topology": "ttH_singlelep",
                 "strategy": args.strategy,
                 "efficiency_denominator": (
-                    "signal or fully matched fallback, fully matched six ttH jet roles, n_jets >= 6"
+                    "explicit event label == signal, fully matched six ttH jet roles, n_jets >= 6"
                 ),
                 "processed_events": int(n_processed),
                 "sampled_plot_events": int(len(evaluation)),
@@ -1841,11 +1763,10 @@ def main() -> None:
         "chunk_size": int(args.chunk_size),
         "event_alignment_modes": {key: int(value) for key, value in alignment_modes.items()},
         "event_alignment_policy": (
-            "auto uses row_order only when prediction length equals H5 length; "
-            "otherwise HYPER_SOURCE_INDEX is required and source-index H5 rows are read."
+            "source_index is the default; row_order must be requested explicitly for a declared full-dataset output."
         ),
-        "label_source": label_source or "fallback_fully_matched",
-        "fallback_fully_matched_used": label_source is None,
+        "label_source": label_source,
+        "fallback_fully_matched_used": False,
         "signal_events": int(np.sum(evaluation["is_signal"] == 1)),
         "background_events": int(np.sum(evaluation["is_signal"] == 0)),
         "n_total_rows": category_summary["n_total_rows"],
@@ -1867,8 +1788,7 @@ def main() -> None:
         "evaluation_policy": {
             "sb_plots": "all events with binary labels and finite classification score",
             "reconstruction_efficiency": (
-                "event-level signal label == 1, fully_matched == 1, and n_jets >= 6; "
-                "if no event label is available, signal label falls back to fully_matched"
+                "event-level signal label == 1, fully_matched == 1, and n_jets >= 6"
             ),
             "observable_plots": (
                 "same as reconstruction_efficiency, with finite pred/truth observable "
@@ -1892,7 +1812,7 @@ def main() -> None:
         },
         "efficiency_logic": {
             "efficiency_denominator": (
-                "signal or fully matched fallback, fully matched six ttH jet roles, n_jets >= 6"
+                "explicit event label == signal, fully matched six ttH jet roles, n_jets >= 6"
             ),
             "b_lep_eff": "selected HyPER_best_blep has truth label 4",
             "b_had_eff": "selected HyPER_best_bhad has truth label 1",

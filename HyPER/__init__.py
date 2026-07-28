@@ -26,13 +26,15 @@ class LazyLoader(ModuleType):
 data = LazyLoader('data', globals(), 'HyPER.data')
 models = LazyLoader('models', globals(), 'HyPER.models')
 utils = LazyLoader('utils', globals(), 'HyPER.utils')
-evaluation = LazyLoader('evaluation', globals(), 'HyPER.evaluation')
 topology = LazyLoader('topology', globals(), 'HyPER.topology')
 
 __version__ = 'v1'
 
 
 __all__ = [
-    'HyPER',
+    'data',
+    'models',
+    'utils',
+    'topology',
     '__version__',
 ]

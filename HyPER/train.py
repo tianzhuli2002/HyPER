@@ -1,527 +1,414 @@
-import hydra
+"""HyPER training entry point for the single active typed configuration schema."""
+
+from __future__ import annotations
+
+import hashlib
 import json
+import os
+import resource
+import time
+from pathlib import Path
+
+import hydra
+import lightning.pytorch as pl
 import torch
 import torch_geometric
-import lightning.pytorch as pl
-
-from lightning.pytorch.loggers import TensorBoardLogger
-from lightning_utilities.core.imports import RequirementCache
 from lightning.pytorch.callbacks import (
+    EarlyStopping,
     LearningRateMonitor,
     ModelCheckpoint,
-    RichProgressBar,
-    RichModelSummary,
-    DeviceStatsMonitor,
-    ModelSummary,
     TQDMProgressBar,
-    EarlyStopping
 )
+from lightning.pytorch.loggers import TensorBoardLogger
+from omegaconf import DictConfig, OmegaConf
+from packaging import version
 
 from HyPER.data import HyPERDataModule
 from HyPER.models import HyPERModel
 from HyPER.utils.timing import TrainingTimingCallback
-from omegaconf import DictConfig, OmegaConf
-from packaging import version
-import os
-import warnings
-
-_RICH_AVAILABLE = RequirementCache("rich>=10.2.2")
 
 
-def _select(cfg: DictConfig, path: str, legacy: str = None, default=None):
-    value = OmegaConf.select(cfg, path, default=None)
-    if value is not None:
-        return value
-    if legacy is not None:
-        value = OmegaConf.select(cfg, legacy, default=None)
-        if value is not None:
-            return value
-    return default
+def _plain(value):
+    return OmegaConf.to_container(value, resolve=True) if OmegaConf.is_config(value) else value
 
 
-def _graph_config_from_cfg(cfg: DictConfig):
-    if OmegaConf.select(cfg, 'input', default=None) is None and OmegaConf.select(cfg, 'target', default=None) is None:
+def _graph_config(cfg: DictConfig) -> dict:
+    if "input" not in cfg or "target" not in cfg:
+        raise ValueError("HyPER configs must provide input and target sections.")
+    return _plain(OmegaConf.create({"input": cfg.input, "target": cfg.target}))
+
+
+def _file_sha256(path: str | None) -> str | None:
+    if path is None or not str(path).strip():
         return None
-    if OmegaConf.select(cfg, 'input', default=None) is None or OmegaConf.select(cfg, 'target', default=None) is None:
-        raise ValueError("Unified HyPER configs must provide both `input` and `target` sections.")
-    return OmegaConf.to_container(
-        OmegaConf.create({
-            'input': OmegaConf.select(cfg, 'input'),
-            'target': OmegaConf.select(cfg, 'target'),
-        }),
-        resolve=True,
-    )
+    candidate = Path(str(path)).expanduser()
+    if not candidate.is_file():
+        return None
+    digest = hashlib.sha256()
+    with candidate.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def _classification_loss_weight(cfg: DictConfig):
-    class_weight = OmegaConf.select(cfg, 'classification.loss_weight', default=None)
-    legacy_beta = _select(cfg, 'loss.beta', 'beta', None)
-    if class_weight is not None and legacy_beta is not None and abs(float(class_weight) - float(legacy_beta)) > 1e-12:
-        raise ValueError(
-            "`classification.loss_weight` and legacy `loss.beta`/`beta` are both set "
-            f"but disagree ({class_weight} != {legacy_beta}). Use one S/B loss coefficient."
+def _resolve_checkpoint(selector: str | None, model_directory: str | None, purpose: str) -> str | None:
+    if selector is None or not str(selector).strip():
+        return None
+    selector = str(selector).strip()
+    direct = Path(selector).expanduser()
+    if direct.is_file():
+        return str(direct.resolve())
+    if selector not in {"best", "last"}:
+        raise FileNotFoundError(
+            f"{purpose} checkpoint must be an existing path or explicit selector 'best'/'last', got {selector!r}."
         )
-    if class_weight is not None:
-        return float(class_weight)
-    if legacy_beta is not None:
-        warnings.warn(
-            "`loss.beta`/`beta` is a deprecated name for the S/B classification loss weight; "
-            "prefer `classification.loss_weight` in new configs.",
-            DeprecationWarning,
-        )
-        return float(legacy_beta)
-    return 0.5
-
-
-def _as_list(value):
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple)):
-        return [str(item) for item in value]
-    if OmegaConf.is_config(value):
-        return [str(item) for item in OmegaConf.to_container(value, resolve=True)]
-    return [str(value)]
-
-
-def _as_plain_container(value, default=None):
-    if value is None:
-        return {} if default is None else default
-    if OmegaConf.is_config(value):
-        return OmegaConf.to_container(value, resolve=True)
-    return value
-
-
-def _resolve_checkpoint_path(checkpoint_path=None, model_directory=None):
-    if checkpoint_path is not None:
-        checkpoint_path = str(checkpoint_path).strip()
-        if checkpoint_path:
-            if not os.path.isfile(checkpoint_path):
-                raise FileNotFoundError(f"Probe checkpoint not found: {checkpoint_path}")
-            return checkpoint_path
-
     if model_directory is None:
-        return None
-
-    model_directory = str(model_directory).strip()
-    if not model_directory:
-        return None
-    checkpoint_dir = os.path.join(model_directory, "checkpoints")
-    if not os.path.isdir(checkpoint_dir):
-        raise FileNotFoundError(f"Probe model checkpoint directory not found: {checkpoint_dir}")
-
-    candidates = [
-        os.path.join(checkpoint_dir, name)
-        for name in os.listdir(checkpoint_dir)
-        if name.endswith(".ckpt")
-    ]
-    if not candidates:
-        raise FileNotFoundError(f"No checkpoint files found in {checkpoint_dir}")
-
-    epoch_candidates = [
-        path for path in candidates
-        if os.path.basename(path).startswith("epoch")
-    ]
-    if epoch_candidates:
-        return sorted(epoch_candidates)[-1]
-    return sorted(candidates)[-1]
+        raise ValueError(f"{purpose} checkpoint selector {selector!r} requires a model directory.")
+    checkpoint_dir = Path(model_directory).expanduser() / "checkpoints"
+    if selector == "last":
+        candidate = checkpoint_dir / "last.ckpt"
+        if not candidate.is_file():
+            raise FileNotFoundError(candidate)
+        return str(candidate.resolve())
+    candidates = list(checkpoint_dir.glob("best-total*.ckpt"))
+    if len(candidates) != 1:
+        raise RuntimeError(
+            f"Selector 'best' requires exactly one best-total checkpoint in {checkpoint_dir}, found {len(candidates)}."
+        )
+    return str(candidates[0].resolve())
 
 
 def _load_probe_backbone(model: HyPERModel, checkpoint_path: str, skip_prefixes=("Classification.",)):
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     source_state = checkpoint.get("state_dict", checkpoint)
     target_state = model.state_dict()
-    skip_prefixes = tuple(str(prefix) for prefix in skip_prefixes)
-
-    loadable = {}
-    skipped_prefix = []
-    skipped_missing = []
-    skipped_shape = []
-
-    for name, tensor in source_state.items():
-        if any(name.startswith(prefix) for prefix in skip_prefixes):
-            skipped_prefix.append(name)
-            continue
-        if name not in target_state:
-            skipped_missing.append(name)
-            continue
-        if tuple(tensor.shape) != tuple(target_state[name].shape):
-            skipped_shape.append((name, tuple(tensor.shape), tuple(target_state[name].shape)))
-            continue
-        loadable[name] = tensor
-
+    loadable = {
+        name: tensor
+        for name, tensor in source_state.items()
+        if not any(name.startswith(prefix) for prefix in skip_prefixes)
+        and name in target_state
+        and tuple(tensor.shape) == tuple(target_state[name].shape)
+    }
     if not loadable:
-        raise RuntimeError(f"No matching non-classification checkpoint weights found in {checkpoint_path}")
-
+        raise RuntimeError(f"No compatible frozen-probe backbone tensors found in {checkpoint_path}.")
     result = model.load_state_dict(loadable, strict=False)
-    print("================================")
-    print("Loaded frozen-probe backbone checkpoint")
-    print(f"Checkpoint:              {checkpoint_path}")
-    print(f"Loaded tensors:          {len(loadable)}")
-    print(f"Skipped by prefix:       {len(skipped_prefix)}")
-    print(f"Skipped missing target:  {len(skipped_missing)}")
-    print(f"Skipped shape mismatch:  {len(skipped_shape)}")
-    print(f"Missing after load:      {len(result.missing_keys)}")
-    print(f"Unexpected after load:   {len(result.unexpected_keys)}")
-    if skipped_prefix:
-        print("Skipped prefix tensors:")
-        for name in skipped_prefix[:20]:
-            print(f"  {name}")
-        if len(skipped_prefix) > 20:
-            print(f"  ... {len(skipped_prefix) - 20} more")
-    if skipped_shape:
-        print("Shape mismatches:")
-        for name, source_shape, target_shape in skipped_shape[:20]:
-            print(f"  {name}: checkpoint={source_shape}, model={target_shape}")
-        if len(skipped_shape) > 20:
-            print(f"  ... {len(skipped_shape) - 20} more")
-    print("================================")
-
     return {
         "checkpoint_path": checkpoint_path,
-        "loaded_tensors": sorted(loadable),
-        "skipped_prefix": sorted(skipped_prefix),
-        "skipped_missing_target": sorted(skipped_missing),
-        "skipped_shape_mismatch": [
-            {"name": name, "checkpoint_shape": list(source_shape), "model_shape": list(target_shape)}
-            for name, source_shape, target_shape in skipped_shape
-        ],
-        "missing_keys_after_load": list(result.missing_keys),
-        "unexpected_keys_after_load": list(result.unexpected_keys),
+        "loaded_tensor_count": len(loadable),
+        "missing_keys": list(result.missing_keys),
+        "unexpected_keys": list(result.unexpected_keys),
     }
 
 
-def worker_init_fn(worker_id: int) -> None:
-    """Initialize worker process with unique random seed for reproducibility."""
-    import numpy as np
-    # Seed: base seed + worker_id to ensure each worker has unique randomness
-    np.random.seed(42 + worker_id)
-    os.environ['PYTHONHASHSEED'] = str(42 + worker_id)
-
-
-def _metric_to_float(value):
-    if value is None:
-        return None
-    if hasattr(value, "detach"):
-        value = value.detach().cpu()
-        if value.numel() == 1:
-            return float(value)
-        return value.tolist()
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return value
+def _checkpoint_callbacks(monitor: str = "val_loss", mode: str = "min"):
+    filename_metric = str(monitor)
+    return [
+        ModelCheckpoint(
+            filename="best-total-{epoch:03d}-{" + filename_metric + ":.6f}",
+            monitor=str(monitor),
+            mode=str(mode),
+            save_top_k=1,
+            save_last=True,
+            save_on_train_epoch_end=False,
+        )
+    ]
 
 
 def run_training(cfg: DictConfig, extra_callbacks=None, logger_name="", return_metrics=True):
-    r"""Perform network training using parameters defined in 
-    `option_file`.
-
-    Args:
-        cfg (str): a `.yaml` file, stores training related parameters. (default: :obj:`str`=None).
-    """
     print(OmegaConf.to_yaml(cfg))
-
-    device = _select(cfg, 'trainer.accelerator', 'device', 'cpu')
-    num_devices = _select(cfg, 'trainer.devices', 'num_devices', 1)
-    batch_size = _select(cfg, 'dataset.batch_size', 'batch_size', 128)
-    num_workers = _select(cfg, 'dataset.num_workers', 'datamodule.num_workers', 8)
-    pin_memory = _select(cfg, 'dataset.pin_memory', 'datamodule.pin_memory', True if device == "gpu" else False)
-    if device == "cpu" and pin_memory:
-        warnings.warn("Disabling `pin_memory` for CPU training.", UserWarning)
-        pin_memory = False
-    persistent_workers = _select(cfg, 'dataset.persistent_workers', 'datamodule.persistent_workers', True)
-    prefetch_factor = _select(cfg, 'dataset.prefetch_factor', 'datamodule.prefetch_factor', 2)
-    cache_dir = _select(cfg, 'dataset.cache_dir', 'datamodule.cache_dir', None)
-    force_reload = _select(cfg, 'dataset.force_reload', 'datamodule.force_reload', False)
-    use_ondisk = _select(cfg, 'dataset.use_ondisk', 'datamodule.use_ondisk', True)
-    train_val_split = _select(cfg, 'dataset.train_val_split', 'train_val_split', 0.95)
-    graph_config = _graph_config_from_cfg(cfg)
-    classification_loss_weight = _classification_loss_weight(cfg)
-    
-    datamodule = HyPERDataModule(
-        root = _select(cfg, 'dataset.root', 'dataset'),
-        train_set = _select(cfg, 'dataset.train_set', 'train_set'),
-        val_set = _select(cfg, 'dataset.val_set', 'val_set'),
-        batch_size = batch_size,
-        max_n_events = _select(cfg, 'dataset.max_n_events', 'max_n_events', -1),
-        percent_valid_samples = 1 - float(train_val_split),
-        drop_last = _select(cfg, 'dataset.drop_last', 'drop_last', True),
-        num_workers = num_workers,
-        pin_memory = pin_memory,
-        persistent_workers = persistent_workers,
-        prefetch_factor = prefetch_factor,
-        cache_dir = cache_dir,
-        force_reload = force_reload,
-        use_ondisk = use_ondisk,
-        graph_config = graph_config,
-        split_config = _as_plain_container(_select(cfg, 'dataset.split', default={})),
-        predict_split = _select(cfg, 'predicting.split', 'dataset.split.predict_split', None),
+    seed = int(cfg.general.seed)
+    pl.seed_everything(seed, workers=True)
+    classification_enabled = bool(cfg.classification.enabled)
+    reconstruction_enabled = bool(cfg.reconstruction.enabled)
+    tuning_cfg = cfg.get("tuning", {})
+    tuning_enabled = bool(tuning_cfg.get("enabled", False))
+    exploratory_tuning = tuning_enabled and not bool(tuning_cfg.get("checkpointing", False))
+    performance_cfg = cfg.get("performance", {})
+    validation_diagnostics_cfg = cfg.get("validation_diagnostics", {})
+    validation_subset_path = (
+        tuning_cfg.get("validation_indices_file")
+        if tuning_enabled
+        else cfg.dataset.split.get("cache_path")
     )
 
-    trainer_cfg = cfg.get('trainer', {})
-    check_val_every_n_epoch = trainer_cfg.get('check_val_every_n_epoch', 1)
-    lr_scheduler_default_frequency = check_val_every_n_epoch if check_val_every_n_epoch is not None else 1
+    datamodule = HyPERDataModule(
+        root=str(cfg.dataset.root),
+        train_set=str(cfg.dataset.train_set),
+        val_set=None if cfg.dataset.val_set is None else str(cfg.dataset.val_set),
+        predict_set=str(cfg.dataset.predict_set),
+        batch_size=int(cfg.dataset.batch_size),
+        drop_last=bool(cfg.dataset.drop_last),
+        num_workers=int(cfg.dataset.num_workers),
+        pin_memory=bool(cfg.dataset.pin_memory),
+        persistent_workers=bool(cfg.dataset.persistent_workers),
+        prefetch_factor=int(cfg.dataset.prefetch_factor),
+        force_reload=bool(cfg.dataset.force_reload),
+        use_ondisk=bool(cfg.dataset.use_ondisk),
+        graph_config=_graph_config(cfg),
+        split_config=_plain(cfg.dataset.split),
+        predict_split=cfg.predicting.split,
+        source_indices_file=cfg.predicting.source_indices_file,
+        source_h5_path=cfg.dataset.get("source_h5_path"),
+        require_two_event_classes=classification_enabled,
+        tuning_mode=tuning_enabled,
+        tuning_train_indices_file=tuning_cfg.get("train_indices_file"),
+        tuning_val_indices_file=tuning_cfg.get("validation_indices_file"),
+        seed=seed,
+        classification_enabled=classification_enabled,
+        reconstruction_enabled=reconstruction_enabled,
+        verify_source_identity_per_event=bool(
+            performance_cfg.get("verify_source_identity_per_event", False)
+        ),
+        source_identity_setup_samples=int(
+            performance_cfg.get("source_identity_setup_samples", 32)
+        ),
+    )
 
     model = HyPERModel(
-        node_in_channels = datamodule.node_in_channels,
-        edge_in_channels = datamodule.edge_in_channels,
-        global_in_channels = datamodule.global_in_channels,
-        edge_out_channels = datamodule.edge_out_channels,
-        hyperedge_out_channels = datamodule.hyperedge_out_channels,
-        target_encoding = datamodule.target_encoding,
-        message_feats = _select(cfg, 'model.message_feats', 'message_feats', 32),
-        dropout = _select(cfg, 'model.dropout', 'dropout', 0.01),
-        message_passing_recurrent = _select(cfg, 'model.message_passing_recurrent', 'num_message_layers', 3),
-        contraction_feats = _select(cfg, 'model.contraction_feats', 'hyperedge_feats', 32),
-        hyperedge_order = _select(cfg, 'model.hyperedge_order', 'hyperedge_order', 3),
-        criterion_edge = _select(cfg, 'loss.criterion_edge', 'criterion_edge', 'BCE'),
-        criterion_hyperedge = _select(cfg, 'loss.criterion_hyperedge', 'criterion_hyperedge', 'BCE'),
-        optimizer = _select(cfg, 'optimizer.name', 'optimizer', 'Adam'),
-        lr = _select(cfg, 'optimizer.learning_rate', 'learning_rate', 1e-3),
-        weight_decay = _select(cfg, 'optimizer.weight_decay', default=0.0),
-        lr_scheduler_enabled = _select(cfg, 'lr_scheduler.enabled', default=True),
-        lr_scheduler_method = _select(cfg, 'lr_scheduler.method', default='reduce_on_plateau'),
-        lr_scheduler_monitor = _select(cfg, 'lr_scheduler.monitor', default='val_loss'),
-        lr_scheduler_mode = _select(cfg, 'lr_scheduler.mode', default='min'),
-        lr_scheduler_factor = _select(cfg, 'lr_scheduler.factor', default=0.8),
-        lr_scheduler_patience = _select(cfg, 'lr_scheduler.patience', default=10),
-        lr_scheduler_min_lr = _select(cfg, 'lr_scheduler.min_lr', default=0.0),
-        lr_scheduler_frequency = _select(cfg, 'lr_scheduler.frequency', default=lr_scheduler_default_frequency),
-        alpha = _select(cfg, 'loss.alpha', 'alpha', 0.5),
-        beta = classification_loss_weight,
-        reduction = _select(cfg, 'loss.reduction', 'loss_reduction', 'mean'),
-        validation_mode = cfg.get('trainer', {}).get('validation_mode', 'keep'),
-        classification_enabled = _select(cfg, 'classification.enabled', default=True),
-        # = _select(cfg, 'classification.input_mode', default='edge_hyperedge'),
-        classification_loss_weight = classification_loss_weight,
-        reconstruction_enabled = _select(cfg, 'reconstruction.enabled', default=True),
-        reconstruction_weighting = _select(cfg, 'loss.reconstruction_weighting', default='legacy'),
-        positive_weight_cap = _select(cfg, 'loss.positive_weight_cap', default=50.0),
-        negative_weight_cap = _select(cfg, 'loss.negative_weight_cap', default=5.0),
-        log_reco_diagnostics = _select(cfg, 'metrics.log_reco_diagnostics', default=True),
-        log_reco_score_metrics = _select(cfg, 'metrics.log_reco_score_metrics', default=True),
-        log_validation_topk = _select(cfg, 'metrics.log_validation_topk', default=True),
-        log_classification_batch_sb = _select(cfg, 'metrics.log_classification_batch_sb', default=True),
-        classification_debug_finite_checks = _select(cfg, 'classification.debug_finite_checks', default=False),
-        classification_debug_range_checks = _select(cfg, 'classification.debug_range_checks', default=False),
-        profile_reco_sections_enabled = _select(cfg, 'profiling.reco_sections_enabled', default=False),
-        profile_reco_sections_batches = _select(cfg, 'profiling.reco_sections_batches', default=50),
-        profile_reco_sections_cuda_synchronize = _select(cfg, 'profiling.reco_sections_cuda_synchronize', default=True),
-        profile_reco_sections_log_every_n_steps = _select(cfg, 'profiling.reco_sections_log_every_n_steps', default=1),
-        validate_cached_target_classes = _select(cfg, 'loss.validate_cached_target_classes', default=False),
-        debug_finite_checks = _select(cfg, 'debug.finite_checks', default=False),
-        debug_stop_on_nonfinite = _select(cfg, 'debug.stop_on_nonfinite', default=True),
-        debug_log_tensor_ranges = _select(cfg, 'debug.log_tensor_ranges', default=False),
-        debug_log_loss_components = _select(cfg, 'debug.log_loss_components', default=False),
-        debug_log_reco_target_activity = _select(cfg, 'debug.log_reco_target_activity', default=False),
+        node_in_channels=datamodule.node_in_channels,
+        edge_in_channels=datamodule.edge_in_channels,
+        global_in_channels=datamodule.global_in_channels,
+        edge_out_channels=datamodule.edge_out_channels,
+        hyperedge_out_channels=datamodule.hyperedge_out_channels,
+        edge_class_names=datamodule.edge_class_names,
+        hyperedge_class_names=datamodule.hyperedge_class_names,
+        message_feats=int(cfg.model.message_feats),
+        dropout=float(cfg.model.dropout),
+        num_message_passing_layers=int(cfg.model.num_message_passing_layers),
+        contraction_feats=int(cfg.model.contraction_feats),
+        hyperedge_order=int(cfg.model.hyperedge_order),
+        optimizer=str(cfg.optimizer.name),
+        lr=float(cfg.optimizer.learning_rate),
+        weight_decay=float(cfg.optimizer.weight_decay),
+        lr_scheduler_enabled=bool(cfg.lr_scheduler.enabled),
+        lr_scheduler_method=str(cfg.lr_scheduler.method),
+        lr_scheduler_monitor=str(cfg.lr_scheduler.monitor),
+        lr_scheduler_mode=str(cfg.lr_scheduler.mode),
+        lr_scheduler_factor=float(cfg.lr_scheduler.factor),
+        lr_scheduler_patience=int(cfg.lr_scheduler.patience),
+        lr_scheduler_min_lr=float(cfg.lr_scheduler.min_lr),
+        lr_scheduler_frequency=int(cfg.lr_scheduler.frequency),
+        classification_enabled=classification_enabled,
+        reconstruction_enabled=reconstruction_enabled,
+        edge_class_weights=_plain(cfg.loss.edge_class_weights),
+        hyperedge_class_weights=_plain(cfg.loss.hyperedge_class_weights),
+        edge_weight=float(cfg.loss.edge_weight),
+        hyperedge_weight=float(cfg.loss.hyperedge_weight),
+        classification_weight=float(cfg.loss.classification_weight),
+        classification_pos_weight=cfg.loss.classification_pos_weight,
+        log_metrics_to_logger=not exploratory_tuning,
+        validation_subset_path=None if validation_subset_path is None else str(validation_subset_path),
+        validation_subset_hash=_file_sha256(validation_subset_path),
+        validation_role_ranking_enabled=bool(
+            validation_diagnostics_cfg.get("role_ranking_enabled", False)
+        ),
+        validation_classification_metrics_enabled=bool(
+            validation_diagnostics_cfg.get("classification_metrics_enabled", False)
+        ),
+        validation_diagnostics_every_n_epochs=int(
+            validation_diagnostics_cfg.get("every_n_epochs", 1)
+        ),
+        validation_diagnostics_max_events=validation_diagnostics_cfg.get("max_events"),
+        validate_candidate_event_assignment=bool(
+            performance_cfg.get("validate_candidate_event_assignment", False)
+        ),
+        optimizer_foreach=cfg.optimizer.get("foreach"),
+        optimizer_fused=bool(cfg.optimizer.get("fused", False)),
     )
 
-    probe_enabled = bool(_select(cfg, 'probe.enabled', default=False))
     probe_manifest = None
-    probe_trainable_names = []
-    probe_frozen_names = []
-    if probe_enabled:
-        if not bool(_select(cfg, 'classification.enabled', default=True)):
-            raise ValueError("probe.enabled=true requires classification.enabled=true.")
-        pretrained_checkpoint = _resolve_checkpoint_path(
-            checkpoint_path=_select(cfg, 'probe.pretrained_checkpoint_path', default=None),
-            model_directory=_select(cfg, 'probe.pretrained_model_directory', default=None),
+    if bool(cfg.get("probe", {}).get("enabled", False)):
+        if not classification_enabled or reconstruction_enabled:
+            raise ValueError("Frozen probe requires classification enabled and reconstruction disabled.")
+        checkpoint = _resolve_checkpoint(
+            cfg.probe.get("pretrained_checkpoint"),
+            cfg.probe.get("pretrained_model_directory"),
+            "Frozen-probe",
         )
-        if pretrained_checkpoint is None:
-            raise ValueError(
-                "probe.enabled=true requires probe.pretrained_checkpoint_path "
-                "or probe.pretrained_model_directory."
-            )
-        trainable_prefixes = _as_list(
-            _select(cfg, 'probe.trainable_parameter_prefixes', default=["Classification."])
-        )
-        if not trainable_prefixes:
-            trainable_prefixes = ["Classification."]
-        load_manifest = _load_probe_backbone(
-            model,
-            pretrained_checkpoint,
-            skip_prefixes=tuple(trainable_prefixes),
-        )
-        probe_trainable_names, probe_frozen_names = model.freeze_for_probe(
-            trainable_prefixes=tuple(trainable_prefixes),
-        )
+        if checkpoint is None:
+            raise ValueError("Frozen probe requires probe.pretrained_checkpoint.")
+        prefixes = tuple(str(value) for value in cfg.probe.trainable_parameter_prefixes)
+        load_info = _load_probe_backbone(model, checkpoint, skip_prefixes=prefixes)
+        trainable, frozen = model.freeze_for_probe(prefixes)
         probe_manifest = {
             "probe_enabled": True,
-            "trainable_parameter_prefixes": trainable_prefixes,
-            "trainable_parameter_names": probe_trainable_names,
-            "n_trainable_parameters": int(sum(p.numel() for p in model.parameters() if p.requires_grad)),
-            "n_total_parameters": int(sum(p.numel() for p in model.parameters())),
-            "n_frozen_parameter_tensors": int(len(probe_frozen_names)),
-            "pretrained": load_manifest,
+            "pretrained": load_info,
+            "trainable_parameters": trainable,
+            "frozen_parameter_tensor_count": len(frozen),
         }
 
-    checkpoint_mode = str(trainer_cfg.get('checkpoint_mode', 'keep_best_last')).lower()
-
-    if checkpoint_mode == 'keep_best_only':
-        save_top_k = 1
-        save_last = False
-    elif checkpoint_mode == 'last_only':
-        save_top_k = 0
-        save_last = True
-    else:
-        save_top_k = 1
-        save_last = True
-
-    checkpoint_callback = ModelCheckpoint(
-            verbose=True,
-            monitor=_select(cfg, 'checkpoint.monitor', default='val_loss'),
-            save_top_k=save_top_k,
-            mode=_select(cfg, 'checkpoint.mode', default='min'),
-            save_last=save_last,
-            save_on_train_epoch_end=False,
+    callbacks = [] if exploratory_tuning else _checkpoint_callbacks(
+        str(tuning_cfg.get("monitor", "val_loss")) if tuning_enabled else "val_loss",
+        str(tuning_cfg.get("direction", "min")) if tuning_enabled else "min",
+    )
+    loss_checkpoint = None if exploratory_tuning else callbacks[0]
+    if bool(cfg.early_stopping.enabled):
+        callbacks.append(
+            EarlyStopping(
+                monitor=str(cfg.early_stopping.monitor),
+                mode=str(cfg.early_stopping.mode),
+                patience=int(cfg.early_stopping.patience),
+                min_delta=float(cfg.early_stopping.get("min_delta", 0.0)),
+                strict=True,
+                check_on_train_epoch_end=False,
+            )
         )
-
-    callbacks = [checkpoint_callback]
+    if not exploratory_tuning:
+        callbacks.append(LearningRateMonitor())
+    if bool(cfg.trainer.enable_progress_bar):
+        callbacks.append(TQDMProgressBar())
+    if bool(cfg.profiling.enabled):
+        callbacks.append(
+            TrainingTimingCallback(
+                log_every_n_steps=int(cfg.profiling.log_every_n_steps),
+                cuda_synchronize=bool(cfg.profiling.cuda_synchronize),
+                output_json=cfg.profiling.output_json,
+            )
+        )
     if extra_callbacks:
         callbacks.extend(extra_callbacks)
 
-    early_stopping_enabled = _select(cfg, 'early_stopping.enabled', 'trainer.enable_early_stopping', True)
-    early_stopping_monitor = _select(cfg, 'early_stopping.monitor', default='val_loss')
-    early_stopping_mode = _select(cfg, 'early_stopping.mode', default='min')
-    early_stopping_patience = _select(cfg, 'early_stopping.patience', 'trainer.patience', 30)
-    print(
-        "Configuring early stopping: "
-        f"enabled={early_stopping_enabled}, "
-        f"monitor={early_stopping_monitor}, "
-        f"mode={early_stopping_mode}, "
-        f"patience={early_stopping_patience}",
-        flush=True,
-    )
-    if early_stopping_enabled:
-        callbacks.append(EarlyStopping(
-            monitor=early_stopping_monitor,
-            mode=early_stopping_mode,
-            min_delta=_select(cfg, 'early_stopping.min_delta', default=0.00),
-            patience=early_stopping_patience,
-            verbose=False,
-            strict=False,
-            check_on_train_epoch_end=False,
-        ))
-
-    callbacks.append(LearningRateMonitor())
-    if _select(cfg, 'trainer.enable_progress_bar', default=True):
-        callbacks.append(RichProgressBar() if _RICH_AVAILABLE else TQDMProgressBar())
-    callbacks.append(RichModelSummary(max_depth=1) if _RICH_AVAILABLE else ModelSummary(max_depth=1))
-
-    if trainer_cfg.get('enable_device_stats', False):
-        callbacks.append(DeviceStatsMonitor())
-
-    profiling_enabled = bool(_select(cfg, 'profiling.enabled', default=False))
-    if profiling_enabled:
-        callbacks.append(
-            TrainingTimingCallback(
-                log_every_n_steps=int(_select(cfg, 'profiling.log_every_n_steps', default=50) or 0),
-                cuda_synchronize=bool(_select(cfg, 'profiling.cuda_synchronize', default=False)),
-                output_json=_select(cfg, 'profiling.output_json', default=None),
-            )
-        )
-
-    # Extract trainer settings
-    precision = trainer_cfg.get("precision", "32-true")
-    print(f"Validation cadence: check_val_every_n_epoch={check_val_every_n_epoch}")
-    trainer_kwargs = dict(
-        accelerator = device,
-        devices = num_devices,
-        precision = precision,
-        max_epochs = _select(cfg, 'trainer.epochs', 'epochs', 1),
-        callbacks = callbacks,
-        logger = TensorBoardLogger(
-            save_dir=_select(cfg, 'paths.savedir', 'savedir', 'HyPER_logs'),
-            name=logger_name,
-            log_graph=trainer_cfg.get('log_graph', False),
-        ),
-        log_every_n_steps = trainer_cfg.get('log_every_n_steps', 50),
-        num_sanity_val_steps = trainer_cfg.get('num_sanity_val_steps', 0),
-        check_val_every_n_epoch = check_val_every_n_epoch,
-        enable_progress_bar = bool(_select(cfg, 'trainer.enable_progress_bar', default=True)),
-    )
-    
-    # Add optional trainer controls
-    gradient_clip_val = _select(cfg, 'trainer.gradient_clip_val', 'trainer.gradient_clip', None)
-    if gradient_clip_val is not None:
-        trainer_kwargs['gradient_clip_val'] = gradient_clip_val
-    if trainer_cfg.get('limit_val_batches', None) is not None:
-        trainer_kwargs['limit_val_batches'] = trainer_cfg['limit_val_batches']
-    if trainer_cfg.get('limit_train_batches', None) is not None:
-        trainer_kwargs['limit_train_batches'] = trainer_cfg['limit_train_batches']
-    if trainer_cfg.get('val_check_interval', None) is not None:
-        trainer_kwargs['val_check_interval'] = trainer_cfg['val_check_interval']
-    if trainer_cfg.get('max_steps', None) is not None:
-        trainer_kwargs['max_steps'] = trainer_cfg['max_steps']
-    if trainer_cfg.get('max_time', None) is not None:
-        trainer_kwargs['max_time'] = trainer_cfg['max_time']
-    
+    trainer_kwargs = {
+        "accelerator": str(cfg.trainer.accelerator),
+        "devices": cfg.trainer.devices,
+        "precision": cfg.trainer.precision,
+        "max_epochs": int(cfg.trainer.epochs),
+        "callbacks": callbacks,
+        "logger": False if exploratory_tuning else TensorBoardLogger(save_dir=str(cfg.paths.savedir), name=logger_name),
+        "enable_checkpointing": not exploratory_tuning,
+        "log_every_n_steps": int(cfg.trainer.log_every_n_steps),
+        "num_sanity_val_steps": int(cfg.trainer.num_sanity_val_steps),
+        "check_val_every_n_epoch": int(cfg.trainer.check_val_every_n_epoch),
+        "enable_progress_bar": bool(cfg.trainer.enable_progress_bar),
+        "gradient_clip_val": float(cfg.trainer.gradient_clip_val),
+        "limit_val_batches": cfg.trainer.limit_val_batches,
+        "limit_test_batches": cfg.trainer.get("limit_test_batches", 1.0),
+    }
+    if cfg.trainer.limit_train_batches is not None:
+        trainer_kwargs["limit_train_batches"] = cfg.trainer.limit_train_batches
+    if cfg.trainer.val_check_interval is not None:
+        trainer_kwargs["val_check_interval"] = cfg.trainer.val_check_interval
+    if cfg.trainer.get("max_steps") is not None:
+        trainer_kwargs["max_steps"] = int(cfg.trainer.max_steps)
     trainer = pl.Trainer(**trainer_kwargs)
 
-    continue_from_ckpt = _select(cfg, 'training.resume_from_checkpoint', 'paths.checkpoint', None)
-    if continue_from_ckpt is None:
-        continue_from_ckpt = _select(cfg, 'continue_from_ckpt', default=None)
-    if continue_from_ckpt is not None:
-        continue_from_ckpt = str(continue_from_ckpt).strip()
-        if not continue_from_ckpt:
-            continue_from_ckpt = None
-    if continue_from_ckpt is not None and not os.path.isfile(continue_from_ckpt):
-        raise FileNotFoundError(f"Checkpoint not found: {continue_from_ckpt}")
-
-    if continue_from_ckpt is not None and cfg.get('reset_params', False) is True:
-        print("Resume training state from %s, using new hyperparameters"%(continue_from_ckpt))
-
-        ckpt = torch.load(continue_from_ckpt, map_location='cpu')
-        model.load_state_dict(ckpt['state_dict'], strict=True)
-
-        trainer.fit(model, datamodule=datamodule)
-
-    elif continue_from_ckpt is not None:
-        print("Resume training from %s"%(continue_from_ckpt))
-
-        trainer.fit(model, datamodule=datamodule, ckpt_path=continue_from_ckpt)
-    
+    resume = cfg.training.resume_from_checkpoint
+    if resume is not None and str(resume).strip():
+        resume = str(Path(str(resume)).expanduser().resolve())
+        if not Path(resume).is_file():
+            raise FileNotFoundError(resume)
     else:
-        trainer.fit(model, datamodule=datamodule)
+        resume = None
+    use_cuda = str(cfg.trainer.accelerator).lower() in {"gpu", "cuda"} and torch.cuda.is_available()
+    if use_cuda:
+        torch.cuda.reset_peak_memory_stats()
+    fit_started = time.perf_counter()
+    trainer.fit(model, datamodule=datamodule, ckpt_path=resume)
+    fit_wall_seconds = time.perf_counter() - fit_started
+    validation_metrics = {
+        name: float(value.detach().cpu())
+        for name, value in trainer.callback_metrics.items()
+        if name.startswith("val_") and hasattr(value, "numel") and value.numel() == 1
+    }
 
-    if probe_manifest is not None:
-        probe_manifest.update(
-            {
-                "best_model_path": checkpoint_callback.best_model_path,
-                "best_model_score": (
-                    float(checkpoint_callback.best_model_score.detach().cpu())
-                    if checkpoint_callback.best_model_score is not None
-                    else None
-                ),
-                "last_model_path": getattr(checkpoint_callback, "last_model_path", None),
-                "log_dir": getattr(trainer.logger, "log_dir", None),
-            }
-        )
-        manifest_dir = getattr(trainer.logger, "log_dir", None) or os.getcwd()
-        os.makedirs(manifest_dir, exist_ok=True)
-        manifest_path = os.path.join(manifest_dir, "frozen_probe_manifest.json")
-        with open(manifest_path, "w", encoding="utf-8") as handle:
-            json.dump(probe_manifest, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        print(f"Wrote frozen-probe manifest: {manifest_path}")
+    best_path = ""
+    if loss_checkpoint is not None:
+        best_path = str(Path(loss_checkpoint.best_model_path).resolve()) if loss_checkpoint.best_model_path else ""
+        if not best_path or not Path(best_path).is_file():
+            raise RuntimeError(
+                f"Training did not produce a checkpoint for monitored metric "
+                f"{loss_checkpoint.monitor!r}; refusing to continue."
+            )
+    test_metrics = []
+    if not tuning_enabled and bool(cfg.trainer.get("run_test_after_fit", True)):
+        test_metrics = trainer.test(datamodule=datamodule, ckpt_path=best_path)
+
+    checkpoint_data = torch.load(best_path, map_location="cpu") if best_path else {}
+    best_score = None if loss_checkpoint is None else loss_checkpoint.best_model_score
+    manifest = {
+        "config_name": cfg.get("config_name"),
+        "effective_config": OmegaConf.to_container(cfg, resolve=True),
+        "log_dir": None if trainer.logger is None else str(Path(trainer.logger.log_dir).resolve()),
+        "best_loss_checkpoint": best_path,
+        "checkpoint_epoch": checkpoint_data.get("epoch"),
+        "checkpoint_global_step": checkpoint_data.get("global_step"),
+        "checkpoint_monitor": None if loss_checkpoint is None else str(loss_checkpoint.monitor),
+        "checkpoint_mode": None if loss_checkpoint is None else str(loss_checkpoint.mode),
+        "checkpoint_score": None if best_score is None else float(best_score.detach().cpu()),
+        "split_cache_path": datamodule.split_cache_path,
+        "split_metadata": datamodule.split_metadata,
+        "loss_weights": {
+            "edge_weight": float(cfg.loss.edge_weight),
+            "hyperedge_weight": float(cfg.loss.hyperedge_weight),
+            "classification_weight": float(cfg.loss.classification_weight),
+        },
+        "classification_enabled": classification_enabled,
+        "reconstruction_enabled": reconstruction_enabled,
+        "performance": {
+            "validation_role_ranking_enabled": bool(
+                validation_diagnostics_cfg.get("role_ranking_enabled", False)
+            ),
+            "validation_classification_metrics_enabled": bool(
+                validation_diagnostics_cfg.get("classification_metrics_enabled", False)
+            ),
+            "validation_diagnostics_every_n_epochs": int(
+                validation_diagnostics_cfg.get("every_n_epochs", 1)
+            ),
+            "validation_diagnostics_max_events": validation_diagnostics_cfg.get("max_events"),
+            "verify_source_identity_per_event": bool(
+                performance_cfg.get("verify_source_identity_per_event", False)
+            ),
+            "source_identity_setup_samples": int(
+                performance_cfg.get("source_identity_setup_samples", 32)
+            ),
+            "validate_candidate_event_assignment": bool(
+                performance_cfg.get("validate_candidate_event_assignment", False)
+            ),
+            "optimizer_foreach": cfg.optimizer.get("foreach"),
+            "optimizer_fused": bool(cfg.optimizer.get("fused", False)),
+        },
+        "test_metrics": test_metrics,
+        "validation_metrics": validation_metrics,
+        "runtime": {
+            "fit_wall_seconds": fit_wall_seconds,
+            "training_events_seen": model.runtime_training_shapes["events"],
+            "training_events_per_second": (
+                model.runtime_training_shapes["events"] / fit_wall_seconds if fit_wall_seconds else None
+            ),
+            "training_shapes": model.runtime_training_shapes,
+            "batch_size": int(cfg.dataset.batch_size),
+            "gradients_finite": bool(model.gradients_finite),
+            "peak_host_rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0,
+            "peak_gpu_memory_mb": (
+                torch.cuda.max_memory_allocated() / (1024.0 * 1024.0) if use_cuda else None
+            ),
+        },
+    }
+    requested_manifest = cfg.paths.get("training_manifest")
+    if exploratory_tuning and not requested_manifest:
+        requested_manifest = Path(str(tuning_cfg.output_dir)) / "exploratory_training_manifest.json"
+    manifest_path = (
+        Path(str(requested_manifest)).expanduser()
+        if requested_manifest is not None and str(requested_manifest).strip()
+        else Path(trainer.logger.log_dir) / "training_manifest.json"
+    )
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"Wrote training manifest: {manifest_path.resolve()}")
+
+    if probe_manifest is not None and trainer.logger is not None:
+        path = Path(trainer.logger.log_dir) / "frozen_probe_manifest.json"
+        path.write_text(json.dumps(probe_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     if not return_metrics:
         return None
-
     metrics = {
-        key: _metric_to_float(value)
-        for key, value in trainer.callback_metrics.items()
+        name: float(value.detach().cpu()) if hasattr(value, "numel") and value.numel() == 1 else value
+        for name, value in trainer.callback_metrics.items()
     }
-    metrics.update(
-        {
-            "best_model_path": checkpoint_callback.best_model_path,
-            "best_model_score": _metric_to_float(checkpoint_callback.best_model_score),
-            "last_model_path": getattr(checkpoint_callback, "last_model_path", None),
-            "log_dir": getattr(trainer.logger, "log_dir", None),
-        }
-    )
-    if "val_loss" not in metrics or metrics["val_loss"] is None:
-        raise RuntimeError("Training completed but `val_loss` was not found in trainer.callback_metrics.")
+    metrics["checkpoint_paths"] = [best_path]
+    metrics["log_dir"] = None if trainer.logger is None else trainer.logger.log_dir
+    metrics["test_array_loaded"] = False if tuning_enabled else None
     return metrics
 
 
@@ -531,22 +418,17 @@ def Train(cfg: DictConfig) -> None:
 
 
 def setup_torch_runtime() -> None:
-    torch.set_float32_matmul_precision('medium')
-
-    # Required for loading PyG Data objects with PyTorch 2.6+ safe unpickling.
+    torch.set_float32_matmul_precision("medium")
     if version.parse(torch.__version__) >= version.parse("2.6"):
-        torch.serialization.add_safe_globals([
-            torch_geometric.data.data.DataEdgeAttr,
-            torch_geometric.data.data.DataTensorAttr,
-            torch_geometric.data.storage.GlobalStorage,
-        ])
-
-    import tqdm
-    import multiprocessing
-    tqdm.tqdm.monitor_interval = 0
-    tqdm.tqdm.set_lock(multiprocessing.RLock())
+        torch.serialization.add_safe_globals(
+            [
+                torch_geometric.data.data.DataEdgeAttr,
+                torch_geometric.data.data.DataTensorAttr,
+                torch_geometric.data.storage.GlobalStorage,
+            ]
+        )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     setup_torch_runtime()
     Train()

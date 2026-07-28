@@ -29,10 +29,6 @@ def _sigmoid(x):
     return torch.sigmoid(x)
 
 
-def _normalize(x):
-    return (x - x.mean()) / (x.std() + 1e-6)
-
-
 def _abs(x):
     return torch.abs(x)
 
@@ -67,7 +63,6 @@ TRANSFORM_REGISTRY = {
     'torch.exp(x)': _exp,
     'sigmoid': _sigmoid,
     'torch.sigmoid(x)': _sigmoid,
-    'normalize': _normalize,
     'abs': _abs,
     'torch.abs(x)': _abs,
     'negate': _negate,

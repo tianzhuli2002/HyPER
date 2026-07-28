@@ -724,8 +724,10 @@ def ttH_single_lep(
         "reco_strategy",
     ]
 
-    if (classification is None or bool(classification)) and "HyPER_CLS_RAW" in results.columns:
-        columns_to_return.append("HyPER_CLS_RAW")
+    if bool(classification):
+        if "HyPER_CLS_PROB" not in results.columns:
+            raise KeyError("classification=True requires HyPER_CLS_PROB in prediction output.")
+        columns_to_return.append("HyPER_CLS_PROB")
 
     return results[columns_to_return]
 

@@ -2,12 +2,19 @@ defaults:
   - ttH_SL_typed
   - _self_
 
+config_name: ttH_SL_reconstruction_only
+
 classification:
   enabled: false
-  loss_weight: 0.0
 
 reconstruction:
   enabled: true
 
+loss:
+  edge_weight: 0.5
+  hyperedge_weight: 0.5
+  classification_weight: 0.0
+
 predicting:
   output_mode: selected
+  overwrite: false

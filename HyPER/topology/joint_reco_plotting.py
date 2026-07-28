@@ -40,7 +40,9 @@ def _binary_labels(values: pd.Series | np.ndarray) -> np.ndarray:
     labels = pd.to_numeric(pd.Series(np.asarray(values).reshape(-1)), errors="coerce").to_numpy(dtype=float)
     if not np.all(np.isfinite(labels)):
         raise ValueError("Binary event labels contain non-finite values.")
-    return np.where(labels > 0.5, 1, 0).astype(int)
+    if not np.isin(np.unique(labels), [0, 1]).all():
+        raise ValueError(f"Event labels must be exactly 0/1, found {np.unique(labels).tolist()}.")
+    return labels.astype(int)
 
 
 def h5_label_candidates(label_field: str | None = None) -> tuple[str, ...]:
@@ -116,23 +118,24 @@ def resolve_event_labels(
         n = len(prediction_labels)
         if h5_labels is not None:
             h5_slice = np.asarray(h5_labels[:n], dtype=int)
-            disagreements = int(np.sum(prediction_labels[: len(h5_slice)] != h5_slice))
+            if len(h5_slice) != n:
+                raise ValueError("Prediction and H5 event-label arrays have different lengths.")
+            disagreements = int(np.sum(prediction_labels != h5_slice))
             if disagreements:
-                frac = disagreements / max(1, len(h5_slice))
-                message = (
+                raise ValueError(
                     f"Prediction labels from {prediction_source} disagree with H5 labels "
                     f"from {h5_label_source} for {disagreements}/{len(h5_slice)} rows"
                     f"{' in ' + context if context else ''}."
                 )
-                if frac > 0.01:
-                    raise ValueError(message)
-                warnings_list.append(message)
             return prediction_labels, prediction_source
         return prediction_labels, prediction_source
 
     if h5_labels is not None:
         return h5_labels, h5_label_source
-    return None, None
+    raise ValueError(
+        "No explicit event-level classification label is available in the prediction or H5 input. "
+        "Reconstruction matching is never a signal/background-label fallback."
+    )
 
 
 def category_masks(evaluation: pd.DataFrame, min_jets: int | None = None) -> dict[str, np.ndarray]:
@@ -269,10 +272,7 @@ def write_category_diagnostics(
             va="bottom",
         )
     plt.ylabel("Rows")
-    title = "Reconstruction category counts"
-    if summary.get("fallback_fully_matched_used"):
-        title += " (fallback labels)"
-    plt.title(title)
+    plt.title("Reconstruction category counts")
     plt.xticks(rotation=12, ha="right")
     plt.tight_layout()
     save_figure(output_dir, "category_counts", formats)

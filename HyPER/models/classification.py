@@ -1,34 +1,7 @@
 import torch
-import math
 
-from torch.nn import Module, Sequential as Seq, Linear, ReLU, Dropout, Parameter, init
-from torch.nn.functional import relu
+from torch.nn import Module, Sequential as Seq, Linear, ReLU, Dropout
 from torch_geometric.utils import scatter
-from HyPER.utils.custom_scatter import custom_scatter
-
-# class classificationModel(Module):
-#     r"""Classification MLP Model.
-
-#     Args:
-#         n_feats_out (int): number of node features of the output graph.
-#         message_feats (int, optional): number of intermediate features. (default :obj:`int`=32)
-#         dropout (float, optional): probability of an element to be zeroed. (default :obj:`float`=0.01)
-
-#     :rtype: :class:`Tuple[Tensor,Tensor]`
-#     """
-#     def __init__(self, n_feats_out, contraction_feats: int=64, message_feats: int=32, dropout=0.01):
-#         super().__init__()
-#         self.message_feats    = message_feats
-#         self.contraction_feats = contraction_feats
-#         self.mlp_class  = Seq(Linear(message_feats*5+contraction_feats*2, message_feats+contraction_feats),
-#                           ReLU(),
-#                           Dropout(p=dropout),
-#                           Linear(message_feats+contraction_feats, message_feats+contraction_feats),
-#                           ReLU(),
-#                           Dropout(p=dropout),
-#                           Linear(message_feats+contraction_feats, n_feats_out),
-#                           Sigmoid())
-#         self.reset_parameters()
 
 class classificationModel(Module):
     r"""Event-level S/B classification head using learned HyPER embeddings.
@@ -87,8 +60,6 @@ class classificationModel(Module):
             [N_events, n_feats_out] raw logits
         """
         
-        # Prefer feat_U to define the number of events, because global features
-        # are one per graph/event and are guaranteed to exist for every event.
         num_events = feat_U.size(0)
 
         # Hyperedge-level summaries: candidate topology/reconstruction structure.
@@ -119,7 +90,6 @@ class classificationModel(Module):
             dim=1,
         ).float()
 
-#### SOME GUARDRAILS TO CATCH SHAPE MISMATCHES EARLY ####
         if feat_U.dim() != 2:
             raise ValueError(f"Expected feat_U shape [N_events, F], got {tuple(feat_U.shape)}")
         if feat_N.dim() != 2 or feat_GE.dim() != 2 or feat_HE.dim() != 2:

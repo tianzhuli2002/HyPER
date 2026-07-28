@@ -55,7 +55,7 @@ def _classification_enabled(
     Priority:
       1. Explicit `classification` argument if provided.
       2. `classification.enabled` from config.
-      3. Default True for backwards compatibility.
+      3. Default false when no explicit mode/config is provided.
     """
     if classification is not None:
         return bool(classification)
@@ -63,7 +63,7 @@ def _classification_enabled(
     cfg = _load_config(config)
 
     return bool(
-        cfg.get("classification", {}).get("enabled", True)
+        cfg.get("classification", {}).get("enabled", False)
     )
 
 
@@ -75,14 +75,14 @@ def _add_cls_column_if_enabled(
     if not classification_enabled:
         return columns_to_return
 
-    if "HyPER_CLS_RAW" not in results.columns:
+    if "HyPER_CLS_PROB" not in results.columns:
         raise KeyError(
-            "classification.enabled is true, but 'HyPER_CLS_RAW' is missing from "
+            "classification.enabled is true, but 'HyPER_CLS_PROB' is missing from "
             "the HyPER outputs. Either run prediction with the classification head "
             "enabled or set classification.enabled: false in the config."
         )
 
-    return columns_to_return + ["HyPER_CLS_RAW"]
+    return columns_to_return + ["HyPER_CLS_PROB"]
 
 
 def _get_best_edge_in_pattern(

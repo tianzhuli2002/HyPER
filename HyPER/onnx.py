@@ -1,8 +1,6 @@
-import os
-import yaml
+from pathlib import Path
 import hydra
 import torch
-import warnings
 
 from omegaconf import DictConfig, OmegaConf
 from torch.export.dynamic_shapes import Dim
@@ -10,15 +8,24 @@ from torch.export.dynamic_shapes import Dim
 from HyPER.models import HyPERModel
 
 
-def _select(cfg: DictConfig, path: str, legacy: str = None, default=None):
-    value = OmegaConf.select(cfg, path, default=None)
-    if value is not None:
-        return value
-    if legacy is not None:
-        value = OmegaConf.select(cfg, legacy, default=None)
-        if value is not None:
-            return value
-    return default
+def _resolve_checkpoint(selector: str | None, model_directory: str | None) -> Path:
+    if selector is None or not str(selector).strip():
+        raise ValueError("onnx_export.checkpoint must be an explicit path or selector 'best'/'last'.")
+    direct = Path(str(selector)).expanduser()
+    if direct.is_file():
+        return direct.resolve()
+    if selector not in {"best", "last"} or not model_directory:
+        raise ValueError("ONNX checkpoint must be an existing path, or best/last with model_directory.")
+    directory = Path(str(model_directory)).expanduser() / "checkpoints"
+    if selector == "last":
+        path = directory / "last.ckpt"
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        return path.resolve()
+    candidates = list(directory.glob("best-total*.ckpt"))
+    if len(candidates) != 1:
+        raise RuntimeError(f"Expected exactly one best-total checkpoint in {directory}, found {len(candidates)}.")
+    return candidates[0].resolve()
 
 
 class _ONNXOutputAdapter(torch.nn.Module):
@@ -27,21 +34,22 @@ class _ONNXOutputAdapter(torch.nn.Module):
         self.model = model
         self.include_classification = bool(include_classification)
 
-    def _reco_score(self, logits):
-        if getattr(self.model, "target_encoding", "binary") == "typed":
-            probs = torch.softmax(logits, dim=1)
-            return 1.0 - probs[:, -1:]
-        return torch.sigmoid(logits)
+    @staticmethod
+    def _reco_score(logits):
+        return 1.0 - torch.softmax(logits, dim=1)[:, -1:]
 
     def forward(self, x, edge_index, edge_attr, u, batch, hyperedge_index, hyperedge_index_batch):
         p_hyper, batch_hyperedge, p_edge, cls_out = self.model(
             x, edge_index, edge_attr, u, batch, hyperedge_index, hyperedge_index_batch
         )
-        p_hyper = self._reco_score(p_hyper)
-        p_edge = self._reco_score(p_edge)
-        if self.include_classification:
+        if self.model.reconstruction_enabled:
+            p_hyper = self._reco_score(p_hyper)
+            p_edge = self._reco_score(p_edge)
+        if self.model.reconstruction_enabled and self.include_classification:
             return p_hyper, batch_hyperedge, p_edge, cls_out
-        return p_hyper, batch_hyperedge, p_edge
+        if self.model.reconstruction_enabled:
+            return p_hyper, batch_hyperedge, p_edge
+        return cls_out
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="default")
@@ -54,37 +62,24 @@ def Onnx(cfg : DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
 
     # Map location
-    predict_with = _select(cfg, 'onnx_export.accelerator', 'predict_with', 'cpu')
+    predict_with = cfg.onnx_export.accelerator
     map_location = torch.device('cuda') if str(predict_with).lower() == "gpu" else torch.device('cpu')
 
     # Load checkpoints
-    convert_model = _select(cfg, 'onnx_export.model_directory', 'convert_model', None)
-    assert convert_model is not None, "No model directory is provided in `convert_model`/`onnx_export.model_directory`. Abort!"
-    ckpt_file = [filename for filename in os.listdir(os.path.join(convert_model, "checkpoints")) if filename.startswith("epoch")]
-    if len(ckpt_file) > 1:
-        warnings.warn(f"There are multiple .ckpt files listed in {convert_model}, using the last checkpoint.")
-        ckpt_file = os.path.join(convert_model, "checkpoints", ckpt_file[-1])
-    if len(ckpt_file) == 0:
-        raise RuntimeError(f"No checkpoint files have been found in {convert_model}.")
-    ckpt_file = os.path.join(convert_model, "checkpoints", ckpt_file[0])
-
-    hparams_file = os.path.join(convert_model, "hparams.yaml")
-    assert os.path.isfile(hparams_file), f"`hparams.ymal` is not found in {convert_model}."
-    with open(hparams_file) as stream:
-        hparams = yaml.safe_load(stream)
-
-    model = HyPERModel.load_from_checkpoint(
-        checkpoint_path = ckpt_file,
-        hparams_file = hparams_file,
-        map_location = map_location,
-    )
+    ckpt_file = _resolve_checkpoint(cfg.onnx_export.checkpoint, cfg.onnx_export.model_directory)
+    model = HyPERModel.load_from_checkpoint(str(ckpt_file), map_location=map_location)
 
     model.eval()
     classification_enabled = bool(getattr(model, 'classification_enabled', True))
     export_model = _ONNXOutputAdapter(model, include_classification=classification_enabled)
-    output_names = ['hyperedge_prime','batch_hyperedge','edge_prime','classification_score']
-    if not classification_enabled:
+    if model.reconstruction_enabled and classification_enabled:
+        output_names = ['hyperedge_score', 'batch_hyperedge', 'edge_score', 'classification_logit']
+    elif model.reconstruction_enabled:
         output_names = ['hyperedge_prime','batch_hyperedge','edge_prime']
+    else:
+        output_names = ['classification_logit']
+
+    hparams = model.hparams
 
     onnx_program = torch.onnx.export(
         export_model,
@@ -111,7 +106,7 @@ def Onnx(cfg : DictConfig) -> None:
     )
 
     onnx_program.optimize()
-    onnx_program.save(_select(cfg, 'onnx_export.save_as', 'onnx_output', 'HyPER.onnx'))
+    onnx_program.save(str(cfg.onnx_export.save_as))
 
 if __name__ == "__main__":
     Onnx()

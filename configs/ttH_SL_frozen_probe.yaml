@@ -4,18 +4,23 @@ defaults:
 
 classification:
   enabled: true
-  loss_weight: 1.0
 
 reconstruction:
   enabled: false
 
+loss:
+  edge_weight: 0.0
+  hyperedge_weight: 0.0
+  classification_weight: 1.0
+
 predicting:
   output_mode: classifier
+  overwrite: false
 
 probe:
   enabled: true
   pretrained_model_directory: null
-  pretrained_checkpoint_path: null
+  pretrained_checkpoint: null
   trainable_parameter_prefixes:
     - Classification.
 

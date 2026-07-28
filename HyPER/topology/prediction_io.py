@@ -14,7 +14,7 @@ import pandas as pd
 
 
 LOGGER = logging.getLogger(__name__)
-SOURCE_INDEX_COLUMNS = ("HYPER_SOURCE_INDEX", "source_event_index")
+SOURCE_INDEX_COLUMNS = ("source_event_index",)
 
 
 def source_index_column(frame: pd.DataFrame) -> str | None:
@@ -32,7 +32,7 @@ def coerce_source_indices(
     column = source_index_column(frame)
     if column is None:
         raise ValueError(
-            "Length mismatch and no HYPER_SOURCE_INDEX available. Re-run prediction "
+            "No source_event_index column is available. Re-run prediction "
             "with source-index export enabled, or predict the full H5."
         )
 

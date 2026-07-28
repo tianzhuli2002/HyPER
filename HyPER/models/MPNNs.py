@@ -1,8 +1,8 @@
-from torch.nn import Module, Sigmoid
+from torch.nn import Module
 from torch_geometric.nn import MetaLayer
 from typing import Optional
 
-from HyPER.models import EdgeModel, NodeModel, GlobalModel
+from .messagePassing import EdgeModel, NodeModel, GlobalModel
 
 
 class MPNNs(Module):
@@ -17,9 +17,6 @@ class MPNNs(Module):
         global_out_channels (int, optional): number of global features of output graph.
         message_feats (int, optional): number of intermediate features. (default :obj:`int`=32)
         dropout (float, optional): probability of an element to be zeroed. (default :obj:`float`=0.01)
-        activation(callable, optional): activation function to apply. (default :obj:`callable`=torch.nn.Sigmoid)
-        p_out(str, optional): the object which the `activation` is applied on. (default :obj:`None`)
-
     :rtype: :class:`Tuple[torch.Tensor,torch.Tensor]
     """
     def __init__(
@@ -32,8 +29,6 @@ class MPNNs(Module):
             global_out_channels: Optional[int] = 1,
             message_feats: Optional[int] = 32,
             dropout: Optional[float] = 0.01,
-            activation: Optional[callable] = Sigmoid(),
-            p_out: Optional[str] = None    
         ) -> None:
         super(MPNNs, self).__init__()
 
@@ -43,23 +38,10 @@ class MPNNs(Module):
             GlobalModel(node_in_channels=node_out_channels, global_in_channels=global_in_channels, global_out_channels=global_out_channels, message_feats=message_feats, dropout=dropout)
         )
 
-        self.activation = activation
-        self.p_out = p_out
-
     def reset_parameters(self):
         for layer in self.MPNNBlock.children():
             if hasattr(layer, 'reset_parameters'):
                 layer.reset_parameters()
 
     def forward(self, x, edge_index, edge_attr, u, batch):
-        x_new, edge_attr_new, u_new = self.MPNNBlock(x, edge_index, edge_attr, u, batch)
-
-        if self.p_out is not None:
-            if self.p_out == 'node':
-                return self.activation(x_new), edge_attr_new, u_new
-            if self.p_out == 'edge':
-                return x_new, self.activation(edge_attr_new), u_new
-            if self.p_out == 'global':
-                return x_new, edge_attr_new, self.activation(u_new)
-        else:
-            return x_new, edge_attr_new, u_new
+        return self.MPNNBlock(x, edge_index, edge_attr, u, batch)

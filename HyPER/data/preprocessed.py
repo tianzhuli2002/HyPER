@@ -3,10 +3,8 @@ import sys
 import math
 import h5py
 import pickle
-import base64
 import json
 import hashlib
-import warnings
 import time
 from copy import deepcopy
 from typing import Optional
@@ -21,20 +19,17 @@ from .dataset import HyPERDataset
 
 
 DB_FORMAT = "pickle_vlen_uint8_v1"
+DB_SCHEMA_VERSION = 2
 
 
 def _decode_graph_payload(payload):
-    """Decode new raw-pickle vlen uint8 payloads and legacy base64 strings."""
-    if isinstance(payload, np.ndarray):
-        return pickle.loads(payload.tobytes())
-    if isinstance(payload, str):
-        payload = payload.encode("utf-8")
-    if isinstance(payload, bytes):
-        try:
-            return pickle.loads(payload)
-        except Exception:
-            return pickle.loads(base64.b64decode(payload), encoding="utf-8")
-    raise TypeError(f"Unsupported graph payload type: {type(payload)}")
+    """Decode the single supported raw-pickle vlen uint8 payload format."""
+    if not isinstance(payload, np.ndarray) or payload.dtype != np.uint8:
+        raise TypeError(
+            f"Expected a uint8 NumPy graph payload for {DB_FORMAT}, got {type(payload)} "
+            f"with dtype={getattr(payload, 'dtype', None)}. Rebuild the graph database."
+        )
+    return pickle.loads(memoryview(payload))
 
 
 class PreprocessingWrite(IterableDataset):
@@ -62,7 +57,7 @@ class PreprocessingWrite(IterableDataset):
         self.preprocess_chunk_size = max(1, int(preprocess_chunk_size))
         self.debug = os.getenv("HYPER_DB_DEBUG", "0") == "1"
 
-        self.master = HyPERDataset(root=root, name=name, training=training, force_reload=False, config=self.config)
+        self.master = HyPERDataset(root=root, name=name, config=self.config)
         self.size = len(self.master)
 
     @staticmethod
@@ -184,8 +179,7 @@ class PreprocessingWrite(IterableDataset):
                 f"avg_edges={total_edges / processed:.1f} "
                 f"avg_hyperedges={total_hyperedges / processed:.1f} "
                 f"avg_payload_bytes={total_bytes / processed:.1f} "
-                f"target_encoding={getattr(self.master, 'target_encoding', 'binary')} "
-                f"vectorized_chunks={getattr(self.master, 'use_vectorized_chunks', False)} "
+                f"target_encoding={self.master.target_encoding} "
                 f"chunk_size={chunk_size} "
                 f"rebuilt=True db_part={db_path}",
                 file=sys.stderr,
@@ -234,9 +228,11 @@ class GraphDB():
             os.remove(self.manifest_path)
 
         if os.path.exists(self.db_path) and not self._is_valid_db(self.db_path):
-            os.remove(self.db_path)
-            if os.path.exists(self.manifest_path):
-                os.remove(self.manifest_path)
+            raise RuntimeError(
+                f"Existing graph DB is unreadable or lacks a Graphs dataset: {self.db_path}. "
+                "HyPER will not delete it automatically; rebuild intentionally in a fresh path "
+                "or with dataset.force_reload=true."
+            )
 
         if os.path.exists(self.db_path):
             self._validate_manifest()
@@ -268,13 +264,12 @@ class GraphDB():
                 self._release_build_lock(lock_fd)
         else:
             print(f"Using existing HyPER graph database {self.db_path}.")
-            master = HyPERDataset(root=root, name=name, training=training, force_reload=False, config=self.config)
+            master = HyPERDataset(root=root, name=name, config=self.config)
             self.dataset_vars = vars(master)
             print(
                 "[HYPER_DB_PROFILE] "
                 f"events=reused total_time=0.000s events_per_s=inf "
-                f"target_encoding={getattr(master, 'target_encoding', 'binary')} "
-                f"vectorized_chunks={getattr(master, 'use_vectorized_chunks', False)} "
+                f"target_encoding={master.target_encoding} "
                 f"rebuilt=False db_path={self.db_path}",
                 file=sys.stderr,
                 flush=True,
@@ -402,6 +397,7 @@ class GraphDB():
     def _write_manifest(self) -> None:
         manifest = {
             "name": self.name,
+            "schema_version": DB_SCHEMA_VERSION,
             "config_hash": self.config_hash,
             "db_format": DB_FORMAT,
             "feature_layout": self.feature_layout,
@@ -411,13 +407,10 @@ class GraphDB():
 
     def _validate_manifest(self) -> None:
         if not os.path.exists(self.manifest_path):
-            warnings.warn(
-                f"Using existing graph DB without a manifest: {self.db_path}. "
-                "If graph-construction config changed since it was built, rebuild with "
-                "`dataset.force_reload=true`.",
-                UserWarning,
+            raise RuntimeError(
+                f"Existing graph DB has no manifest and cannot be validated: {self.db_path}. "
+                "Rebuild intentionally with `dataset.force_reload=true`."
             )
-            return
 
         with open(self.manifest_path, encoding="utf-8") as f:
             manifest = json.load(f)
@@ -427,18 +420,17 @@ class GraphDB():
                 f"Existing graph DB manifest does not match the current graph config: {self.db_path}. "
                 "Rebuild intentionally with `dataset.force_reload=true` or choose a fresh dataset/cache name."
             )
-        stored_format = manifest.get("db_format")
-        if stored_format is None:
-            warnings.warn(
-                f"Using existing graph DB manifest without a db_format field: {self.db_path}. "
-                "Old base64 graph DBs remain readable, but new DBs use raw pickle vlen uint8.",
-                UserWarning,
+        stored_schema = manifest.get("schema_version")
+        if stored_schema != DB_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Existing graph DB schema {stored_schema!r} is incompatible; expected "
+                f"{DB_SCHEMA_VERSION}: {self.db_path}. Build into a fresh path."
             )
-        elif stored_format != DB_FORMAT:
-            warnings.warn(
-                f"Using graph DB with db_format={stored_format!r}; expected {DB_FORMAT!r}. "
-                "Attempting backwards-compatible graph payload decoding.",
-                UserWarning,
+        stored_format = manifest.get("db_format")
+        if stored_format != DB_FORMAT:
+            raise RuntimeError(
+                f"Existing graph DB format {stored_format!r} is unsupported; expected {DB_FORMAT!r}: "
+                f"{self.db_path}. Rebuild intentionally with `dataset.force_reload=true`."
             )
 
     def __len__(self):
@@ -446,6 +438,10 @@ class GraphDB():
 
     def __getitem__(self, index):
         return _decode_graph_payload(self.db[index])
+
+    def __getitems__(self, indices):
+        """Decode one DataLoader batch while preserving the requested order."""
+        return [_decode_graph_payload(self.db[int(index)]) for index in indices]
 
     @property
     def db(self):
@@ -517,6 +513,9 @@ class HyPEROnDiskDataset(Dataset):
 
     def __getitem__(self, index):
         return self.db[index]
+
+    def __getitems__(self, indices):
+        return self.db.__getitems__(indices)
 
     def __len__(self):
         return self.db.__len__()

@@ -1,12 +1,9 @@
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Sequence
-from warnings import warn
 from copy import deepcopy
 from os import path as osp
 from itertools import combinations, permutations
-import time
-import sys
-import os
+from warnings import warn
 
 import math
 import h5py
@@ -20,9 +17,19 @@ from torch import Tensor
 from torch_geometric.data import Data, Dataset
 
 from .transform import TransformFeatures
-from .filter import TargetConnectivityFilter
 from .edge_features import EDGE_FEATURE_TRANSFORMS
 from .transforms import TRANSFORM_REGISTRY
+from .splits import decode_classification_labels
+from HyPER.models.loss import reconstruction_active_from_typed_targets
+
+
+class HyPERData(Data):
+    """PyG event with an intrinsic, non-offset H5 source row."""
+
+    def __inc__(self, key, value, *args, **kwargs):
+        if key == "source_event_index":
+            return 0
+        return super().__inc__(key, value, *args, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -53,34 +60,15 @@ class HyPERDataset(Dataset):
         root: str,
         name: str,
         transform: Optional[Callable] = None,
-        pre_transform: Optional[Callable] = None,
-        pre_filter: Optional[Callable] = None,
-        training: bool = True,
-        force_reload: bool = False,
-        cache_dir: Optional[str] = None,
         config: Optional[dict] = None,
-        vectorized_chunks: Optional[bool] = None,
     ) -> None:
 
         self.root = root
         self.name = name
         self.transform = transform
-        self.pre_transform = pre_transform
-        self.pre_filter = pre_filter
-        self._train_mode = training
-        if vectorized_chunks is None:
-            vectorized_chunks = self._env_bool("HYPER_VECTORIZE_CHUNKS", True)
-        self.use_vectorized_chunks = bool(vectorized_chunks)
         self._edge_template_cache: dict[int, torch.Tensor] = {}
         self._hyperedge_template_cache: dict[tuple[int, int], torch.Tensor] = {}
 
-        if cache_dir is not None:
-            warn("`cache_dir` is deprecated; HyPERDataset no longer writes per-event .pt caches.", DeprecationWarning)
-        if force_reload:
-            warn("`force_reload` is handled by HyPEROnDiskDataset for .db preprocessing.", UserWarning)
-
-        # Parse graph-construction config. New unified Hydra configs can pass
-        # embedded input/target sections; old workflows still use root/config.yaml.
         parsed_inputs = self._resolve_graph_config(root=self.root, config=config)
         self.node_input_names = list(parsed_inputs['input']['nodes'].keys())
         self.input_id = parsed_inputs['input']['nodes']
@@ -117,9 +105,9 @@ class HyPERDataset(Dataset):
         self._invalid_truth_label_warning_count = 0
 
         target_cfg = parsed_inputs.get('target', {})
-        self.target_encoding = str(target_cfg.get("encoding", "binary")).strip().lower()
-        if self.target_encoding not in {"binary", "typed"}:
-            raise ValueError("target.encoding must be either 'binary' or 'typed'.")
+        self.target_encoding = str(target_cfg.get("encoding", "")).strip().lower()
+        if self.target_encoding != "typed":
+            raise ValueError("target.encoding must be explicitly set to 'typed'.")
 
         edge_target_cfg = target_cfg.get('edge', {}) or {}
         hyperedge_target_cfg = target_cfg.get('hyperedge', {}) or {}
@@ -128,12 +116,17 @@ class HyPERDataset(Dataset):
         self.edge_targets = [self._normalise_target_group(v) for v in edge_target_cfg.values()]
         self.hyperedge_targets = [self._normalise_target_group(v) for v in hyperedge_target_cfg.values()]
         self.hyperedge_order = len(self.hyperedge_targets[0][0]) if self.hyperedge_targets and self.hyperedge_targets[0] else 2
-        self.hyperedge_ordered = bool(target_cfg.get("hyperedge_ordered", False))
+        if "hyperedge_ordered" in target_cfg:
+            raise ValueError(
+                "target.hyperedge_ordered is no longer supported; hyperedges are always unordered."
+            )
         self.target_edge_ids, self.target_hyperedge_ids = self.assign_target_ids()
-        self.edge_out_channels = len(self.edge_target_names) + 1 if self.target_encoding == "typed" else 1
-        self.hyperedge_out_channels = len(self.hyperedge_target_names) + 1 if self.target_encoding == "typed" else 1
-        self.edge_background_class = self.edge_out_channels - 1 if self.target_encoding == "typed" else None
-        self.hyperedge_background_class = self.hyperedge_out_channels - 1 if self.target_encoding == "typed" else None
+        self.edge_class_names = self.edge_target_names + ["background"]
+        self.hyperedge_class_names = self.hyperedge_target_names + ["background"]
+        self.edge_out_channels = len(self.edge_class_names)
+        self.hyperedge_out_channels = len(self.hyperedge_class_names)
+        self.edge_background_class = self.edge_out_channels - 1
+        self.hyperedge_background_class = self.hyperedge_out_channels - 1
 
         # 4-vector setup. The model-facing node feature list may use periodic
         # sin/cos phi inputs, but graph construction still needs an internal phi.
@@ -159,12 +152,9 @@ class HyPERDataset(Dataset):
         # Edge features
         self.edge_features_to_use = self.parse_edge_features(parsed_inputs)
         self.edge_feature_names = list(self.edge_features_to_use.keys())
-        self.edge_directionality = str(
-            parsed_inputs["input"].get("edge_directionality", "undirected")
-        ).strip().lower()
-        if self.edge_directionality not in {"undirected", "directed"}:
+        if "edge_directionality" in parsed_inputs["input"]:
             raise ValueError(
-                "input.edge_directionality must be either 'undirected' or 'directed'."
+                "input.edge_directionality is no longer supported; graph edges are always fully directed."
             )
 
         # Node/global transforms
@@ -206,14 +196,10 @@ class HyPERDataset(Dataset):
         if self.transform is None:
             self.transform = self._transforms
 
-        # Filter
         if 'filter' in parsed_inputs:
-            self._pre_filter = TargetConnectivityFilter(
-                num_edge_targets=parsed_inputs['filter']['num_edges'],
-                num_hyperedge_targets=parsed_inputs['filter']['num_hyperedge']
+            raise ValueError(
+                "Dataset filtering is no longer supported. Select explicit source indices before splitting."
             )
-        else:
-            self._pre_filter = None
 
         # HDF5 path (do NOT keep a global open handle - open per-worker)
         self._h5_path = osp.join(root, "raw", f"{name}.h5")
@@ -222,17 +208,17 @@ class HyPERDataset(Dataset):
         with h5py.File(self._h5_path, 'r') as _f:
             self._validate_h5_feature_fields(_f["INPUTS"])
             self._num_events = len(_f["INPUTS"]["GLOBAL"])
+            if "LABELS" not in _f or "GLOBAL" not in _f["LABELS"]:
+                raise KeyError(
+                    f"{self._h5_path} has no explicit event label at LABELS/GLOBAL. "
+                    "Reconstruction matching is never a classification-label fallback."
+                )
+            self._validate_global_labels(_f["LABELS"]["GLOBAL"][:])
         self.file = None
 
         # Precompute target sets
         self._target_edge_set = set(tuple(t) for t in self._flatten_target_ids(self.target_edge_ids)) if self.target_edge_ids else set()
         self._target_hyperedge_set = set(tuple(t) for t in self._flatten_target_ids(self.target_hyperedge_ids)) if self.target_hyperedge_ids else set()
-
-        # === DEBUG: Log dataset creation ===
-        if os.getenv("HYPER_DEBUG", "0") == "1":
-            print(f"[DEBUG] HyPERDataset created: {self.name}, {self._num_events} events, PID={os.getpid()}",
-                  file=sys.stderr, flush=True)
-
 
     def __len__(self) -> int:
         return self._num_events
@@ -241,26 +227,11 @@ class HyPERDataset(Dataset):
     def __getitem__(self, idx: int) -> Data:
         """Load and process a single event on demand."""
 
-        # === DEBUG: Progress logging (every 1000 events) ===
-        if os.getenv("HYPER_DEBUG", "0") == "1" and idx % 1000 == 0:
-            t0 = time.time()
-            print(f"[DATA] Event {idx}/{len(self)} - PID={os.getpid()} - Time={t0:.0f}",
-                  file=sys.stderr, flush=True)
-
-        t0 = time.time()
         data = self.processing(idx)
-        t_process = time.time() - t0
 
         # Apply filters/transforms
-        if self._pre_filter and not self._pre_filter(data):
-            return self.__getitem__((idx + 1) % len(self))
         if self.transform:
             data = self.transform(data)
-
-        if os.getenv("HYPER_DEBUG", "0") == "1" and idx % 1000 == 0:
-            t_total = time.time() - t0
-            print(f"[DATA] Processed {idx}: process={t_process:.2f}s, total={t_total:.2f}s",
-                  file=sys.stderr, flush=True)
 
         return data
 
@@ -268,23 +239,10 @@ class HyPERDataset(Dataset):
     def processing_chunk(self, start: int, end: int) -> List[Data]:
         """Build a contiguous event chunk.
 
-        By default this uses a chunk-aware path that performs contiguous HDF5
-        reads once per input/label collection, then assembles per-event PyG Data
-        objects. Set ``HYPER_VECTORIZE_CHUNKS=0`` to force the legacy loop.
+        Contiguous HDF5 reads are performed once per input/label collection,
+        then assembled into per-event PyG objects.
         """
-        if self.use_vectorized_chunks and self._pre_filter is None:
-            try:
-                return self.processing_chunk_vectorized(start, end)
-            except Exception:
-                if self._env_bool("HYPER_VECTORIZE_CHUNKS_FALLBACK", False):
-                    warn(
-                        "Vectorized chunk graph construction failed; falling back "
-                        "to per-event processing because HYPER_VECTORIZE_CHUNKS_FALLBACK=1.",
-                        UserWarning,
-                    )
-                else:
-                    raise
-        return [self[idx] for idx in range(start, end)]
+        return self.processing_chunk_vectorized(start, end)
 
 
     def processing_chunk_vectorized(self, start: int, end: int) -> List[Data]:
@@ -294,11 +252,7 @@ class HyPERDataset(Dataset):
 
         self._ensure_file_open()
         inputs = self.file["INPUTS"]
-        labels = self.file["LABELS"] if "LABELS" in self.file else None
-        # Build labels and reconstruction targets whenever the H5 provides
-        # them. This keeps typed graph caches reusable between reconstruction,
-        # classifier-only training, and prediction/evaluation modes.
-        has_targets = labels is not None
+        labels = self.file["LABELS"]
 
         x_all, counts, node_p4_all, valid_input_mask = self.build_node_attributes_with_mask(
             inputs, start, end
@@ -306,17 +260,9 @@ class HyPERDataset(Dataset):
         counts_list = [int(v) for v in counts.tolist()]
         offsets = np.concatenate([[0], np.cumsum(counts_list, dtype=np.int64)])
 
-        if has_targets:
-            cantor_nodes_all = self.assign_node_ids_from_chunk(
-                x_all,
-                labels,
-                start,
-                end,
-                counts,
-                valid_input_mask,
-            ).to(torch.long)
-        else:
-            cantor_nodes_all = None
+        cantor_nodes_all = self.assign_node_ids_from_chunk(
+            x_all, labels, start, end, counts, valid_input_mask,
+        ).to(torch.long)
 
         u_all = self._build_global_model_array(inputs, start, end)
         if u_all.ndim == 3 and u_all.shape[1] == 1:
@@ -324,12 +270,9 @@ class HyPERDataset(Dataset):
         if u_all.ndim == 1:
             u_all = u_all.unsqueeze(0)
 
-        if has_targets and "GLOBAL" in labels:
-            cls_all = self.build_global_targets(labels, start, end)
-            if cls_all.ndim == 1:
-                cls_all = cls_all.unsqueeze(1)
-        else:
-            cls_all = None
+        cls_all = self.build_global_targets(labels, start, end)
+        if cls_all.ndim == 1:
+            cls_all = cls_all.unsqueeze(1)
 
         graphs: List[Data] = []
         for local_idx, n_nodes in enumerate(counts_list):
@@ -341,51 +284,28 @@ class HyPERDataset(Dataset):
             edge_index = self._edge_index_template(n_nodes)
             edge_attr = self.build_edge_attributes_from_pairs(edge_index, node_p4)
 
-            if has_targets and cantor_nodes_all is not None:
-                cantor_nodes = cantor_nodes_all[lo:hi]
-                cantor_edge_index = cantor_nodes[edge_index] if edge_index.numel() else torch.empty((2, 0), dtype=torch.long)
-                if self.target_encoding == "typed":
-                    edge_attr_t = self.build_typed_edge_target(cantor_edge_index)
-                else:
-                    edge_attr_t = self.find_matched_connections(
-                        cantor_edge_index,
-                        self._flatten_target_ids(self.target_edge_ids),
-                    )
-                node_ids = cantor_nodes.float().clone()
-            else:
-                cantor_nodes = None
-                edge_attr_t = torch.empty((edge_index.shape[1], 0), dtype=torch.float32)
-                node_ids = torch.empty((0,), dtype=torch.float32)
+            cantor_nodes = cantor_nodes_all[lo:hi]
+            cantor_edge_index = cantor_nodes[edge_index] if edge_index.numel() else torch.empty((2, 0), dtype=torch.long)
+            edge_attr_t = self.build_typed_edge_target(cantor_edge_index)
+            node_ids = cantor_nodes.clone()
+            node_truth_ids = self._cantor_second(cantor_nodes)
 
             if self.hyperedge_targets:
                 hyperedge_index = self._hyperedge_index_template(n_nodes, self.hyperedge_order)
-                if has_targets and cantor_nodes is not None:
-                    cantor_hyperedge_index = (
-                        cantor_nodes[hyperedge_index]
-                        if hyperedge_index.numel()
-                        else torch.empty((self.hyperedge_order, 0), dtype=torch.long)
-                    )
-                    if self.target_encoding == "typed":
-                        hyperedge_attr_t = self.build_typed_hyperedge_target(cantor_hyperedge_index)
-                    else:
-                        hyperedge_attr_t = self.find_matched_connections(
-                            cantor_hyperedge_index,
-                            self._flatten_target_ids(self.target_hyperedge_ids),
-                        )
-                else:
-                    hyperedge_attr_t = torch.empty((hyperedge_index.shape[1], 0), dtype=torch.float32)
+                cantor_hyperedge_index = (
+                    cantor_nodes[hyperedge_index]
+                    if hyperedge_index.numel()
+                    else torch.empty((self.hyperedge_order, 0), dtype=torch.long)
+                )
+                hyperedge_attr_t = self.build_typed_hyperedge_target(cantor_hyperedge_index)
             else:
                 hyperedge_index = torch.empty((2, 0), dtype=torch.long)
                 hyperedge_attr_t = torch.empty((0, 1), dtype=torch.float32)
 
             u = u_all[local_idx].unsqueeze(0).clone()
-            cls_t = (
-                cls_all[local_idx].unsqueeze(0).clone()
-                if cls_all is not None
-                else torch.empty((1, 0), dtype=torch.float32)
-            )
+            cls_t = cls_all[local_idx].unsqueeze(0).clone()
 
-            data = Data(
+            data = HyPERData(
                 x=x,
                 edge_index=edge_index,
                 edge_attr=edge_attr,
@@ -393,9 +313,11 @@ class HyPERDataset(Dataset):
                 u=u,
                 cls_t=cls_t,
                 node_ids=node_ids,
+                node_truth_ids=node_truth_ids,
                 edge_attr_t=edge_attr_t,
                 hyperedge_index=hyperedge_index,
                 hyperedge_attr_t=hyperedge_attr_t,
+                source_event_index=torch.tensor([start + local_idx], dtype=torch.long),
                 **self._cached_reco_target_fields(edge_attr_t, hyperedge_attr_t),
             )
 
@@ -414,7 +336,7 @@ class HyPERDataset(Dataset):
         # Ensure file handle is opened in this process/worker
         self._ensure_file_open()
         inputs = self.file["INPUTS"]
-        labels = self.file["LABELS"] if "LABELS" in self.file else None
+        labels = self.file["LABELS"]
 
         # Node attributes (also returns precomputed per-node 4-vectors)
         x, Nobjects, node_p4 = self.build_node_attributes(inputs, idx, idx+1)
@@ -424,19 +346,12 @@ class HyPERDataset(Dataset):
         # Build labels and reconstruction targets whenever the H5 provides
         # them. This keeps typed graph caches reusable between reconstruction,
         # classifier-only training, and prediction/evaluation modes.
-        has_targets = labels is not None
-        if has_targets:
-            cantor_node_ids, local_node_ids = self.assign_node_ids(
-                x, labels, idx, idx+1, Nobjects
-            )
-            edge_index, cantor_edge_index = self.build_edge_indices(
-                local_node_ids, cantor_node_ids
-            )
-        else:
-            cantor_node_ids = None
-            local_node_ids = self.build_local_node_ids(Nobjects)
-            edge_index = self.build_edge_indices(local_node_ids, None)[0]
-            cantor_edge_index = None
+        cantor_node_ids, local_node_ids = self.assign_node_ids(
+            x, labels, idx, idx+1, Nobjects
+        )
+        edge_index, cantor_edge_index = self.build_edge_indices(
+            local_node_ids, cantor_node_ids
+        )
         edge_attr = self.build_edge_attributes_from_pairs(edge_index, node_p4)
 
         if edge_index.shape[1] != edge_attr.shape[0]:
@@ -452,41 +367,23 @@ class HyPERDataset(Dataset):
             hyperedge_index, cantor_hyperedge_index = self.build_hyperedge_indices(
                 local_node_ids, cantor_node_ids, self.hyperedge_order
             )
-            if has_targets:
-                if self.target_encoding == "typed":
-                    hyperedge_attr_t = self.build_typed_hyperedge_target(cantor_hyperedge_index)
-                else:
-                    hyperedge_attr_t = self.find_matched_connections(
-                        cantor_hyperedge_index, self._flatten_target_ids(self.target_hyperedge_ids)
-                    )
-            else:
-                hyperedge_attr_t = torch.empty((hyperedge_index.shape[1], 0), dtype=torch.float32)
+            hyperedge_attr_t = self.build_typed_hyperedge_target(cantor_hyperedge_index)
         else:
             hyperedge_index = torch.empty((2, 0), dtype=torch.long)
             hyperedge_attr_t = torch.empty((0, 1), dtype=torch.float32)
 
         # Global attributes & targets
         u = self.build_global_attributes(inputs, idx, idx+1)
-        cls_t = self.build_global_targets(labels, idx, idx+1) if has_targets and "GLOBAL" in labels else torch.empty((1, 0), dtype=torch.float32)
+        cls_t = self.build_global_targets(labels, idx, idx+1)
 
         # Edge targets
-        if has_targets:
-            if self.target_encoding == "typed":
-                edge_attr_t = self.build_typed_edge_target(cantor_edge_index)
-            else:
-                edge_attr_t = self.find_matched_connections(
-                    cantor_edge_index, self._flatten_target_ids(self.target_edge_ids)
-                )
-        else:
-            edge_attr_t = torch.empty((edge_index.shape[1], 0), dtype=torch.float32)
+        edge_attr_t = self.build_typed_edge_target(cantor_edge_index)
 
         # Flatten node IDs
-        if cantor_node_ids is not None:
-            cantor_node_ids_flat = torch.tensor(
-                np.asarray(ak.flatten(cantor_node_ids)), dtype=torch.float32
-            )
-        else:
-            cantor_node_ids_flat = torch.empty((0,), dtype=torch.float32)
+        cantor_node_ids_flat = torch.tensor(
+            np.asarray(ak.flatten(cantor_node_ids)), dtype=torch.long
+        )
+        node_truth_ids = self._cantor_second(cantor_node_ids_flat)
 
         # Ensure proper shapes for transforms
         if u.ndim == 1:
@@ -494,7 +391,7 @@ class HyPERDataset(Dataset):
         if cls_t.ndim == 1:
             cls_t = cls_t.unsqueeze(0)
 
-        return Data(
+        return HyPERData(
             x=x,
             edge_index=edge_index,
             edge_attr=edge_attr,
@@ -502,9 +399,11 @@ class HyPERDataset(Dataset):
             u=u,
             cls_t=cls_t,
             node_ids=cantor_node_ids_flat,
+            node_truth_ids=node_truth_ids,
             edge_attr_t=edge_attr_t,
             hyperedge_index=hyperedge_index,
             hyperedge_attr_t=hyperedge_attr_t,
+            source_event_index=torch.tensor([idx], dtype=torch.long),
             **self._cached_reco_target_fields(edge_attr_t, hyperedge_attr_t),
         )
 
@@ -512,33 +411,24 @@ class HyPERDataset(Dataset):
     # === Static helper methods (all fork-compatible) ===
 
     def _cached_reco_target_fields(self, edge_attr_t: torch.Tensor, hyperedge_attr_t: torch.Tensor) -> dict:
-        """Optional future cache fields; old graph DBs are still valid without them."""
+        """Cache candidate classes and event-level reconstruction activity."""
         fields = {}
-        if self.target_encoding == "typed":
-            if edge_attr_t is not None and edge_attr_t.numel() > 0 and edge_attr_t.ndim == 2:
-                edge_class = edge_attr_t.argmax(dim=1).to(torch.long)
-                fields["edge_attr_t_class"] = edge_class
-                fields["edge_reco_active"] = (edge_class != (edge_attr_t.size(1) - 1)).any().reshape(1)
-            else:
-                fields["edge_attr_t_class"] = torch.empty((0,), dtype=torch.long)
-                fields["edge_reco_active"] = torch.zeros((1,), dtype=torch.bool)
-
-            if hyperedge_attr_t is not None and hyperedge_attr_t.numel() > 0 and hyperedge_attr_t.ndim == 2:
-                hyper_class = hyperedge_attr_t.argmax(dim=1).to(torch.long)
-                fields["hyperedge_attr_t_class"] = hyper_class
-                fields["hyperedge_reco_active"] = (hyper_class != (hyperedge_attr_t.size(1) - 1)).any().reshape(1)
-            else:
-                fields["hyperedge_attr_t_class"] = torch.empty((0,), dtype=torch.long)
-                fields["hyperedge_reco_active"] = torch.zeros((1,), dtype=torch.bool)
+        edge_active = reconstruction_active_from_typed_targets(edge_attr_t, None)
+        hyperedge_active = reconstruction_active_from_typed_targets(None, hyperedge_attr_t)
+        if edge_attr_t is not None and edge_attr_t.numel() > 0 and edge_attr_t.ndim == 2:
+            edge_class = edge_attr_t.argmax(dim=1).to(torch.long)
+            fields["edge_attr_t_class"] = edge_class
+            fields["edge_reco_active"] = torch.tensor([edge_active], dtype=torch.bool)
         else:
-            if edge_attr_t is not None and edge_attr_t.numel() > 0:
-                fields["edge_reco_active"] = (edge_attr_t.float().flatten() > 0.5).any().reshape(1)
-            else:
-                fields["edge_reco_active"] = torch.zeros((1,), dtype=torch.bool)
-            if hyperedge_attr_t is not None and hyperedge_attr_t.numel() > 0:
-                fields["hyperedge_reco_active"] = (hyperedge_attr_t.float().flatten() > 0.5).any().reshape(1)
-            else:
-                fields["hyperedge_reco_active"] = torch.zeros((1,), dtype=torch.bool)
+            fields["edge_attr_t_class"] = torch.empty((0,), dtype=torch.long)
+            fields["edge_reco_active"] = torch.zeros((1,), dtype=torch.bool)
+        if hyperedge_attr_t is not None and hyperedge_attr_t.numel() > 0 and hyperedge_attr_t.ndim == 2:
+            hyper_class = hyperedge_attr_t.argmax(dim=1).to(torch.long)
+            fields["hyperedge_attr_t_class"] = hyper_class
+            fields["hyperedge_reco_active"] = torch.tensor([hyperedge_active], dtype=torch.bool)
+        else:
+            fields["hyperedge_attr_t_class"] = torch.empty((0,), dtype=torch.long)
+            fields["hyperedge_reco_active"] = torch.zeros((1,), dtype=torch.bool)
         return fields
 
     @staticmethod
@@ -548,13 +438,6 @@ class HyPERDataset(Dataset):
                 return yaml.safe_load(stream)
             except yaml.YAMLError as exc:
                 print(exc)
-
-    @staticmethod
-    def _env_bool(name: str, default: bool) -> bool:
-        value = os.getenv(name)
-        if value is None:
-            return bool(default)
-        return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
     @staticmethod
     def _resolve_graph_config(root: str, config: Optional[dict] = None):
@@ -576,8 +459,8 @@ class HyPERDataset(Dataset):
     def _normalise_target_group(value) -> List[List[str]]:
         """Return a list of same-type target connections.
 
-        HyPER legacy configs use ``name: ['1-1', '1-2']`` for one connection.
-        VyPER-style configs may use ``name: [['1-1', '1-2'], ...]``.  Internally
+        A flat list describes one connection; a nested list describes multiple
+        same-semantic connections. Internally
         both are represented as a list of connection definitions so one typed
         output channel can match multiple same-semantic targets.
         """
@@ -646,6 +529,14 @@ class HyPERDataset(Dataset):
         s = (a_t.to(torch.long) + b_t.to(torch.long))
         paired = (s * (s + 1)) // 2 + b_t.to(torch.long)
         return paired.to(torch.float32)
+
+    @staticmethod
+    def _cantor_second(paired: torch.Tensor) -> torch.Tensor:
+        """Recover the integer truth-role id (second Cantor coordinate)."""
+        z = paired.to(torch.long)
+        w = torch.floor((torch.sqrt(8.0 * z.to(torch.float64) + 1.0) - 1.0) / 2.0).to(torch.long)
+        triangular = (w * (w + 1)) // 2
+        return z - triangular
 
 
     def parse_edge_features(self, parsed_inputs):
@@ -929,9 +820,12 @@ class HyPERDataset(Dataset):
 
     def build_global_targets(self, labels_h5: h5py._hl.group.Group, start: int, end: int) -> torch.Tensor:
         arr = np.asarray(labels_h5["GLOBAL"][start:end])
-        if arr.ndim == 1:
-            arr = arr[:, None]
-        return torch.from_numpy(arr).float()
+        labels = decode_classification_labels(arr, source_h5_path=self._h5_path)
+        return torch.from_numpy(labels[:, None]).float()
+
+    @staticmethod
+    def _validate_global_labels(values: np.ndarray) -> None:
+        decode_classification_labels(values, source_h5_path="<dataset validation>")
 
 
     def assign_node_ids(self, node_feature_array: torch.Tensor, labels_h5: h5py._hl.group.Group,
@@ -1081,25 +975,14 @@ class HyPERDataset(Dataset):
 
 
     def build_edge_indices(self, local_node_ids_chunk: ak.Array, cantor_node_ids_chunk: ak.Array) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build graph edge indices.
-
-        The default is ``input.edge_directionality: undirected`` for backwards
-        compatibility with existing HyPER caches and reconstruction outputs.
-        ``directed`` is available for explicit audits/training tests against the
-        VyPER-style convention.
-        """
+        """Build every ordered pair i -> j with i != j."""
 
         # === Local node indices ===
-        edge_pairs = (
-            ak.combinations(local_node_ids_chunk, 2)
-            if self.edge_directionality == "undirected"
-            else ak.cartesian((local_node_ids_chunk, local_node_ids_chunk), nested=True)
-        )
-        if self.edge_directionality == "directed":
-            edge_pair_indices = ak.argcartesian((local_node_ids_chunk, local_node_ids_chunk), nested=True)
-            edge_pairs = edge_pairs[edge_pair_indices["0"] != edge_pair_indices["1"]]
-        edge_index_0 = ak.flatten(edge_pairs["0"])
-        edge_index_1 = ak.flatten(edge_pairs["1"])
+        edge_pairs = ak.cartesian((local_node_ids_chunk, local_node_ids_chunk), nested=True)
+        edge_pair_indices = ak.argcartesian((local_node_ids_chunk, local_node_ids_chunk), nested=True)
+        edge_pairs = edge_pairs[edge_pair_indices["0"] != edge_pair_indices["1"]]
+        edge_index_0 = ak.flatten(edge_pairs["0"], axis=None)
+        edge_index_1 = ak.flatten(edge_pairs["1"], axis=None)
         edge_index_0_torch = torch.tensor(edge_index_0.to_numpy(), dtype=torch.long)
         edge_index_1_torch = torch.tensor(edge_index_1.to_numpy(), dtype=torch.long)
         edge_index_chunk = torch.stack([edge_index_0_torch, edge_index_1_torch], dim=0)
@@ -1108,18 +991,13 @@ class HyPERDataset(Dataset):
             cantor_edge_index_chunk = torch.empty((2, 0), dtype=torch.long)
         else:
             # === Cantor node indices ===
-            cantor_edge_pairs = (
-                ak.combinations(cantor_node_ids_chunk, 2)
-                if self.edge_directionality == "undirected"
-                else ak.cartesian((cantor_node_ids_chunk, cantor_node_ids_chunk), nested=True)
-            )
-            if self.edge_directionality == "directed":
-                cantor_edge_pair_indices = ak.argcartesian((cantor_node_ids_chunk, cantor_node_ids_chunk), nested=True)
-                cantor_edge_pairs = cantor_edge_pairs[
-                    cantor_edge_pair_indices["0"] != cantor_edge_pair_indices["1"]
-                ]
-            cantor_edge_index_0 = ak.flatten(cantor_edge_pairs["0"])
-            cantor_edge_index_1 = ak.flatten(cantor_edge_pairs["1"])
+            cantor_edge_pairs = ak.cartesian((cantor_node_ids_chunk, cantor_node_ids_chunk), nested=True)
+            cantor_edge_pair_indices = ak.argcartesian((cantor_node_ids_chunk, cantor_node_ids_chunk), nested=True)
+            cantor_edge_pairs = cantor_edge_pairs[
+                cantor_edge_pair_indices["0"] != cantor_edge_pair_indices["1"]
+            ]
+            cantor_edge_index_0 = ak.flatten(cantor_edge_pairs["0"], axis=None)
+            cantor_edge_index_1 = ak.flatten(cantor_edge_pairs["1"], axis=None)
             cantor_edge_index_0_torch = torch.tensor(cantor_edge_index_0.to_numpy(), dtype=torch.long)
             cantor_edge_index_1_torch = torch.tensor(cantor_edge_index_1.to_numpy(), dtype=torch.long)
             cantor_edge_index_chunk = torch.stack([cantor_edge_index_0_torch, cantor_edge_index_1_torch], dim=0)
@@ -1158,7 +1036,7 @@ class HyPERDataset(Dataset):
         min_pt = torch.minimum(pt1, pt2)
 
         raw_features = {
-            "delta_eta": torch.abs(d_eta_signed),
+            "delta_eta": d_eta_signed,
             "delta_phi": d_phi,
             "delta_R": d_r,
             "M": torch.sqrt(torch.clamp(m2, min=0.0)),
@@ -1180,8 +1058,6 @@ class HyPERDataset(Dataset):
             return cached
         if n_nodes < 2:
             template = torch.empty((2, 0), dtype=torch.long)
-        elif self.edge_directionality == "undirected":
-            template = torch.tensor(list(combinations(range(n_nodes), 2)), dtype=torch.long).t().contiguous()
         else:
             template = torch.tensor(list(permutations(range(n_nodes), 2)), dtype=torch.long).t().contiguous()
         self._edge_template_cache[n_nodes] = template
@@ -1221,38 +1097,11 @@ class HyPERDataset(Dataset):
         return ak.unflatten(ak.Array(np.arange(int(counts.sum()), dtype=np.int64)), ak.Array(counts))
 
 
-    def find_matched_connections(self, connection_input_cantor_tensor: torch.Tensor,
-                                target_connection_ids: Sequence[Sequence[int]]) -> torch.Tensor:
-        """Assign target 1 or 0 to all connection objects.
-
-        Candidate edges/hyperedges are unordered combinations of graph nodes.
-        Truth target definitions are semantic sets, so matching must be
-        permutation-invariant.  Sorting both the candidate Cantor IDs and target
-        Cantor IDs avoids dropping valid Whad/thad targets when, for example,
-        W_HAD_J2 appears before W_HAD_J1 in the input jet order.
-        """
-        if len(target_connection_ids) == 0:
-            n_conn = connection_input_cantor_tensor.shape[1]
-            return torch.zeros(n_conn, 1, dtype=torch.float32)
-
-        targets = torch.stack([torch.tensor(t, dtype=connection_input_cantor_tensor.dtype)
-                              for t in target_connection_ids])
-
-        connections = connection_input_cantor_tensor.t()
-        connections = torch.sort(connections, dim=1).values
-        targets = torch.sort(targets, dim=1).values
-        matches = (connections.unsqueeze(1) == targets.unsqueeze(0))
-        full_matches = matches.all(dim=2)
-        output_labels = full_matches.any(dim=1, keepdim=True).float()
-
-        return output_labels
-
     def _typed_connection_target(
         self,
         connection_input_cantor_tensor: torch.Tensor,
         target_connection_ids: Sequence[Sequence[Sequence[int]]],
         out_channels: int,
-        ordered: bool,
     ) -> torch.Tensor:
         n_conn = int(connection_input_cantor_tensor.shape[1])
         out = torch.zeros((n_conn, out_channels), dtype=torch.float32)
@@ -1260,8 +1109,7 @@ class HyPERDataset(Dataset):
             return out
 
         connections = connection_input_cantor_tensor.t()
-        if not ordered:
-            connections = torch.sort(connections, dim=1).values
+        connections = torch.sort(connections, dim=1).values
 
         for class_idx, target_group in enumerate(target_connection_ids):
             if not target_group:
@@ -1270,8 +1118,7 @@ class HyPERDataset(Dataset):
                 torch.tensor(target, dtype=connections.dtype, device=connections.device)
                 for target in target_group
             ])
-            if not ordered:
-                targets = torch.sort(targets, dim=1).values
+            targets = torch.sort(targets, dim=1).values
             matches = (connections.unsqueeze(1) == targets.unsqueeze(0)).all(dim=2)
             out[matches.any(dim=1), class_idx] = 1.0
 
@@ -1289,7 +1136,6 @@ class HyPERDataset(Dataset):
             cantor_edge_index,
             self.target_edge_ids,
             self.edge_out_channels,
-            ordered=self.edge_directionality == "directed",
         )
 
     def build_typed_hyperedge_target(self, cantor_hyperedge_index: torch.Tensor) -> torch.Tensor:
@@ -1297,7 +1143,6 @@ class HyPERDataset(Dataset):
             cantor_hyperedge_index,
             self.target_hyperedge_ids,
             self.hyperedge_out_channels,
-            ordered=self.hyperedge_ordered,
         )
 
 
