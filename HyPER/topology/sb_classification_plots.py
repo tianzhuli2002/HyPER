@@ -1,204 +1,733 @@
 #!/usr/bin/env python3
-"""Lightweight S/B classifier-only validation plots for HyPER predictions."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
-import sys
 from pathlib import Path
+from typing import Iterable
 
 import matplotlib
 
 matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+from matplotlib.ticker import AutoMinorLocator
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    roc_auc_score,
+    roc_curve,
+)
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+BACKGROUND_COLOUR = "#4C566A"
+SIGNAL_COLOUR = "#3B82F6"
+FM_COLOUR = "#2A9D8F"
+NONFM_COLOUR = "#E07A5F"
+REFERENCE_COLOUR = "#8A8F98"
 
-from prediction_io import load_hyper_prediction_output  # noqa: E402
+
+def configure_matplotlib() -> None:
+    plt.rcParams.update(
+        {
+            "figure.figsize": (7.4, 5.5),
+            "figure.dpi": 130,
+            "savefig.dpi": 250,
+            "savefig.bbox": "tight",
+            "savefig.pad_inches": 0.06,
+            "font.family": "DejaVu Sans",
+            "mathtext.fontset": "dejavusans",
+            "font.size": 11.5,
+            "axes.labelsize": 12.5,
+            "axes.titlesize": 14,
+            "axes.titleweight": "normal",
+            "axes.linewidth": 1.05,
+            "axes.grid": False,
+            "xtick.labelsize": 10.5,
+            "ytick.labelsize": 10.5,
+            "xtick.direction": "in",
+            "ytick.direction": "in",
+            "xtick.top": True,
+            "ytick.right": True,
+            "xtick.major.size": 5.5,
+            "ytick.major.size": 5.5,
+            "xtick.minor.size": 2.8,
+            "ytick.minor.size": 2.8,
+            "legend.frameon": False,
+            "legend.fontsize": 10.0,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prediction-output", required=True)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--formats", nargs="+", default=["png", "pdf"])
-    parser.add_argument("--score-field", default="HyPER_CLS_PROB")
-    parser.add_argument("--label-field", default=None)
-    parser.add_argument("--max-events", type=int, default=None)
+    parser = argparse.ArgumentParser(
+        description="Create publication-quality HyPER classification plots."
+    )
+    parser.add_argument(
+        "--prediction-output",
+        required=True,
+        type=Path,
+    )
+    parser.add_argument(
+        "--output-dir",
+        required=True,
+        type=Path,
+    )
+    parser.add_argument(
+        "--score-field",
+        default="HyPER_CLS_PROB",
+    )
+    parser.add_argument(
+        "--label-field",
+        default="HyPER_CLS_T",
+    )
+    parser.add_argument(
+        "--fm-field",
+        default="truth_fully_matched",
+    )
+    parser.add_argument(
+        "--model-label",
+        default=None,
+        help="Optional plot title; inferred from the output path when omitted.",
+    )
+    parser.add_argument(
+        "--experiment-label",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--bins",
+        type=int,
+        default=40,
+    )
+    parser.add_argument(
+        "--formats",
+        nargs="+",
+        default=("pdf", "png"),
+    )
     return parser.parse_args()
 
 
-def finite_array(values) -> np.ndarray:
-    arr = np.asarray(values, dtype=float).reshape(-1)
-    return arr[np.isfinite(arr)]
+def load_prediction_columns(
+    prediction_path: Path,
+    columns: Iterable[str],
+) -> pd.DataFrame:
+    columns = list(columns)
+
+    if prediction_path.is_dir() or prediction_path.name.endswith(".pkl.parts"):
+        parts = sorted(prediction_path.glob("part_*.pkl"))
+
+        if not parts:
+            raise FileNotFoundError(
+                f"No part_*.pkl files found under {prediction_path}"
+            )
+
+        frames = []
+
+        for part in parts:
+            frame = pd.read_pickle(part)
+
+            missing = [column for column in columns if column not in frame.columns]
+            if missing:
+                raise KeyError(
+                    f"{part} is missing required columns: {missing}"
+                )
+
+            frames.append(frame.loc[:, columns].copy())
+
+        return pd.concat(frames, ignore_index=True)
+
+    frame = pd.read_pickle(prediction_path)
+
+    missing = [column for column in columns if column not in frame.columns]
+    if missing:
+        raise KeyError(
+            f"{prediction_path} is missing required columns: {missing}"
+        )
+
+    return frame.loc[:, columns].copy()
 
 
-def binary_labels(values) -> np.ndarray:
-    arr = np.asarray(values, dtype=float).reshape(-1)
-    finite = np.isfinite(arr)
-    labels = np.full(arr.shape, -1, dtype=int)
-    labels[finite] = (arr[finite] > 0.5).astype(int)
-    return labels
+
+def infer_model_label(prediction_path: Path) -> str:
+    value = str(prediction_path).lower()
+
+    if "ttbar1l" in value or "ttbar_sl" in value:
+        topology = "ttbar single-lepton"
+    elif "tth" in value:
+        topology = "ttH single-lepton"
+    else:
+        topology = "HyPER classification"
+
+    if "classification_only" in value:
+        mode = "classification-only"
+    elif "joint" in value:
+        mode = "joint reconstruction and classification"
+    else:
+        mode = ""
+
+    return f"{topology} — {mode}" if mode else topology
 
 
-def roc_auc(scores: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-    keep = np.isfinite(scores) & np.isin(labels, [0, 1])
-    scores = scores[keep]
-    labels = labels[keep]
-    n_pos = int((labels == 1).sum())
-    n_neg = int((labels == 0).sum())
-    if n_pos == 0 or n_neg == 0:
-        return np.asarray([]), np.asarray([]), float("nan")
+def decorate_axis(
+    ax: plt.Axes,
+    experiment_label: str,
+    model_label: str,
+) -> None:
+    del experiment_label
 
-    order = np.argsort(-scores, kind="mergesort")
-    sorted_labels = labels[order]
-    tp = np.cumsum(sorted_labels == 1)
-    fp = np.cumsum(sorted_labels == 0)
-    tpr = np.concatenate([[0.0], tp / float(n_pos), [1.0]])
-    fpr = np.concatenate([[0.0], fp / float(n_neg), [1.0]])
-    auc = float(np.trapz(tpr, fpr))
-    return fpr, tpr, auc
+    ax.tick_params(which="both", direction="in", top=True, right=True)
+    ax.xaxis.set_minor_locator(AutoMinorLocator())
+    ax.yaxis.set_minor_locator(AutoMinorLocator())
+
+    if model_label:
+        ax.set_title(model_label, pad=12)
 
 
-def save_all(fig, output_dir: Path, stem: str, formats: list[str]) -> None:
-    for fmt in formats:
-        fig.savefig(output_dir / f"{stem}.{fmt}", bbox_inches="tight")
+def save_figure(
+    fig: plt.Figure,
+    output_dir: Path,
+    stem: str,
+    formats: Iterable[str],
+) -> None:
+    for output_format in formats:
+        fig.savefig(
+            output_dir / f"{stem}.{output_format}",
+            format=output_format,
+        )
+
     plt.close(fig)
 
 
-def main() -> int:
+def draw_filled_histogram(
+    ax: plt.Axes,
+    values: np.ndarray,
+    bins: np.ndarray,
+    label: str,
+    colour: str,
+    alpha: float = 0.20,
+) -> None:
+    if len(values) == 0:
+        return
+
+    ax.hist(
+        values,
+        bins=bins,
+        density=True,
+        histtype="stepfilled",
+        color=colour,
+        alpha=alpha,
+        linewidth=0,
+    )
+    ax.hist(
+        values,
+        bins=bins,
+        density=True,
+        histtype="step",
+        color=colour,
+        linewidth=2.0,
+        label=f"{label}  ($N={len(values):,}$)",
+    )
+
+
+def make_score_plot(
+    output_dir: Path,
+    score_groups: list[tuple[str, np.ndarray, str]],
+    bins: np.ndarray,
+    experiment_label: str,
+    model_label: str,
+    stem: str,
+    formats: Iterable[str],
+    logarithmic: bool = False,
+) -> None:
+    fig, ax = plt.subplots()
+
+    for label, values, colour in score_groups:
+        draw_filled_histogram(
+            ax=ax,
+            values=values,
+            bins=bins,
+            label=label,
+            colour=colour,
+        )
+
+    ax.set_xlabel("HyPER classification score")
+    ax.set_ylabel("Normalised events")
+    ax.set_xlim(0.0, 1.0)
+
+    if logarithmic:
+        ax.set_yscale("log")
+        ax.set_ylim(bottom=1.0e-3)
+
+    decorate_axis(ax, experiment_label, model_label)
+
+    ax.legend(
+        loc="best",
+        handlelength=2.4,
+    )
+
+    fig.tight_layout()
+    save_figure(fig, output_dir, stem, formats)
+
+
+def make_standard_roc(
+    output_dir: Path,
+    curves: list[tuple[str, np.ndarray, np.ndarray, float, str]],
+    experiment_label: str,
+    model_label: str,
+    stem: str,
+    formats: Iterable[str],
+) -> None:
+    fig, ax = plt.subplots()
+
+    for label, fpr, tpr, auc_value, colour in curves:
+        ax.plot(
+            fpr,
+            tpr,
+            linewidth=2.1,
+            color=colour,
+            label=f"{label}  (AUC = {auc_value:.4f})",
+        )
+
+    ax.plot(
+        [0.0, 1.0],
+        [0.0, 1.0],
+        linestyle="--",
+        linewidth=1.2,
+        color=REFERENCE_COLOUR,
+        label="Random classifier",
+    )
+
+    ax.set_xlabel("Background efficiency")
+    ax.set_ylabel("Signal efficiency")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.02)
+
+    decorate_axis(ax, experiment_label, model_label)
+    ax.legend(loc="lower right")
+
+    fig.tight_layout()
+    save_figure(fig, output_dir, stem, formats)
+
+
+def make_background_rejection_plot(
+    output_dir: Path,
+    curves: list[tuple[str, np.ndarray, np.ndarray, float, str, int]],
+    experiment_label: str,
+    model_label: str,
+    formats: Iterable[str],
+) -> None:
+    fig, ax = plt.subplots()
+
+    for label, fpr, tpr, auc_value, colour, n_background in curves:
+        minimum_efficiency = 1.0 / max(n_background, 1)
+        rejection = 1.0 / np.maximum(fpr, minimum_efficiency)
+
+        ax.plot(
+            tpr,
+            rejection,
+            linewidth=2.1,
+            color=colour,
+            label=f"{label}  (AUC = {auc_value:.4f})",
+        )
+
+    ax.set_xlabel("Signal efficiency")
+    ax.set_ylabel("Background rejection  $1/\\epsilon_{\\mathrm{bkg}}$")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_yscale("log")
+
+    decorate_axis(ax, experiment_label, model_label)
+    ax.legend(loc="upper right")
+
+    fig.tight_layout()
+    save_figure(
+        fig,
+        output_dir,
+        "classifier_background_rejection",
+        formats,
+    )
+
+
+def make_confusion_matrix(
+    output_dir: Path,
+    truth: np.ndarray,
+    prediction: np.ndarray,
+    experiment_label: str,
+    model_label: str,
+    formats: Iterable[str],
+) -> None:
+    matrix = confusion_matrix(
+        truth,
+        prediction,
+        labels=[0, 1],
+        normalize="true",
+    )
+
+    fig, ax = plt.subplots(figsize=(6.2, 5.4))
+    image = ax.imshow(
+        matrix,
+        interpolation="nearest",
+        cmap="Blues",
+        vmin=0.0,
+        vmax=1.0,
+    )
+
+    labels = ["Background", "Signal"]
+
+    ax.set_xticks([0, 1], labels=labels)
+    ax.set_yticks([0, 1], labels=labels)
+    ax.set_xlabel("Predicted class")
+    ax.set_ylabel("True class")
+
+    for row in range(2):
+        for column in range(2):
+            value = matrix[row, column]
+            colour = "white" if value > 0.55 else "black"
+
+            ax.text(
+                column,
+                row,
+                f"{value:.3f}",
+                ha="center",
+                va="center",
+                fontsize=14,
+                fontweight="bold",
+                color=colour,
+            )
+
+    decorate_axis(ax, experiment_label, model_label)
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+
+    fig.tight_layout()
+    save_figure(
+        fig,
+        output_dir,
+        "classifier_confusion_matrix",
+        formats,
+    )
+
+
+def make_category_fractions(
+    output_dir: Path,
+    counts: dict[str, int],
+    experiment_label: str,
+    model_label: str,
+    formats: Iterable[str],
+) -> None:
+    labels = [
+        "Background",
+        "Signal FM",
+        "Signal non-FM",
+    ]
+    values = np.asarray(
+        [
+            counts["background"],
+            counts["signal_fm"],
+            counts["signal_nonfm"],
+        ],
+        dtype=float,
+    )
+    fractions = values / values.sum()
+
+    fig, ax = plt.subplots(figsize=(6.8, 5.4))
+
+    bars = ax.bar(
+        labels,
+        fractions,
+        color=[
+            BACKGROUND_COLOUR,
+            FM_COLOUR,
+            NONFM_COLOUR,
+        ],
+        alpha=0.78,
+        edgecolor="black",
+        linewidth=0.8,
+    )
+
+    for bar, count, fraction in zip(bars, values, fractions):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            bar.get_height() + 0.015,
+            f"{fraction:.1%}\n$N={int(count):,}$",
+            ha="center",
+            va="bottom",
+            fontsize=10.5,
+        )
+
+    ax.set_ylabel("Fraction of test events")
+    ax.set_ylim(0.0, max(fractions) * 1.28)
+    ax.tick_params(axis="x", which="minor", bottom=False)
+
+    decorate_axis(ax, experiment_label, model_label)
+
+    fig.tight_layout()
+    save_figure(
+        fig,
+        output_dir,
+        "classifier_category_fractions",
+        formats,
+    )
+
+
+def rejection_at_efficiency(
+    fpr: np.ndarray,
+    tpr: np.ndarray,
+    target_efficiency: float,
+    n_background: int,
+) -> float:
+    index = int(np.argmin(np.abs(tpr - target_efficiency)))
+    minimum_efficiency = 1.0 / max(n_background, 1)
+
+    return float(1.0 / max(float(fpr[index]), minimum_efficiency))
+
+
+def main() -> None:
+    configure_matplotlib()
     args = parse_args()
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
-    predictions = load_hyper_prediction_output(args.prediction_output, max_events=args.max_events)
-    if args.score_field not in predictions.columns:
-        raise KeyError(f"Score field not found: {args.score_field}")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    scores_all = np.asarray(predictions[args.score_field], dtype=float).reshape(-1)
-    finite = np.isfinite(scores_all)
-    scores = scores_all[finite]
+    model_label = (
+        args.model_label
+        if args.model_label
+        else infer_model_label(args.prediction_output)
+    )
 
-    label_field = args.label_field
-    if label_field is None:
-        for candidate in ("HyPER_CLS_T", "truth_label", "label", "cls_t"):
-            if candidate in predictions.columns:
-                label_field = candidate
-                break
+    frame = load_prediction_columns(
+        args.prediction_output,
+        (
+            args.score_field,
+            args.label_field,
+            args.fm_field,
+        ),
+    )
 
-    labels = None
-    if label_field is not None and label_field in predictions.columns:
-        labels = binary_labels(predictions[label_field])
+    score = np.asarray(frame[args.score_field], dtype=float)
+    truth = (
+        np.asarray(frame[args.label_field], dtype=float) > 0.5
+    ).astype(np.int8)
+    fully_matched = np.asarray(
+        frame[args.fm_field],
+        dtype=bool,
+    )
 
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.hist(scores, bins=50, histtype="stepfilled", alpha=0.75)
-    ax.set_xlabel(args.score_field)
-    ax.set_ylabel("Events")
-    ax.set_title("Classifier score")
-    save_all(fig, output_dir, "classifier_score_hist", args.formats)
+    finite = np.isfinite(score)
 
-    summary = {
-        "prediction_output": str(args.prediction_output),
-        "n_rows": int(len(predictions)),
-        "score_field": args.score_field,
-        "score_finite": int(finite.sum()),
-        "score_finite_fraction": float(finite.mean()) if len(finite) else float("nan"),
-        "score_min": float(np.min(scores)) if scores.size else float("nan"),
-        "score_max": float(np.max(scores)) if scores.size else float("nan"),
-        "score_mean": float(np.mean(scores)) if scores.size else float("nan"),
-        "score_std": float(np.std(scores)) if scores.size else float("nan"),
-        "label_field": label_field,
+    if not np.all(finite):
+        score = score[finite]
+        truth = truth[finite]
+        fully_matched = fully_matched[finite]
+
+    score = np.clip(score, 0.0, 1.0)
+
+    background_mask = truth == 0
+    signal_mask = truth == 1
+    signal_fm_mask = signal_mask & fully_matched
+    signal_nonfm_mask = signal_mask & ~fully_matched
+
+    background_score = score[background_mask]
+    signal_score = score[signal_mask]
+    signal_fm_score = score[signal_fm_mask]
+    signal_nonfm_score = score[signal_nonfm_mask]
+
+    if len(background_score) == 0 or len(signal_score) == 0:
+        raise RuntimeError(
+            "Both signal and background events are required."
+        )
+
+    auc_all = float(roc_auc_score(truth, score))
+    fpr_all, tpr_all, _ = roc_curve(truth, score)
+
+    fm_truth = np.concatenate(
+        [
+            np.zeros(len(background_score), dtype=np.int8),
+            np.ones(len(signal_fm_score), dtype=np.int8),
+        ]
+    )
+    fm_score = np.concatenate(
+        [
+            background_score,
+            signal_fm_score,
+        ]
+    )
+
+    auc_fm = float(roc_auc_score(fm_truth, fm_score))
+    fpr_fm, tpr_fm, _ = roc_curve(fm_truth, fm_score)
+
+    prediction = (score >= 0.5).astype(np.int8)
+    accuracy = float(accuracy_score(truth, prediction))
+
+    bins = np.linspace(0.0, 1.0, args.bins + 1)
+
+    all_groups = [
+        ("Background", background_score, BACKGROUND_COLOUR),
+        ("All signal", signal_score, SIGNAL_COLOUR),
+    ]
+
+    category_groups = [
+        ("Background", background_score, BACKGROUND_COLOUR),
+        ("Signal FM", signal_fm_score, FM_COLOUR),
+        ("Signal non-FM", signal_nonfm_score, NONFM_COLOUR),
+    ]
+
+    make_score_plot(
+        args.output_dir,
+        all_groups,
+        bins,
+        args.experiment_label,
+        model_label,
+        "classifier_score_hist",
+        args.formats,
+    )
+
+    make_score_plot(
+        args.output_dir,
+        all_groups,
+        bins,
+        args.experiment_label,
+        model_label,
+        "classifier_score_all_signal_vs_background",
+        args.formats,
+    )
+
+    make_score_plot(
+        args.output_dir,
+        category_groups,
+        bins,
+        args.experiment_label,
+        model_label,
+        "classifier_score_by_truth",
+        args.formats,
+    )
+
+    make_score_plot(
+        args.output_dir,
+        category_groups,
+        bins,
+        args.experiment_label,
+        model_label,
+        "classifier_score_signal_fm_nonfm_background",
+        args.formats,
+    )
+
+
+    roc_curves = [
+        (
+            "All signal",
+            fpr_all,
+            tpr_all,
+            auc_all,
+            SIGNAL_COLOUR,
+        ),
+    ]
+
+    make_standard_roc(
+        args.output_dir,
+        roc_curves,
+        args.experiment_label,
+        model_label,
+        "classifier_roc",
+        args.formats,
+    )
+
+
+
+    make_confusion_matrix(
+        args.output_dir,
+        truth,
+        prediction,
+        args.experiment_label,
+        model_label,
+        args.formats,
+    )
+
+    counts = {
+        "all": int(len(score)),
+        "background": int(background_mask.sum()),
+        "signal": int(signal_mask.sum()),
+        "signal_fm": int(signal_fm_mask.sum()),
+        "signal_nonfm": int(signal_nonfm_mask.sum()),
     }
 
-    if labels is not None:
-        labelled = finite & np.isin(labels, [0, 1])
-        y = labels[labelled]
-        s = scores_all[labelled]
-        n_signal = int((y == 1).sum())
-        n_background = int((y == 0).sum())
-        pred = (s >= 0.5).astype(int)
-        accuracy = float((pred == y).mean()) if y.size else float("nan")
-        tp = int(((pred == 1) & (y == 1)).sum())
-        fp = int(((pred == 1) & (y == 0)).sum())
-        tn = int(((pred == 0) & (y == 0)).sum())
-        fn = int(((pred == 0) & (y == 1)).sum())
-        fpr, tpr, auc = roc_auc(scores_all, labels)
+    make_category_fractions(
+        args.output_dir,
+        counts,
+        args.experiment_label,
+        model_label,
+        args.formats,
+    )
 
-        fig, ax = plt.subplots(figsize=(7, 5))
-        ax.hist(s[y == 0], bins=50, alpha=0.55, label="background")
-        ax.hist(s[y == 1], bins=50, alpha=0.55, label="signal")
-        ax.set_xlabel(args.score_field)
-        ax.set_ylabel("Events")
-        ax.set_title("Classifier score by truth class")
-        ax.legend()
-        save_all(fig, output_dir, "classifier_score_by_truth", args.formats)
+    summary = {
+        "prediction_output": str(args.prediction_output.resolve()),
+        "score_field": args.score_field,
+        "label_field": args.label_field,
+        "fm_field": args.fm_field,
+        "model_label": model_label,
+        "counts": counts,
+        # Canonical fields retained for workflow-suite compatibility.
+        "roc_auc": auc_all,
+        "auc": auc_all,
+        "accuracy": accuracy,
+        "classification_accuracy": accuracy,
 
-        if fpr.size and tpr.size and math.isfinite(auc):
-            fig, ax = plt.subplots(figsize=(6, 6))
-            ax.plot(fpr, tpr, label=f"AUC = {auc:.4f}")
-            ax.plot([0, 1], [0, 1], linestyle="--", color="0.5")
-            ax.set_xlabel("False positive rate")
-            ax.set_ylabel("True positive rate")
-            ax.set_title("Classifier ROC")
-            ax.legend(loc="lower right")
-            save_all(fig, output_dir, "classifier_roc", args.formats)
+        # Additional detailed fields.
+        "auc_all_signal": auc_all,
+        "auc_fm_signal": auc_fm,
+        "accuracy_at_threshold_0p5": accuracy,
+        "background_rejection": {
+            "all_signal_at_50_percent": rejection_at_efficiency(
+                fpr_all,
+                tpr_all,
+                0.50,
+                len(background_score),
+            ),
+            "all_signal_at_70_percent": rejection_at_efficiency(
+                fpr_all,
+                tpr_all,
+                0.70,
+                len(background_score),
+            ),
+            "all_signal_at_80_percent": rejection_at_efficiency(
+                fpr_all,
+                tpr_all,
+                0.80,
+                len(background_score),
+            ),
+            "fm_signal_at_50_percent": rejection_at_efficiency(
+                fpr_fm,
+                tpr_fm,
+                0.50,
+                len(background_score),
+            ),
+            "fm_signal_at_70_percent": rejection_at_efficiency(
+                fpr_fm,
+                tpr_fm,
+                0.70,
+                len(background_score),
+            ),
+            "fm_signal_at_80_percent": rejection_at_efficiency(
+                fpr_fm,
+                tpr_fm,
+                0.80,
+                len(background_score),
+            ),
+        },
+    }
 
-        summary.update(
-            {
-                "n_labelled": int(labelled.sum()),
-                "n_signal": n_signal,
-                "n_background": n_background,
-                "signal_fraction": float(n_signal / y.size) if y.size else float("nan"),
-                "auc": auc,
-                "accuracy_at_0p5": accuracy,
-                "confusion_at_0p5": {"tp": tp, "fp": fp, "tn": tn, "fn": fn},
-                "signal_efficiency_at_0p5": float(tp / (tp + fn)) if tp + fn else float("nan"),
-                "background_rejection_at_0p5": float((tn + fp) / fp) if fp else float("inf"),
-                "label_source": "prediction:HyPER_CLS_T",
-                "fallback_fully_matched_used": False,
-            }
-        )
-        rejection = {}
-        for efficiency in (0.7, 0.8, 0.9):
-            signal_scores = s[y == 1]
-            background_scores = s[y == 0]
-            threshold = float(np.quantile(signal_scores, 1.0 - efficiency))
-            background_efficiency = float((background_scores >= threshold).mean())
-            rejection[str(efficiency)] = {
-                "threshold": threshold,
-                "background_rejection": float(1.0 / background_efficiency) if background_efficiency else float("inf"),
-            }
-        summary["background_rejection_at_signal_efficiency"] = rejection
+    # summary.json is the canonical workflow output consumed by
+    # validate_workflow_suite.py.
+    summary_text = json.dumps(summary, indent=2, sort_keys=True) + "\n"
 
-        fig, ax = plt.subplots(figsize=(5, 5))
-        matrix = np.asarray([[tn, fp], [fn, tp]])
-        image = ax.imshow(matrix, cmap="Blues")
-        for row in range(2):
-            for column in range(2):
-                ax.text(column, row, str(matrix[row, column]), ha="center", va="center")
-        ax.set_xticks([0, 1], labels=["background", "signal"])
-        ax.set_yticks([0, 1], labels=["background", "signal"])
-        ax.set_xlabel("Predicted")
-        ax.set_ylabel("Truth")
-        ax.set_title("Confusion matrix at probability 0.5")
-        fig.colorbar(image, ax=ax)
-        save_all(fig, output_dir, "classifier_confusion_matrix", args.formats)
+    (args.output_dir / "summary.json").write_text(summary_text)
+    (args.output_dir / "pretty_summary.json").write_text(summary_text)
 
-    with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-
-    lines = [f"{key}: {value}" for key, value in summary.items()]
-    (output_dir / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(json.dumps(summary, indent=2, sort_keys=True))
-    return 0
+    print(summary_text, end="")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
