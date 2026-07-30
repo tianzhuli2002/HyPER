@@ -3,6 +3,33 @@ import torch
 from torch.nn import Module, Sequential as Seq, Linear, ReLU, Dropout
 from torch_geometric.utils import scatter
 
+
+def pool_event_representation(
+    feat_HE, feat_GE, feat_N, feat_U, batch_GE, batch_HE, batch_N
+):
+    """Return the exact pooled event tensor consumed by every classification head."""
+    if feat_U.dim() != 2:
+        raise ValueError(f"Expected feat_U shape [N_events, F], got {tuple(feat_U.shape)}")
+    if feat_N.dim() != 2 or feat_GE.dim() != 2 or feat_HE.dim() != 2:
+        raise ValueError(
+            "Expected 2D embeddings: "
+            f"feat_N={tuple(feat_N.shape)}, feat_GE={tuple(feat_GE.shape)}, "
+            f"feat_HE={tuple(feat_HE.shape)}"
+        )
+    num_events = feat_U.size(0)
+    return torch.cat(
+        [
+            scatter(feat_N, batch_N, dim=0, dim_size=num_events, reduce="mean"),
+            scatter(feat_N, batch_N, dim=0, dim_size=num_events, reduce="max"),
+            scatter(feat_GE, batch_GE, dim=0, dim_size=num_events, reduce="mean"),
+            scatter(feat_GE, batch_GE, dim=0, dim_size=num_events, reduce="max"),
+            scatter(feat_HE, batch_HE, dim=0, dim_size=num_events, reduce="mean"),
+            scatter(feat_HE, batch_HE, dim=0, dim_size=num_events, reduce="max"),
+            feat_U,
+        ],
+        dim=1,
+    ).float()
+
 class classificationModel(Module):
     r"""Event-level S/B classification head using learned HyPER embeddings.
 
@@ -60,45 +87,9 @@ class classificationModel(Module):
             [N_events, n_feats_out] raw logits
         """
         
-        num_events = feat_U.size(0)
-
-        # Hyperedge-level summaries: candidate topology/reconstruction structure.
-        he_mean = scatter(feat_HE, batch_HE, dim=0, dim_size=num_events, reduce="mean")
-        he_max = scatter(feat_HE, batch_HE, dim=0, dim_size=num_events, reduce="max")
-
-        # Edge-level summaries: pairwise object relationships.
-        ge_mean = scatter(feat_GE, batch_GE, dim=0, dim_size=num_events, reduce="mean")
-        ge_max = scatter(feat_GE, batch_GE, dim=0, dim_size=num_events, reduce="max")
-
-        # Node-level summaries: updated object representations.
-        n_mean = scatter(feat_N, batch_N, dim=0, dim_size=num_events, reduce="mean")
-        n_max = scatter(feat_N, batch_N, dim=0, dim_size=num_events, reduce="max")
-
-        # Global/event embedding already has one row per event.
-        u_event = feat_U
-
-        x_in = torch.cat(
-            [
-                n_mean,
-                n_max,
-                ge_mean,
-                ge_max,
-                he_mean,
-                he_max,
-                u_event,
-            ],
-            dim=1,
-        ).float()
-
-        if feat_U.dim() != 2:
-            raise ValueError(f"Expected feat_U shape [N_events, F], got {tuple(feat_U.shape)}")
-        if feat_N.dim() != 2 or feat_GE.dim() != 2 or feat_HE.dim() != 2:
-            raise ValueError(
-                "Expected 2D embeddings: "
-                f"feat_N={tuple(feat_N.shape)}, "
-                f"feat_GE={tuple(feat_GE.shape)}, "
-                f"feat_HE={tuple(feat_HE.shape)}"
-            )
+        x_in = pool_event_representation(
+            feat_HE, feat_GE, feat_N, feat_U, batch_GE, batch_HE, batch_N
+        )
         expected = 5 * self.message_feats + 2 * self.contraction_feats
         if x_in.size(1) != expected:
             raise ValueError(f"Classification input has {x_in.size(1)} features, expected {expected}")

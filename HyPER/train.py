@@ -26,6 +26,7 @@ from packaging import version
 from HyPER.data import HyPERDataModule
 from HyPER.models import HyPERModel
 from HyPER.utils.timing import TrainingTimingCallback
+from HyPER.utils.epoch_summary import PersistentEpochSummary
 
 
 def _plain(value):
@@ -255,7 +256,9 @@ def run_training(cfg: DictConfig, extra_callbacks=None, logger_name="", return_m
         )
     if not exploratory_tuning:
         callbacks.append(LearningRateMonitor())
-    if bool(cfg.trainer.enable_progress_bar):
+    callbacks.append(PersistentEpochSummary())
+    progress_bar_enabled = bool(cfg.trainer.enable_progress_bar) and os.isatty(1) and os.isatty(2)
+    if progress_bar_enabled:
         callbacks.append(TQDMProgressBar())
     if bool(cfg.profiling.enabled):
         callbacks.append(
@@ -279,7 +282,7 @@ def run_training(cfg: DictConfig, extra_callbacks=None, logger_name="", return_m
         "log_every_n_steps": int(cfg.trainer.log_every_n_steps),
         "num_sanity_val_steps": int(cfg.trainer.num_sanity_val_steps),
         "check_val_every_n_epoch": int(cfg.trainer.check_val_every_n_epoch),
-        "enable_progress_bar": bool(cfg.trainer.enable_progress_bar),
+        "enable_progress_bar": progress_bar_enabled,
         "gradient_clip_val": float(cfg.trainer.gradient_clip_val),
         "limit_val_batches": cfg.trainer.limit_val_batches,
         "limit_test_batches": cfg.trainer.get("limit_test_batches", 1.0),

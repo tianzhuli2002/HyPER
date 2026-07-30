@@ -54,6 +54,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from HyPER.topology.reconstruction_score import ttbar_sl_event_reconstruction_score
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -512,15 +514,8 @@ def evaluate_event(
     w_lep_score = finite_float(row.get("HyPER_best_w1_prob", np.nan))
     w_had_score = finite_float(row.get("HyPER_best_w2_prob", np.nan))
 
-    finite_component_scores = [
-        score
-        for score in (top_had_score, top_lep_score, w_had_score, w_lep_score)
-        if math.isfinite(score)
-    ]
-    event_reco_score = (
-        float(np.prod(finite_component_scores))
-        if len(finite_component_scores) == 4
-        else float("nan")
+    event_reco_score = ttbar_sl_event_reconstruction_score(
+        (top_had_score, top_lep_score, w_had_score, w_lep_score)
     )
 
     return {

@@ -14,7 +14,7 @@ from torch_geometric.utils import degree, unbatch
 from torchmetrics.functional.classification import binary_auroc
 
 from .MPNNs import MPNNs
-from .classification import classificationModel
+from .classification import classificationModel, pool_event_representation
 from .hyperedge import HyperedgeModel
 from .loss import (
     additive_total_loss,
@@ -231,12 +231,16 @@ class HyPERModel(LightningModule):
         batch,
         hyperedge_index,
         hyperedge_index_batch=None,
+        return_representations: bool = False,
     ):
         x_embed, edge_embed, u_embed = x, edge_attr, u
+        block_event_representations = []
         for layer in self.message_passing_layers:
             x_embed, edge_embed, u_embed = layer(
                 x_embed, edge_index, edge_embed, u_embed, batch
             )
+            if return_representations:
+                block_event_representations.append(u_embed)
         if hyperedge_index_batch is None:
             hyperedge_batch = self._candidate_event_batch(
                 batch, hyperedge_index, "hyperedge"
@@ -261,21 +265,29 @@ class HyPERModel(LightningModule):
             hyperedge_batch,
             self.hparams.hyperedge_order,
         )
+        edge_batch = self._candidate_event_batch(batch, edge_index, "edge")
+        event_representation = None
+        if self.classification_enabled or return_representations:
+            event_representation = pool_event_representation(
+                hyper_embed, edge_embed, x_embed, u_embed,
+                edge_batch, hyper_batch, batch,
+            )
         cls_logits = None
         if self.classification_enabled:
-            edge_batch = self._candidate_event_batch(batch, edge_index, "edge")
-            cls_logits = self.Classification(
-                feat_HE=hyper_embed,
-                feat_GE=edge_embed,
-                feat_N=x_embed,
-                feat_U=u_embed,
-                batch_GE=edge_batch,
-                batch_HE=hyper_batch,
-                batch_N=batch,
-            )
+            cls_logits = self.Classification.mlp_class(event_representation)
         edge_logits = self.ge_head(edge_embed) if self.reconstruction_enabled else None
         hyper_logits = self.he_head(hyper_embed) if self.reconstruction_enabled else None
-        return hyper_logits, hyper_batch, edge_logits, cls_logits
+        outputs = (hyper_logits, hyper_batch, edge_logits, cls_logits)
+        if not return_representations:
+            return outputs
+        representations = {
+            "final_event": event_representation,
+            "classification_head_input": event_representation,
+        }
+        representations.update(
+            {f"block_{index}": value for index, value in enumerate(block_event_representations)}
+        )
+        return outputs, representations
 
     def _shared_step(self, data):
         return self.forward(
