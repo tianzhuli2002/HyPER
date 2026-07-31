@@ -11,6 +11,17 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from HyPER.topology.plot_style import (
+    BACKGROUND_COLOUR,
+    FM_COLOUR,
+    NONFM_COLOUR,
+    REFERENCE_COLOUR,
+    SIGNAL_COLOUR,
+    configure_matplotlib,
+    decorate_axis,
+    save_figure as shared_save_figure,
+)
+
 
 CATEGORY_LABELS = {
     "signal_fm": "signal fully matched",
@@ -218,9 +229,7 @@ def category_summary_from_counts(
 
 
 def save_figure(output_dir: Path, stem: str, formats: list[str]) -> None:
-    for fmt in formats:
-        plt.savefig(output_dir / f"{stem}.{fmt}", bbox_inches="tight")
-    plt.close()
+    shared_save_figure(plt.gcf(), output_dir, stem, formats)
 
 
 def write_category_diagnostics(
@@ -303,6 +312,7 @@ def plot_joint_sb(
     output_dir: Path,
     formats: list[str],
 ) -> dict[str, Any]:
+    configure_matplotlib()
     if score_field not in evaluation.columns:
         return {"available": False, "reason": f"missing score field {score_field}"}
     scores = evaluation[score_field].to_numpy(dtype=float)
@@ -315,71 +325,89 @@ def plot_joint_sb(
     is_background = ~is_signal
     bins = np.linspace(0.0, 1.0, 41)
 
-    plt.figure(figsize=(6.4, 4.5))
-    for mask, label, color in (
-        (is_signal, "signal", "tab:orange"),
-        (is_background, "background", "tab:blue"),
-    ):
+    def filled_hist(ax, mask: np.ndarray, label: str, colour: str) -> None:
         values = scores[mask & finite_scores]
-        if len(values):
-            plt.hist(values, bins=bins, histtype="step", density=True, label=label, color=color)
-    plt.xlabel(score_field)
-    plt.ylabel("Density")
-    plt.title("Classifier score: all signal vs background")
-    plt.legend()
-    plt.tight_layout()
-    save_figure(output_dir, "sb_score_all_signal_vs_background", formats)
+        if not len(values):
+            return
+        ax.hist(values, bins=bins, density=True, histtype="stepfilled",
+                color=colour, alpha=0.20, linewidth=0)
+        ax.hist(values, bins=bins, density=True, histtype="step",
+                color=colour, linewidth=2.0, label=f"{label} ($N={len(values):,}$)")
 
-    plt.figure(figsize=(6.4, 4.5))
-    for key, color in (
-        ("signal_fm", "tab:orange"),
-        ("signal_nonfm", "tab:green"),
-        ("background", "tab:blue"),
-    ):
-        values = scores[masks[key] & finite_scores]
-        if len(values):
-            plt.hist(
-                values,
-                bins=bins,
-                histtype="step",
-                density=True,
-                label=CATEGORY_LABELS[key],
-                color=color,
-            )
-    plt.xlabel(score_field)
-    plt.ylabel("Density")
-    plt.title("Classifier score by reconstruction category")
-    plt.legend()
-    plt.tight_layout()
-    save_figure(output_dir, "sb_score_signal_fm_nonfm_background", formats)
+    fig, ax = plt.subplots(figsize=(7.4, 5.5))
+    filled_hist(ax, is_background, "Background", BACKGROUND_COLOUR)
+    filled_hist(ax, is_signal, "All signal", SIGNAL_COLOUR)
+    ax.set_xlim(0.0, 1.0)
+    ax.set_xlabel("HyPER classification score")
+    ax.set_ylabel("Normalised events")
+    decorate_axis(ax, title="ttbar single-lepton — all signal vs background")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    shared_save_figure(fig, output_dir, "sb_score_all_signal_vs_background", formats)
+
+    fig, ax = plt.subplots(figsize=(7.4, 5.5))
+    filled_hist(ax, masks["background"], "Background", BACKGROUND_COLOUR)
+    filled_hist(ax, masks["signal_fm"], "Signal FM", FM_COLOUR)
+    filled_hist(ax, masks["signal_nonfm"], "Signal non-FM", NONFM_COLOUR)
+    ax.set_xlim(0.0, 1.0)
+    ax.set_xlabel("HyPER classification score")
+    ax.set_ylabel("Normalised events")
+    decorate_axis(ax, title="ttbar single-lepton — classification score by reconstruction category")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    shared_save_figure(fig, output_dir, "sb_score_signal_fm_nonfm_background", formats)
 
     all_labels = is_signal.astype(int)
     fpr_all, tpr_all, auc_all = _binary_roc(all_labels, scores)
-    if len(fpr_all):
-        plt.figure(figsize=(5.4, 5.2))
-        plt.plot(fpr_all, tpr_all, label=f"AUC={auc_all:.4f}")
-        plt.plot([0, 1], [0, 1], linestyle="--", color="0.5")
-        plt.xlabel("Background efficiency")
-        plt.ylabel("Signal efficiency")
-        plt.title("ROC: all signal vs background")
-        plt.legend(loc="lower right")
-        plt.tight_layout()
-        save_figure(output_dir, "sb_roc_all_signal_vs_background", formats)
-
     fm_or_background = masks["signal_fm"] | masks["background"]
     fm_labels = masks["signal_fm"][fm_or_background].astype(int)
     fm_scores = scores[fm_or_background]
     fpr_fm, tpr_fm, auc_fm = _binary_roc(fm_labels, fm_scores)
-    if len(fpr_fm):
-        plt.figure(figsize=(5.4, 5.2))
-        plt.plot(fpr_fm, tpr_fm, label=f"AUC={auc_fm:.4f}")
-        plt.plot([0, 1], [0, 1], linestyle="--", color="0.5")
-        plt.xlabel("Background efficiency")
-        plt.ylabel("FM signal efficiency")
-        plt.title("ROC: fully matched signal vs background")
-        plt.legend(loc="lower right")
-        plt.tight_layout()
-        save_figure(output_dir, "sb_roc_fm_signal_vs_background", formats)
+    nonfm_or_background = masks["signal_nonfm"] | masks["background"]
+    nonfm_labels = masks["signal_nonfm"][nonfm_or_background].astype(int)
+    nonfm_scores = scores[nonfm_or_background]
+    fpr_nonfm, tpr_nonfm, auc_nonfm = _binary_roc(nonfm_labels, nonfm_scores)
+
+    roc_specs = (
+        ("sb_roc_all_signal_vs_background", fpr_all, tpr_all, auc_all,
+         "Signal efficiency", "ttbar single-lepton — all signal vs background", SIGNAL_COLOUR),
+        ("sb_roc_fm_signal_vs_background", fpr_fm, tpr_fm, auc_fm,
+         "FM signal efficiency", "ttbar single-lepton — FM signal vs background", FM_COLOUR),
+        ("sb_roc_nonfm_signal_vs_background", fpr_nonfm, tpr_nonfm, auc_nonfm,
+         "Non-FM signal efficiency", "ttbar single-lepton — non-FM signal vs background", NONFM_COLOUR),
+    )
+    for stem, fpr, tpr, auc, ylabel, title, colour in roc_specs:
+        if not len(fpr):
+            continue
+        fig, ax = plt.subplots(figsize=(6.3, 5.8))
+        ax.plot(fpr, tpr, color=colour, linewidth=2.2, label=f"AUC={auc:.4f}")
+        ax.plot([0, 1], [0, 1], linestyle="--", color=REFERENCE_COLOUR, linewidth=1.2)
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.0)
+        ax.set_xlabel("Background efficiency")
+        ax.set_ylabel(ylabel)
+        decorate_axis(ax, title=title)
+        ax.legend(loc="lower right")
+        fig.tight_layout()
+        shared_save_figure(fig, output_dir, stem, formats)
+
+    fig, ax = plt.subplots(figsize=(6.8, 6.0))
+    for fpr, tpr, auc, label, colour in (
+        (fpr_all, tpr_all, auc_all, "All signal", SIGNAL_COLOUR),
+        (fpr_fm, tpr_fm, auc_fm, "Signal FM", FM_COLOUR),
+        (fpr_nonfm, tpr_nonfm, auc_nonfm, "Signal non-FM", NONFM_COLOUR),
+    ):
+        if len(fpr):
+            ax.plot(fpr, tpr, color=colour, linewidth=2.0, label=f"{label} (AUC={auc:.3f})")
+    ax.plot([0, 1], [0, 1], linestyle="--", color=REFERENCE_COLOUR, linewidth=1.2)
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlabel("Background efficiency")
+    ax.set_ylabel("Signal efficiency")
+    decorate_axis(ax, title="ttbar single-lepton — reconstruction-category ROC")
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    shared_save_figure(fig, output_dir, "sb_roc_signal_categories_vs_background", formats)
 
     result = {
         "available": True,
@@ -392,25 +420,21 @@ def plot_joint_sb(
         "n_signal_with_finite_score": int(np.sum(is_signal & finite_scores)),
         "n_background_with_finite_score": int(np.sum(is_background & finite_scores)),
         "n_signal_fm_with_finite_score": int(np.sum(masks["signal_fm"] & finite_scores)),
-        "n_signal_nonfm_with_finite_score": int(
-            np.sum(masks["signal_nonfm"] & finite_scores)
-        ),
+        "n_signal_nonfm_with_finite_score": int(np.sum(masks["signal_nonfm"] & finite_scores)),
         "n_signal_partial_with_finite_score": int(
             np.sum(masks.get("signal_partial", np.zeros(len(evaluation), dtype=bool)) & finite_scores)
         ),
         "n_signal_unmatched_with_finite_score": int(
             np.sum(masks.get("signal_unmatched", np.zeros(len(evaluation), dtype=bool)) & finite_scores)
         ),
-        "auc_all_signal_vs_background": (
-            auc_all if math.isfinite(auc_all) else None
-        ),
+        "auc_all_signal_vs_background": auc_all if math.isfinite(auc_all) else None,
         "auc_fm_signal_vs_background": auc_fm if math.isfinite(auc_fm) else None,
+        "auc_nonfm_signal_vs_background": auc_nonfm if math.isfinite(auc_nonfm) else None,
     }
     with (output_dir / "sb_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2, sort_keys=True)
         handle.write("\n")
     return result
-
 
 def plot_observable_pair(
     evaluation: pd.DataFrame,

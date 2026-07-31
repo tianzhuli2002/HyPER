@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from HyPER.analysis.representations import align_exports, event_index_sha256, linear_cka
+from HyPER.topology.plot_style import configure_matplotlib, decorate_axis, save_figure
 
 
 NON_REPRESENTATIONS = {
@@ -34,6 +35,12 @@ def parse_args():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--title", required=True)
     parser.add_argument("--common-events-only", action="store_true")
+    parser.add_argument(
+        "--subsets",
+        nargs="+",
+        choices=("all", "background", "signal_fully_matched", "signal_non_fully_matched"),
+        default=("all", "background", "signal_fully_matched", "signal_non_fully_matched"),
+    )
     return parser.parse_args()
 
 
@@ -43,10 +50,14 @@ def load_export(path):
 
 
 def representation_names(export):
-    return [
+    names = [
         name for name, values in export.items()
         if name not in NON_REPRESENTATIONS and np.asarray(values).ndim == 2
     ]
+    if "final_event" in names and "classification_head_input" in names:
+        names.remove("classification_head_input")
+    preferred = ["block_0", "block_1", "block_2", "final_event"]
+    return [name for name in preferred if name in names] + [name for name in names if name not in preferred]
 
 
 def main() -> int:
@@ -60,12 +71,13 @@ def main() -> int:
         raise ValueError("Both exports must contain at least one 2D representation array.")
     truth = np.asarray(left["truth_class"])[left_rows]
     fully_matched = np.asarray(left["truth_fully_matched"])[left_rows].astype(bool)
-    subsets = {
+    all_subsets = {
         "all": np.ones(len(indices), dtype=bool),
         "background": truth == 0,
         "signal_fully_matched": (truth == 1) & fully_matched,
         "signal_non_fully_matched": (truth == 1) & ~fully_matched,
     }
+    subsets = {name: all_subsets[name] for name in args.subsets}
     matrices, rows = {}, []
     for subset_name, mask in subsets.items():
         count = int(mask.sum())
@@ -96,6 +108,7 @@ def main() -> int:
         "full_cross_layer_cka": {subset: matrix.tolist() for subset, matrix in matrices.items()},
         "definition": "||X_centered.T @ Y_centered||_F^2 / sqrt(||X_centered.T @ X_centered||_F^2 ||Y_centered.T @ Y_centered||_F^2)",
         "stored_feature_dtype": "float32", "calculation_dtype": "float64",
+        "classification_head_input_alias": "final_event",
     }
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -106,26 +119,51 @@ def main() -> int:
         writer = csv.writer(handle)
         writer.writerow(("subset", "event_count", "left_representation", "right_representation", "cka"))
         writer.writerows(rows)
-    plt.rcParams.update({"font.family": "DejaVu Sans"})
-    fig, axes = plt.subplots(2, 2, figsize=(13, 10), constrained_layout=True)
+    configure_matplotlib()
+    nplots = len(matrices)
+    ncols = min(2, nplots)
+    nrows = int(np.ceil(nplots / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6.5 * ncols, 5.0 * nrows), constrained_layout=True, squeeze=False)
     image = None
     for ax, (subset_name, matrix) in zip(axes.flat, matrices.items()):
         image = ax.imshow(matrix, vmin=0, vmax=1, cmap="viridis", aspect="auto")
-        ax.set_xticks(range(len(right_names)), right_names, rotation=45, ha="right")
+        ax.set_xticks(range(len(right_names)), right_names, rotation=35, ha="right")
         ax.set_yticks(range(len(left_names)), left_names)
         ax.set_xlabel("Right representation")
         ax.set_ylabel("Left representation")
-        ax.set_title(f"{subset_name.replace('_', ' ')} (N={subsets[subset_name].sum():,})")
-        if matrix.size <= 64:
-            for i in range(matrix.shape[0]):
-                for j in range(matrix.shape[1]):
-                    ax.text(j, i, f"{matrix[i, j]:.3f}", ha="center", va="center",
-                            color="white" if matrix[i, j] < 0.55 else "black", fontsize=8)
+        decorate_axis(ax, title=f"{subset_name.replace('_', ' ')} ($N={subsets[subset_name].sum():,}$)", minor_ticks=False)
+        for i in range(matrix.shape[0]):
+            for j in range(matrix.shape[1]):
+                ax.text(j, i, f"{matrix[i, j]:.3f}", ha="center", va="center",
+                        color="white" if matrix[i, j] < 0.55 else "black", fontsize=8)
+    for ax in axes.flat[len(matrices):]:
+        ax.set_visible(False)
     fig.suptitle(args.title)
-    fig.colorbar(image, ax=axes, label="Linear centred CKA", shrink=0.85)
-    fig.savefig(output_dir / "cka_heatmap.pdf", bbox_inches="tight")
-    fig.savefig(output_dir / "cka_heatmap.png", dpi=180, bbox_inches="tight")
-    plt.close(fig)
+    fig.colorbar(image, ax=[ax for ax in axes.flat if ax.get_visible()], label="Linear centred CKA", shrink=0.85)
+    save_figure(fig, output_dir, "cka_heatmap")
+
+    inclusive = matrices["all"]
+    fig, ax = plt.subplots(figsize=(7.2, 5.8))
+    image = ax.imshow(inclusive, vmin=0, vmax=1, cmap="viridis", aspect="auto")
+    ax.set_xticks(range(len(right_names)), right_names, rotation=35, ha="right")
+    ax.set_yticks(range(len(left_names)), left_names)
+    ax.set_xlabel("Right representation")
+    ax.set_ylabel("Left representation")
+    decorate_axis(ax, title=f"{args.title}: all events", minor_ticks=False)
+    for i in range(inclusive.shape[0]):
+        for j in range(inclusive.shape[1]):
+            ax.text(j, i, f"{inclusive[i, j]:.3f}", ha="center", va="center",
+                    color="white" if inclusive[i, j] < 0.55 else "black", fontsize=9)
+    fig.colorbar(image, ax=ax, label="Linear centred CKA")
+    fig.tight_layout()
+    save_figure(fig, output_dir, "cka_inclusive_heatmap")
+
+    with (output_dir / "cka_corresponding_layers.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(("subset", "event_count", "representation", "cka"))
+        for subset_name, values in summary["corresponding_layer_cka"].items():
+            for representation, value in values.items():
+                writer.writerow((subset_name, summary["subset_counts"][subset_name], representation, value))
     print(f"wrote={output_dir}")
     return 0
 

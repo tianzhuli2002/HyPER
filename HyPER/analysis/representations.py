@@ -124,3 +124,71 @@ def random_orthogonal(dimension: int, seed: int) -> np.ndarray:
     signs = np.sign(np.diag(r))
     signs[signs == 0] = 1
     return q * signs
+
+
+class StreamingLinearCKA:
+    """Accumulate sufficient statistics for centred linear CKA."""
+
+    def __init__(self, left_dimension: int, right_dimension: int):
+        self.left_dimension = int(left_dimension)
+        self.right_dimension = int(right_dimension)
+        if self.left_dimension <= 0 or self.right_dimension <= 0:
+            raise ValueError("Representation dimensions must be positive.")
+        self.count = 0
+        self.sum_left = np.zeros(self.left_dimension, dtype=np.float64)
+        self.sum_right = np.zeros(self.right_dimension, dtype=np.float64)
+        self.left_gram = np.zeros((self.left_dimension, self.left_dimension), dtype=np.float64)
+        self.right_gram = np.zeros((self.right_dimension, self.right_dimension), dtype=np.float64)
+        self.cross = np.zeros((self.left_dimension, self.right_dimension), dtype=np.float64)
+
+    def update(self, left, right) -> None:
+        left = np.asarray(left, dtype=np.float64)
+        right = np.asarray(right, dtype=np.float64)
+        if left.ndim != 2 or right.ndim != 2 or left.shape[0] != right.shape[0]:
+            raise ValueError(f"Streaming CKA requires paired 2D batches; got {left.shape}, {right.shape}.")
+        if left.shape[1] != self.left_dimension or right.shape[1] != self.right_dimension:
+            raise ValueError("Streaming CKA batch dimensions differ from the accumulator.")
+        if not np.isfinite(left).all() or not np.isfinite(right).all():
+            raise ValueError("Streaming CKA batches must be finite.")
+        self.count += int(left.shape[0])
+        self.sum_left += left.sum(axis=0)
+        self.sum_right += right.sum(axis=0)
+        self.left_gram += left.T @ left
+        self.right_gram += right.T @ right
+        self.cross += left.T @ right
+
+    def centred_products(self):
+        if self.count < 2:
+            raise ValueError("Streaming CKA requires at least two events.")
+        mean_left = self.sum_left / self.count
+        mean_right = self.sum_right / self.count
+        left = self.left_gram - self.count * np.outer(mean_left, mean_left)
+        right = self.right_gram - self.count * np.outer(mean_right, mean_right)
+        cross = self.cross - self.count * np.outer(mean_left, mean_right)
+        return left, right, cross
+
+    def value(self) -> float:
+        left, right, cross = self.centred_products()
+        numerator = np.linalg.norm(cross, ord="fro") ** 2
+        denominator = np.sqrt(
+            (np.linalg.norm(left, ord="fro") ** 2)
+            * (np.linalg.norm(right, ord="fro") ** 2)
+        )
+        if not np.isfinite(denominator) or denominator <= 0:
+            raise ValueError("CKA is undefined for a zero-variance representation.")
+        result = float(numerator / denominator)
+        if result < -1e-12 or result > 1.0 + 1e-10:
+            raise RuntimeError(f"Streaming linear CKA lies outside its numerical range: {result}.")
+        return min(1.0, max(0.0, result))
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "count": int(self.count),
+            "left_dimension": self.left_dimension,
+            "right_dimension": self.right_dimension,
+            "sum_left": self.sum_left,
+            "sum_right": self.sum_right,
+            "left_gram": self.left_gram,
+            "right_gram": self.right_gram,
+            "cross": self.cross,
+        }

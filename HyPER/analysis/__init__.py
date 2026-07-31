@@ -6,6 +6,7 @@ from .representations import (
     event_index_sha256,
     fit_procrustes,
     linear_cka,
+    StreamingLinearCKA,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "event_index_sha256",
     "fit_procrustes",
     "linear_cka",
+    "StreamingLinearCKA",
 ]

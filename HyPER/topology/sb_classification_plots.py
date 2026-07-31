@@ -23,46 +23,15 @@ from sklearn.metrics import (
 )
 
 
-BACKGROUND_COLOUR = "#4C566A"
-SIGNAL_COLOUR = "#3B82F6"
-FM_COLOUR = "#2A9D8F"
-NONFM_COLOUR = "#E07A5F"
-REFERENCE_COLOUR = "#8A8F98"
-
-
-def configure_matplotlib() -> None:
-    plt.rcParams.update(
-        {
-            "figure.figsize": (7.4, 5.5),
-            "figure.dpi": 130,
-            "savefig.dpi": 250,
-            "savefig.bbox": "tight",
-            "savefig.pad_inches": 0.06,
-            "font.family": "DejaVu Sans",
-            "mathtext.fontset": "dejavusans",
-            "font.size": 11.5,
-            "axes.labelsize": 12.5,
-            "axes.titlesize": 14,
-            "axes.titleweight": "normal",
-            "axes.linewidth": 1.05,
-            "axes.grid": False,
-            "xtick.labelsize": 10.5,
-            "ytick.labelsize": 10.5,
-            "xtick.direction": "in",
-            "ytick.direction": "in",
-            "xtick.top": True,
-            "ytick.right": True,
-            "xtick.major.size": 5.5,
-            "ytick.major.size": 5.5,
-            "xtick.minor.size": 2.8,
-            "ytick.minor.size": 2.8,
-            "legend.frameon": False,
-            "legend.fontsize": 10.0,
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-        }
-    )
-
+from HyPER.topology.plot_style import (
+    BACKGROUND_COLOUR,
+    SIGNAL_COLOUR,
+    FM_COLOUR,
+    NONFM_COLOUR,
+    REFERENCE_COLOUR,
+    configure_matplotlib,
+    save_figure as shared_save_figure,
+)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -195,13 +164,7 @@ def save_figure(
     stem: str,
     formats: Iterable[str],
 ) -> None:
-    for output_format in formats:
-        fig.savefig(
-            output_dir / f"{stem}.{output_format}",
-            format=output_format,
-        )
-
-    plt.close(fig)
+    shared_save_figure(fig, output_dir, stem, formats)
 
 
 def draw_filled_histogram(

@@ -55,6 +55,7 @@ import numpy as np
 import pandas as pd
 
 from HyPER.topology.reconstruction_score import ttbar_sl_event_reconstruction_score
+from HyPER.topology.plot_style import configure_matplotlib, save_figure as shared_save_figure
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -679,9 +680,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def save_fig(output_dir: Path, name: str, formats: list[str]) -> None:
-    for fmt in formats:
-        plt.savefig(output_dir / f"{name}.{fmt}", bbox_inches="tight")
-    plt.close()
+    shared_save_figure(plt.gcf(), output_dir, name, formats)
 
 
 def finite(values: pd.Series | np.ndarray) -> np.ndarray:
@@ -1233,6 +1232,7 @@ def append_csv(path: Path, rows: pd.DataFrame, write_header: bool) -> None:
 
 
 def main() -> None:
+    configure_matplotlib()
     args = parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),

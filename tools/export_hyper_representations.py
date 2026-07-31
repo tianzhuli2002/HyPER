@@ -57,7 +57,9 @@ def deterministic_indices(split_cache: str, split: str, count: int, seed: int) -
 
 def main() -> int:
     args = parse_args()
-    device = torch.device("cuda:0" if args.accelerator == "gpu" and torch.cuda.is_available() else "cpu")
+    if args.accelerator == "gpu" and not torch.cuda.is_available():
+        raise RuntimeError("GPU acceleration was requested but PyTorch cannot access CUDA.")
+    device = torch.device("cuda:0" if args.accelerator == "gpu" else "cpu")
     selected = deterministic_indices(args.split_cache, args.split, args.max_events, args.seed)
     cfg = load_analysis_config(args.config)
     module = build_analysis_datamodule(
