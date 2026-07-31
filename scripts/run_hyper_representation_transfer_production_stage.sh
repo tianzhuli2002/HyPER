@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STAGE=${1:?Usage: $0 {export|align|cka|full-cka|evaluate|statistics|plots|validate}}
+if (( $# != 1 )); then
+    echo "Usage: $0 {export|align|cka|full-cka|evaluate|statistics|plots|validate}" >&2
+    exit 2
+fi
+STAGE=$1
 
 REPO=${HYPER_REPRESENTATION_REPO:-/net/scratch/w00238tl/HyPER_representation_transfer_prod}
 PROD=${HYPER_ORIGINAL_RUNTIME:-/net/scratch/w00238tl/HyPER_24_2_speedup_prod}
