@@ -3,16 +3,11 @@ import pandas as pd
 
 from tqdm.rich import tqdm
 
-
-def _load_hyper_outputs(HyPER_outputs: str | pd.DataFrame) -> pd.DataFrame:
-    if isinstance(HyPER_outputs, pd.DataFrame):
-        return HyPER_outputs.copy()
-    if isinstance(HyPER_outputs, str):
-        return pd.read_pickle(HyPER_outputs)
-    raise ValueError(
-        f"Unrecognised HyPER output type {type(HyPER_outputs)}, "
-        "it must be `str` or `pandas.DataFrame`."
-    )
+from .contracts import (
+    append_classifier_column,
+    classification_enabled,
+    load_prediction_frame,
+)
 
 
 def _as_list(x):
@@ -332,10 +327,11 @@ def _nonjet_nodes_from_vct(nodes, vct):
     return [node for node, kind in zip(_as_list(nodes), _as_list(vct)) if kind != 1]
 
 
-def ttH_single_lep(
+def reconstruct_tth(
     HyPER_outputs: str | pd.DataFrame,
+    config=None,
     classification: bool | None = None,
-    strategy: str = "thad_first",
+    strategy: str = "higgs_first",
     max_tlep_candidates: int = 20,
     max_thad_candidates: int = 30,
     max_pair_candidates: int = 60,
@@ -375,7 +371,7 @@ def ttH_single_lep(
             f"expected one of {sorted(valid_strategies)}"
         )
 
-    results = _load_hyper_outputs(HyPER_outputs)
+    results = load_prediction_frame(HyPER_outputs)
 
     HyPER_best_tlep = []
     HyPER_best_thad = []
@@ -724,24 +720,9 @@ def ttH_single_lep(
         "reco_strategy",
     ]
 
-    if bool(classification):
-        if "HyPER_CLS_PROB" not in results.columns:
-            raise KeyError("classification=True requires HyPER_CLS_PROB in prediction output.")
-        columns_to_return.append("HyPER_CLS_PROB")
-
-    return results[columns_to_return]
-
-
-# Alias with shorter naming for config/CLI dispatch.
-def tth_single_lep(
-    HyPER_outputs: str | pd.DataFrame,
-    classification: bool | None = None,
-    strategy: str = "thad_first",
-    **kwargs,
-):
-    return ttH_single_lep(
-        HyPER_outputs,
-        classification=classification,
-        strategy=strategy,
-        **kwargs,
+    columns_to_return = append_classifier_column(
+        columns_to_return,
+        results,
+        classification_enabled(config=config, explicit=classification),
     )
+    return results[columns_to_return]

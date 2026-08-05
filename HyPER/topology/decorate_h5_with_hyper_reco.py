@@ -19,13 +19,16 @@ import numpy as np
 import pandas as pd
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from prediction_io import load_hyper_prediction_output  # noqa: E402
-from ttbar import ttbar_single_lep  # noqa: E402
-from tth import ttH_single_lep  # noqa: E402
+from HyPER.topology.prediction_io import (  # noqa: E402
+    coerce_source_indices,
+    load_hyper_prediction_output,
+)
+from HyPER.topology.ttbar import reconstruct_ttbar1l  # noqa: E402
+from HyPER.topology.tth import reconstruct_tth  # noqa: E402
 
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -134,11 +137,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-h5", required=True)
     parser.add_argument("--hyper-output", required=True)
     parser.add_argument("--output-h5", required=True)
-    parser.add_argument("--topology", required=True, choices=["ttbar_singlelep", "ttH"])
+    parser.add_argument("--topology", required=True, choices=["ttbar1L", "ttH"])
     parser.add_argument("--max-events", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--summary-json", default=None)
-    parser.add_argument("--strict", action="store_true")
     parser.add_argument("--debug-mirror", action="store_true")
     parser.add_argument(
         "--write-debug-indices",
@@ -590,11 +592,11 @@ def semantic_ttbar_singlelep_reco(hyper_df: pd.DataFrame) -> pd.DataFrame:
             )
         # Current production models are trained without a classification head.
         # Ignore any legacy HyPER_CLS_RAW column and reconstruct without requiring it.
-        hyper_df = ttbar_single_lep(hyper_df, classification=False)
+        hyper_df = reconstruct_ttbar1l(hyper_df, classification=False)
     else:
         hyper_df = hyper_df.copy()
 
-    # ttbar_single_lep swaps candidates after finding tlep_position, so the old
+    # reconstruct_ttbar1l swaps candidates after finding tlep_position, so the old
     # names below are semantic after that swap: top1/w1 are leptonic, top2/w2
     # are hadronic.
     semantic = pd.DataFrame(index=hyper_df.index)
@@ -639,7 +641,7 @@ def semantic_tth_singlelep_reco(hyper_df: pd.DataFrame) -> pd.DataFrame:
                 + ", ".join(missing)
             )
         # Current production models are no-class; old classification outputs are ignored.
-        hyper_df = ttH_single_lep(hyper_df, classification=False)
+        hyper_df = reconstruct_tth(hyper_df, classification=False)
     else:
         hyper_df = hyper_df.copy()
     for score_column in (
@@ -652,79 +654,6 @@ def semantic_tth_singlelep_reco(hyper_df: pd.DataFrame) -> pd.DataFrame:
         if score_column not in hyper_df.columns:
             hyper_df[score_column] = np.nan
     return hyper_df.reset_index(drop=True)
-
-
-def align_reco_to_h5_prefix(
-    raw_hyper_df: pd.DataFrame,
-    reco: pd.DataFrame,
-    n_processed: int,
-    strict: bool,
-    warnings_list: list[str],
-) -> tuple[pd.DataFrame, str]:
-    """Align prediction rows to the copied H5 prefix when event_index is available.
-
-    The decorator writes a prefix of the input H5.  Selected prediction outputs may
-    carry an ``event_index`` column; when that index is the same prefix, or a
-    permutation of it, we verify/reorder explicitly.  Arbitrary sparse subsets need
-    a matching sampled H5 and are reported loudly instead of being silently treated
-    as aligned.
-    """
-    reco = reco.iloc[:n_processed].reset_index(drop=True)
-    if "event_index" not in raw_hyper_df.columns:
-        warning = (
-            "HyPER output has no event_index column; assuming prediction row order "
-            "matches the input H5 prefix."
-        )
-        LOGGER.warning(warning)
-        warnings_list.append(warning)
-        return reco, "row_order_prefix_assumed"
-
-    event_index = pd.to_numeric(
-        raw_hyper_df["event_index"].iloc[:n_processed],
-        errors="coerce",
-    ).to_numpy(dtype=float)
-    if len(event_index) != n_processed or not np.all(np.isfinite(event_index)):
-        warning = (
-            "HyPER output event_index is missing or non-finite for some processed rows; "
-            "assuming prediction row order matches the input H5 prefix."
-        )
-        if strict:
-            raise ValueError(warning)
-        LOGGER.warning(warning)
-        warnings_list.append(warning)
-        return reco, "row_order_prefix_assumed_event_index_invalid"
-
-    event_index_int = event_index.astype(np.int64)
-    if not np.allclose(event_index, event_index_int):
-        warning = (
-            "HyPER output event_index contains non-integer values; assuming prediction "
-            "row order matches the input H5 prefix."
-        )
-        if strict:
-            raise ValueError(warning)
-        LOGGER.warning(warning)
-        warnings_list.append(warning)
-        return reco, "row_order_prefix_assumed_event_index_invalid"
-
-    expected = np.arange(n_processed, dtype=np.int64)
-    if np.array_equal(event_index_int, expected):
-        return reco, "event_index_prefix_verified"
-
-    if np.array_equal(np.sort(event_index_int), expected):
-        order = np.argsort(event_index_int)
-        return reco.iloc[order].reset_index(drop=True), "event_index_prefix_reordered"
-
-    warning = (
-        "HyPER output event_index is not the copied H5 prefix 0..n_processed-1. "
-        "This decorator currently writes prefix H5 files, so arbitrary sampled "
-        "prediction subsets need a matching sampled H5. Assuming row-order alignment "
-        "for this run."
-    )
-    if strict:
-        raise ValueError(warning)
-    LOGGER.warning(warning)
-    warnings_list.append(warning)
-    return reco, "row_order_prefix_assumed_event_index_nonprefix"
 
 
 def decorate_ttbar_singlelep(
@@ -1289,6 +1218,84 @@ def copy_group_chunked(
             copy_dataset_chunked(item, dest_group, name, n_input_events, event_limit, chunk_size)
 
 
+def copy_dataset_indexed(
+    src_ds: h5py.Dataset,
+    dst_group: h5py.Group,
+    name: str,
+    n_input_events: int,
+    source_indices: np.ndarray,
+    chunk_size: int,
+) -> None:
+    kwargs = _dataset_create_kwargs(src_ds)
+    if src_ds.shape and src_ds.shape[0] == n_input_events:
+        shape = (len(source_indices),) + tuple(src_ds.shape[1:])
+        dst = dst_group.create_dataset(name, shape=shape, dtype=src_ds.dtype, **kwargs)
+        _copy_attrs(src_ds.attrs, dst.attrs)
+        for start in range(0, len(source_indices), chunk_size):
+            stop = min(start + chunk_size, len(source_indices))
+            chunk = np.asarray(source_indices[start:stop], dtype=np.int64)
+            order = np.argsort(chunk, kind="mergesort")
+            sorted_values = src_ds[chunk[order]]
+            restore = np.empty_like(order)
+            restore[order] = np.arange(order.size)
+            dst[start:stop] = sorted_values[restore]
+        return
+    copy_dataset_chunked(
+        src_ds, dst_group, name, n_input_events,
+        n_input_events, chunk_size,
+    )
+
+
+def copy_group_indexed(
+    source_group: h5py.Group,
+    dest_group: h5py.Group,
+    n_input_events: int,
+    source_indices: np.ndarray,
+    chunk_size: int,
+) -> None:
+    _copy_attrs(source_group.attrs, dest_group.attrs)
+    for name, item in source_group.items():
+        if isinstance(item, h5py.Group):
+            child = dest_group.create_group(name)
+            copy_group_indexed(
+                item, child, n_input_events, source_indices, chunk_size
+            )
+        elif isinstance(item, h5py.Dataset):
+            copy_dataset_indexed(
+                item, dest_group, name, n_input_events, source_indices, chunk_size
+            )
+
+
+def copy_input_h5_indexed(
+    input_h5: str,
+    output_h5: str,
+    overwrite: bool,
+    n_input_events: int,
+    source_indices: np.ndarray,
+    chunk_size: int = 100000,
+) -> None:
+    if Path(input_h5).resolve() == Path(output_h5).resolve():
+        raise ValueError("--output-h5 must be different from --input-h5.")
+    output_path = Path(output_h5)
+    if output_path.exists():
+        if not overwrite:
+            raise FileExistsError(
+                f"{output_h5} exists; rerun with --overwrite to replace it."
+            )
+        output_path.unlink()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(input_h5, "r") as source, h5py.File(output_h5, "w") as dest:
+        _copy_attrs(source.attrs, dest.attrs)
+        copy_group_indexed(
+            source, dest, n_input_events, source_indices, int(chunk_size)
+        )
+        provenance = dest.require_group("PROVENANCE")
+        provenance.create_dataset(
+            "source_event_index",
+            data=np.asarray(source_indices, dtype=np.int64),
+        )
+
+
 def copy_input_h5(
     input_h5: str,
     output_h5: str,
@@ -1339,11 +1346,11 @@ def build_summary(
         "n_thad_valid": int(reco_counters.get("thad_valid", 0)),
         "n_whad_valid": int(reco_counters.get("whad_valid", 0)),
         "n_b_lep_valid": int(reco_counters.get("b_lep_valid", 0)),
-        "length_mismatch": bool(n_input_events != n_reco_events),
+        "source_subset": bool(n_processed != n_input_events),
         "event_alignment": alignment_mode,
         "event_alignment_policy": (
-            "event_index is verified/reordered when it describes the copied H5 prefix; "
-            "otherwise row-order prefix alignment is assumed unless --strict raises."
+            "Output rows are copied from the source H5 in exact source_event_index order; "
+            "missing, duplicate, non-integral, or out-of-range indices are rejected."
         ),
         "invalid_reasons": {
             key: int(invalid_reasons.get(key, 0))
@@ -1377,7 +1384,7 @@ def main() -> None:
     hyper_df = load_hyper_dataframe(str(hyper_output), max_events=args.max_events)
     n_loaded_reco_events = len(hyper_df)
     n_reco_events = int(hyper_df.attrs.get("hyper_total_rows", n_loaded_reco_events))
-    if args.topology == "ttbar_singlelep":
+    if args.topology == "ttbar1L":
         reco = semantic_ttbar_singlelep_reco(hyper_df)
     elif args.topology == "ttH":
         reco = semantic_tth_singlelep_reco(hyper_df)
@@ -1390,46 +1397,36 @@ def main() -> None:
                 raise KeyError(f"Missing required input dataset {required}")
         n_input_events = len(source["INPUTS/JET"])
 
-    if args.strict and n_input_events != n_reco_events:
-        raise ValueError(
-            f"Length mismatch: input H5 has {n_input_events} events, "
-            f"HyPER output has {n_reco_events} rows."
-        )
-
     warnings_list: list[str] = []
-    if n_input_events != n_reco_events:
-        warning = (
-            f"Length mismatch: input H5 has {n_input_events} events, "
-            f"HyPER output has {n_reco_events} rows; processing the available prefix."
+    n_processed = int(n_loaded_reco_events)
+    if n_processed == 0:
+        raise ValueError("Prediction output contains no rows to decorate.")
+    if len(reco) != n_processed:
+        raise RuntimeError(
+            f"Topology reconstruction returned {len(reco)} rows for "
+            f"{n_processed} prediction rows."
         )
-        LOGGER.warning(warning)
-        warnings_list.append(warning)
-
-    n_processed = min(n_input_events, n_loaded_reco_events, n_reco_events)
-    if args.max_events is not None:
-        n_processed = min(n_processed, int(args.max_events))
-
-    reco_for_processing, alignment_mode = align_reco_to_h5_prefix(
+    source_indices, index_warnings = coerce_source_indices(
         hyper_df,
-        reco,
-        n_processed,
-        args.strict,
-        warnings_list,
+        n_h5_events=n_input_events,
+        allow_duplicates=False,
     )
+    warnings_list.extend(index_warnings)
+    reco_for_processing = reco.reset_index(drop=True)
+    alignment_mode = "source_event_index_indexed_copy"
 
-    copy_limit = n_processed if args.max_events is not None else None
-    copy_input_h5(
+    copy_input_h5_indexed(
         str(input_h5),
         args.output_h5,
         args.overwrite,
         n_input_events=n_input_events,
-        event_limit=copy_limit,
+        source_indices=source_indices,
         chunk_size=args.chunk_size,
     )
     with h5py.File(args.output_h5, "a") as output:
         n_output_events = len(output["INPUTS/JET"])
         decorate_start_time = time.monotonic()
-        if args.topology == "ttbar_singlelep":
+        if args.topology == "ttbar1L":
             datasets, debug_datasets, fields_written = create_decoration_datasets(
                 output,
                 n_output_events,

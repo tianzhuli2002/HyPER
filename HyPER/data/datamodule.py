@@ -33,7 +33,6 @@ class HyPERDataModule(LightningDataModule):
         self,
         root: str,
         train_set: Optional[str] = None,
-        val_set: Optional[str] = None,
         predict_set: Optional[str] = None,
         batch_size: int = 128,
         drop_last: bool = True,
@@ -41,8 +40,6 @@ class HyPERDataModule(LightningDataModule):
         pin_memory: bool = True,
         persistent_workers: bool = True,
         prefetch_factor: int = 2,
-        force_reload: bool = False,
-        use_ondisk: bool = True,
         graph_config: Optional[dict] = None,
         split_config: Optional[dict] = None,
         predict_split: Optional[str] = None,
@@ -63,7 +60,6 @@ class HyPERDataModule(LightningDataModule):
         
         self.root = root
         self.train_set = train_set
-        self.val_set = val_set
         self.predict_set = predict_set
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -76,8 +72,6 @@ class HyPERDataModule(LightningDataModule):
             raise ValueError("dataset.num_workers must be non-negative.")
         if int(self.prefetch_factor) <= 0:
             raise ValueError("dataset.prefetch_factor must be positive.")
-        self.force_reload = force_reload
-        self.use_ondisk = use_ondisk
         self.graph_config = deepcopy(graph_config) if graph_config is not None else None
         self.split_config = deepcopy(split_config) if split_config is not None else {}
         self.predict_split = self._normalise_split_name(predict_split)
@@ -105,9 +99,9 @@ class HyPERDataModule(LightningDataModule):
         self.edge_in_channels = len(parsed_inputs['input']['edge_features'])
         self.global_in_channels = len(feature_layout["global"]["resolved_features"])
         target_cfg = parsed_inputs.get('target', {})
-        self.target_encoding = str(target_cfg.get('encoding', '')).strip().lower()
+        self.target_encoding = str(target_cfg.get('encoding', 'typed')).strip().lower()
         if self.target_encoding != 'typed':
-            raise ValueError("target.encoding must be explicitly set to 'typed'.")
+            raise ValueError("HyPER supports typed reconstruction targets only.")
         edge_targets = target_cfg.get('edge', {}) or {}
         hyperedge_targets = target_cfg.get('hyperedge', {}) or {}
         self.edge_target_names = list(edge_targets.keys())
@@ -153,26 +147,22 @@ class HyPERDataModule(LightningDataModule):
         return name
 
     def _split_enabled(self) -> bool:
-        return self._as_bool(self.split_config.get("enabled", False), default=False)
+        # Persistent train/validation/test splits are the only supported path.
+        return bool(self.split_config)
 
     def _dataset(self, name: str, training: bool):
+        if name is None or not str(name).strip():
+            raise ValueError("A graph-database dataset name is required.")
         t0 = time.perf_counter()
-        if self.use_ondisk:
-            dataset = HyPEROnDiskDataset(
-                root=self.root,
-                name=name,
-                training=training,
-                force_reload=self.force_reload,
-                batch_size=self.batch_size,
-                num_workers=self.num_workers,
-                config=self.graph_config,
-            )
-        else:
-            dataset = HyPERDataset(
-                root=self.root,
-                name=name,
-                config=self.graph_config,
-            )
+        dataset = HyPEROnDiskDataset(
+            root=self.root,
+            name=name,
+            training=training,
+            force_reload=False,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            config=self.graph_config,
+        )
         self.setup_timings[f"dataset_{name}_{'train' if training else 'predict'}_s"] = time.perf_counter() - t0
         return dataset
 
@@ -319,7 +309,6 @@ class HyPERDataModule(LightningDataModule):
         metadata = split_result["metadata"]
         print("================================")
         print("HyPER train/validation/test split")
-        print("split enabled: true")
         print(f"source H5: {metadata.get('source_h5_path')}")
         print(f"n total: {metadata.get('n_events')}")
         print(f"stratify requested: {metadata.get('stratify')}")
@@ -334,9 +323,9 @@ class HyPERDataModule(LightningDataModule):
             print(f"  {name}: {split_counts.get(name, 0)} {self._format_counts(label_counts.get(name, {}))}")
         print("================================")
 
-    def _setup_explicit_split(self):
+    def _setup_explicit_split(self, stage: str | None):
         if self.train_set is None or str(self.train_set).strip() == "":
-            raise ValueError("dataset.split.enabled=true requires dataset.train_set to identify the source H5.")
+            raise ValueError("A persistent dataset split requires dataset.train_set.")
 
         if self.tuning_mode:
             cache_path = self.split_config.get("cache_path")
@@ -417,41 +406,60 @@ class HyPERDataModule(LightningDataModule):
                     f"and validation splits; insufficient class composition: {failures}."
                 )
 
-        full_data = self._dataset(self.train_set, training=True)
+        full_data = self._dataset(
+            self.train_set, training=stage not in {"predict"}
+        )
         indices = split_result["indices"]
-        self.train_data = self._make_indexed_subset(full_data, indices["train"], "train")
-        self.val_data = self._make_indexed_subset(full_data, indices["val"], "val")
-        self.test_data = None if self.tuning_mode else self._make_indexed_subset(full_data, indices["test"], "test")
+        needs_train = stage in {None, "fit"}
+        needs_val = stage in {None, "fit", "validate"}
+        needs_test = not self.tuning_mode and stage in {None, "test"}
 
-        if self.predict_split == "train":
-            self.predict_data = self.train_data
-            self.resolved_predict_split = "train"
-        elif self.predict_split == "val":
-            self.predict_data = self.val_data
-            self.resolved_predict_split = "val"
-        elif self.predict_split == "test":
-            self.predict_data = self.test_data
-            self.resolved_predict_split = "test"
+        self.train_data = (
+            self._make_indexed_subset(full_data, indices["train"], "train")
+            if needs_train
+            else None
+        )
+        self.val_data = (
+            self._make_indexed_subset(full_data, indices["val"], "val")
+            if needs_val
+            else None
+        )
+        self.test_data = (
+            self._make_indexed_subset(full_data, indices["test"], "test")
+            if needs_test
+            else None
+        )
+
+        if stage == "predict" and self.source_indices_file is None:
+            if self.predict_split not in {"train", "val", "test"}:
+                raise ValueError(
+                    "Prediction from a persistent split requires predicting.split "
+                    "to be train, val, or test."
+                )
+            self.predict_data = self._make_indexed_subset(
+                full_data, indices[self.predict_split], self.predict_split
+            )
+            self.resolved_predict_split = self.predict_split
     
-    def setup(self, stage: str):
-        """Setting up datasets."""
+    def setup(self, stage: str | None):
+        """Initialise only the datasets required by the Lightning stage."""
+        if stage not in {None, "fit", "validate", "test", "predict"}:
+            raise ValueError(f"Unsupported Lightning setup stage: {stage!r}")
         setup_t0 = time.perf_counter()
         if self._split_enabled():
-            self._setup_explicit_split()
+            self._setup_explicit_split(stage)
 
         elif self.train_set is not None:
-            if self.val_set is None or str(self.val_set).strip() == "" or self.train_set == self.val_set:
-                raise ValueError(
-                    "Training requires either dataset.split.enabled=true or distinct explicit "
-                    "dataset.train_set and dataset.val_set H5 files."
-                )
-            self.train_data = self._dataset(self.train_set, training=True)
-            self.val_data = self._dataset(self.val_set, training=True)
+            raise ValueError(
+                "HyPER requires a persistent dataset.split configuration; "
+                "separate ad-hoc train/validation files are no longer supported."
+            )
 
+        prediction_requested = stage in {None, "predict"}
         if self.tuning_mode:
             self.predict_data = None
             self.resolved_predict_split = None
-        elif self.source_indices_file is not None:
+        elif prediction_requested and self.source_indices_file is not None:
             if self.predict_set is None:
                 raise ValueError("predicting.source_indices_file requires dataset.predict_set.")
             prediction_source = self._dataset(self.predict_set, training=False)
@@ -472,14 +480,21 @@ class HyPERDataModule(LightningDataModule):
                 split_name = "source_indices"
             self.predict_data = self._make_indexed_subset(prediction_source, indices, split_name)
             self.resolved_predict_split = split_name
-        elif self.predict_data is None and self.predict_set is not None:
+        elif prediction_requested and self.predict_data is None and self.predict_set is not None:
             self.predict_data = self._make_indexed_full_dataset(
                 self._dataset(self.predict_set, training=False), split_name="all"
             )
             self.resolved_predict_split = "all"
 
-        if self.train_data is None and self.val_data is None and self.predict_data is None:
-            raise ValueError("No datasets have been provided. Abort!")
+        required = {
+            "fit": (self.train_data, self.val_data),
+            "validate": (self.val_data,),
+            "test": (self.test_data,),
+            "predict": (self.predict_data,),
+            None: (self.train_data, self.val_data, self.test_data, self.predict_data),
+        }[stage]
+        if any(dataset is None for dataset in required):
+            raise RuntimeError(f"Dataset initialisation is incomplete for stage {stage!r}.")
         self.setup_timings["setup_total_s"] = time.perf_counter() - setup_t0
 
         # Print dataset summary (keep Rich - negligible overhead)
@@ -492,15 +507,12 @@ class HyPERDataModule(LightningDataModule):
             table.add_column("Name", justify="left")
             table.add_column("Value", justify="left")
             table.add_row("Drop last batch", str(self.drop_last))
-            table.add_row("Use on-disk DB", str(self.use_ondisk))
-            table.add_row("Force reload", str(self.force_reload))
             table.add_row("Batch size", str(self.batch_size))
             table.add_row("Num workers", str(self.num_workers))
             table.add_row("Persistent workers", str(self.persistent_workers))
             table.add_row("Prefetch factor", str(self.prefetch_factor))
             table.add_row("Pin memory", str(self.pin_memory))
-            table.add_row("Dataset mode", "ondisk" if self.use_ondisk else "raw_h5")
-            table.add_row("Explicit split enabled", str(self._split_enabled()))
+            table.add_row("Dataset source", "validated on-disk graph database")
             if self._split_enabled():
                 table.add_row("Split cache", str(self.split_cache_path))
                 table.add_row("Predict split", str(self.predict_split))
@@ -509,7 +521,7 @@ class HyPERDataModule(LightningDataModule):
                 table.add_row("Training set", str(self.train_set))
                 table.add_row("Training samples", str(len(self.train_data)))
             if self.val_data is not None:
-                table.add_row("Validation set", str(self.val_set) if self.val_set else "split from training set")
+                table.add_row("Validation set", "persistent validation split")
                 table.add_row("Validation samples", str(len(self.val_data)))
             if self.test_data is not None:
                 table.add_row("Test samples", str(len(self.test_data)))

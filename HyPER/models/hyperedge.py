@@ -4,7 +4,7 @@ import math
 from torch.nn import Module, Sequential as Seq, Linear, ReLU, Dropout, Parameter, init
 from torch.nn.functional import relu
 
-from HyPER.utils import softmax
+from HyPER.utils.softmax import softmax
 
 class HyperedgeModel(Module):
     r"""Hyperedge Model.

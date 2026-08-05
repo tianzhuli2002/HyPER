@@ -2,10 +2,10 @@ from torch.nn import Module
 from torch_geometric.nn import MetaLayer
 from typing import Optional
 
-from .messagePassing import EdgeModel, NodeModel, GlobalModel
+from .message_passing import EdgeModel, NodeModel, GlobalModel
 
 
-class MPNNs(Module):
+class MessagePassingBlock(Module):
     r""" The Message Passing Neural Networks.
 
     Args:
@@ -30,7 +30,7 @@ class MPNNs(Module):
             message_feats: Optional[int] = 32,
             dropout: Optional[float] = 0.01,
         ) -> None:
-        super(MPNNs, self).__init__()
+        super().__init__()
 
         self.MPNNBlock = MetaLayer(
             EdgeModel(node_in_channels=node_in_channels, edge_in_channels=edge_in_channels, global_in_channels=global_in_channels, edge_out_channels=edge_out_channels, message_feats=message_feats, dropout=dropout),

@@ -5,27 +5,8 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.export.dynamic_shapes import Dim
 
+from HyPER.checkpoints import resolve_checkpoint
 from HyPER.models import HyPERModel
-
-
-def _resolve_checkpoint(selector: str | None, model_directory: str | None) -> Path:
-    if selector is None or not str(selector).strip():
-        raise ValueError("onnx_export.checkpoint must be an explicit path or selector 'best'/'last'.")
-    direct = Path(str(selector)).expanduser()
-    if direct.is_file():
-        return direct.resolve()
-    if selector not in {"best", "last"} or not model_directory:
-        raise ValueError("ONNX checkpoint must be an existing path, or best/last with model_directory.")
-    directory = Path(str(model_directory)).expanduser() / "checkpoints"
-    if selector == "last":
-        path = directory / "last.ckpt"
-        if not path.is_file():
-            raise FileNotFoundError(path)
-        return path.resolve()
-    candidates = list(directory.glob("best-total*.ckpt"))
-    if len(candidates) != 1:
-        raise RuntimeError(f"Expected exactly one best-total checkpoint in {directory}, found {len(candidates)}.")
-    return candidates[0].resolve()
 
 
 class _ONNXOutputAdapter(torch.nn.Module):
@@ -66,7 +47,11 @@ def Onnx(cfg : DictConfig) -> None:
     map_location = torch.device('cuda') if str(predict_with).lower() == "gpu" else torch.device('cpu')
 
     # Load checkpoints
-    ckpt_file = _resolve_checkpoint(cfg.onnx_export.checkpoint, cfg.onnx_export.model_directory)
+    ckpt_file = resolve_checkpoint(
+        cfg.onnx_export.checkpoint,
+        cfg.onnx_export.model_directory,
+        purpose="ONNX checkpoint",
+    )
     model = HyPERModel.load_from_checkpoint(str(ckpt_file), map_location=map_location)
 
     model.eval()

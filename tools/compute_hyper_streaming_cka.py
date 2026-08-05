@@ -26,6 +26,8 @@ from HyPER.analysis.runtime import (
     load_analysis_config,
     load_frozen_model,
     truth_fully_matched,
+    resource_diagnostics,
+    write_resource_diagnostics,
 )
 from HyPER.topology.plot_style import configure_matplotlib, decorate_axis, save_figure
 
@@ -48,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     for mode in MODES:
         parser.add_argument(f"--{mode}-config", required=True)
         parser.add_argument(f"--{mode}-checkpoint", required=True)
+    parser.add_argument("--topology", choices=("ttbar1L", "ttH"), required=True)
     parser.add_argument("--h5", required=True)
     parser.add_argument("--split-cache", required=True)
     parser.add_argument("--dataset-root", required=True)
@@ -113,10 +116,13 @@ def main() -> int:
         mode: load_frozen_model(getattr(args, f"{mode}_checkpoint"), device)
         for mode in MODES
     }
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     accumulators: dict[tuple[str, str, str], StreamingLinearCKA] = {}
     subset_counts = {name: 0 for name in SUBSETS}
     event_hash = hashlib.sha256()
     batch_count = 0
+    representation_dimension = None
     started = time.perf_counter()
     with torch.inference_mode():
         for batch in module.predict_dataloader():
@@ -125,15 +131,22 @@ def main() -> int:
             for mode, model in models.items():
                 _, reps = forward_representations(model, batch)
                 value = reps["final_event"].detach().float().cpu().numpy()
-                if value.ndim != 2 or value.shape[1] != 1024:
+                if value.ndim != 2 or value.shape[1] <= 0:
                     raise RuntimeError(f"{mode} final_event has unexpected shape {value.shape}.")
                 if not np.isfinite(value).all():
                     raise RuntimeError(f"{mode} final_event contains non-finite values.")
+                if representation_dimension is None:
+                    representation_dimension = int(value.shape[1])
+                elif int(value.shape[1]) != representation_dimension:
+                    raise RuntimeError(
+                        f"{mode} final_event dimension {value.shape[1]} differs from "
+                        f"the expected {representation_dimension}."
+                    )
                 representations[mode] = value
             indices = batch.source_event_index.detach().cpu().reshape(-1).numpy().astype(np.int64)
             event_hash.update(np.ascontiguousarray(indices).tobytes())
             labels = batch.cls_t.detach().cpu().reshape(-1).numpy().astype(np.int8)
-            fm = truth_fully_matched(batch).astype(bool)
+            fm = truth_fully_matched(batch, args.topology).astype(bool)
             masks = subset_masks(labels, fm)
             for subset, mask in masks.items():
                 count = int(mask.sum())
@@ -175,12 +188,13 @@ def main() -> int:
             )
     summary = {
         "title": args.title,
+        "topology": args.topology,
         "split": args.split,
         "event_count": int(len(selected)),
         "subset_counts": subset_counts,
         "event_index_hash": event_hash.hexdigest(),
         "representation": "final_event",
-        "representation_dimension": 1024,
+        "representation_dimension": int(representation_dimension),
         "classification_head_input_alias": "final_event",
         "model_checkpoints": {
             mode: str(Path(getattr(args, f"{mode}_checkpoint")).expanduser().resolve())
@@ -193,7 +207,7 @@ def main() -> int:
         "events_per_second": float(len(selected) / elapsed) if elapsed > 0 else None,
     }
     (output / "full_test_final_event_cka.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8"
     )
     with (output / "full_test_final_event_cka.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -219,6 +233,9 @@ def main() -> int:
     ax.legend(loc="best")
     fig.tight_layout()
     save_figure(fig, output, "full_test_final_event_cka")
+    diagnostics = resource_diagnostics(stage="full-cka", started=started, events_processed=len(selected), output_root=output)
+    diagnostics.update({"topology": args.topology, "split": args.split, "representation": "final_event"})
+    write_resource_diagnostics(output, diagnostics)
     print(f"wrote={output} events={len(selected)} elapsed_seconds={elapsed:.1f}")
     return 0
 

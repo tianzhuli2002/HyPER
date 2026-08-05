@@ -75,9 +75,10 @@ def parse_args() -> argparse.Namespace:
         default=40,
     )
     parser.add_argument(
-        "--formats",
-        nargs="+",
-        default=("pdf", "png"),
+        "--formats", nargs="+", default=("pdf", "png")
+    )
+    parser.add_argument(
+        "--plot-set", choices=("essential", "full"), default="essential"
     )
     return parser.parse_args()
 
@@ -173,7 +174,7 @@ def draw_filled_histogram(
     bins: np.ndarray,
     label: str,
     colour: str,
-    alpha: float = 0.20,
+    alpha: float = 0.12,
 ) -> None:
     if len(values) == 0:
         return
@@ -220,7 +221,7 @@ def make_score_plot(
         )
 
     ax.set_xlabel("HyPER classification score")
-    ax.set_ylabel("Normalised events")
+    ax.set_ylabel("Probability density")
     ax.set_xlim(0.0, 1.0)
 
     if logarithmic:
@@ -301,7 +302,7 @@ def make_background_rejection_plot(
 
     ax.set_xlabel("Signal efficiency")
     ax.set_ylabel("Background rejection  $1/\\epsilon_{\\mathrm{bkg}}$")
-    ax.set_xlim(0.0, 1.0)
+    ax.set_xlim(0.2, 0.9)
     ax.set_yscale("log")
 
     decorate_axis(ax, experiment_label, model_label)
@@ -449,6 +450,24 @@ def rejection_at_efficiency(
     return float(1.0 / max(float(fpr[index]), minimum_efficiency))
 
 
+def binary_subset_roc(
+    background_score: np.ndarray,
+    signal_score: np.ndarray,
+    label: str,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    if len(background_score) == 0 or len(signal_score) == 0:
+        raise RuntimeError(
+            f"{label} ROC requires at least one background and one signal event."
+        )
+    truth = np.concatenate(
+        [np.zeros(len(background_score), dtype=np.int8),
+         np.ones(len(signal_score), dtype=np.int8)]
+    )
+    scores = np.concatenate([background_score, signal_score])
+    fpr, tpr, _ = roc_curve(truth, scores)
+    return fpr, tpr, float(roc_auc_score(truth, scores))
+
+
 def main() -> None:
     configure_matplotlib()
     args = parse_args()
@@ -506,21 +525,9 @@ def main() -> None:
     auc_all = float(roc_auc_score(truth, score))
     fpr_all, tpr_all, _ = roc_curve(truth, score)
 
-    fm_truth = np.concatenate(
-        [
-            np.zeros(len(background_score), dtype=np.int8),
-            np.ones(len(signal_fm_score), dtype=np.int8),
-        ]
+    fpr_fm, tpr_fm, auc_fm = binary_subset_roc(
+        background_score, signal_fm_score, "Fully matched signal"
     )
-    fm_score = np.concatenate(
-        [
-            background_score,
-            signal_fm_score,
-        ]
-    )
-
-    auc_fm = float(roc_auc_score(fm_truth, fm_score))
-    fpr_fm, tpr_fm, _ = roc_curve(fm_truth, fm_score)
 
     prediction = (score >= 0.5).astype(np.int8)
     accuracy = float(accuracy_score(truth, prediction))
@@ -534,59 +541,28 @@ def main() -> None:
 
     category_groups = [
         ("Background", background_score, BACKGROUND_COLOUR),
-        ("Signal FM", signal_fm_score, FM_COLOUR),
-        ("Signal non-FM", signal_nonfm_score, NONFM_COLOUR),
+        ("Fully matched signal", signal_fm_score, FM_COLOUR),
+        ("Not fully matched signal", signal_nonfm_score, NONFM_COLOUR),
     ]
 
     make_score_plot(
         args.output_dir,
-        all_groups,
-        bins,
-        args.experiment_label,
-        model_label,
-        "classifier_score_hist",
-        args.formats,
-    )
-
-    make_score_plot(
-        args.output_dir,
-        all_groups,
-        bins,
-        args.experiment_label,
-        model_label,
-        "classifier_score_all_signal_vs_background",
-        args.formats,
-    )
-
-    make_score_plot(
-        args.output_dir,
         category_groups,
         bins,
         args.experiment_label,
         model_label,
-        "classifier_score_by_truth",
+        "classification_scores",
         args.formats,
     )
 
-    make_score_plot(
-        args.output_dir,
-        category_groups,
-        bins,
-        args.experiment_label,
-        model_label,
-        "classifier_score_signal_fm_nonfm_background",
-        args.formats,
+    fpr_nonfm, tpr_nonfm, auc_nonfm = binary_subset_roc(
+        background_score, signal_nonfm_score, "Not fully matched signal"
     )
-
 
     roc_curves = [
-        (
-            "All signal",
-            fpr_all,
-            tpr_all,
-            auc_all,
-            SIGNAL_COLOUR,
-        ),
+        ("All signal", fpr_all, tpr_all, auc_all, SIGNAL_COLOUR),
+        ("Fully matched signal", fpr_fm, tpr_fm, auc_fm, FM_COLOUR),
+        ("Not fully matched signal", fpr_nonfm, tpr_nonfm, auc_nonfm, NONFM_COLOUR),
     ]
 
     make_standard_roc(
@@ -599,15 +575,21 @@ def main() -> None:
     )
 
 
-
-    make_confusion_matrix(
+    make_background_rejection_plot(
         args.output_dir,
-        truth,
-        prediction,
+        [
+            (label, fpr, tpr, auc_value, colour, len(background_score))
+            for label, fpr, tpr, auc_value, colour in roc_curves
+        ],
         args.experiment_label,
         model_label,
         args.formats,
     )
+
+    if args.plot_set == "full":
+        make_confusion_matrix(
+            args.output_dir, truth, prediction, args.experiment_label, model_label, args.formats
+        )
 
     counts = {
         "all": int(len(score)),
@@ -617,13 +599,10 @@ def main() -> None:
         "signal_nonfm": int(signal_nonfm_mask.sum()),
     }
 
-    make_category_fractions(
-        args.output_dir,
-        counts,
-        args.experiment_label,
-        model_label,
-        args.formats,
-    )
+    if args.plot_set == "full":
+        make_category_fractions(
+            args.output_dir, counts, args.experiment_label, model_label, args.formats
+        )
 
     summary = {
         "prediction_output": str(args.prediction_output.resolve()),
@@ -641,6 +620,7 @@ def main() -> None:
         # Additional detailed fields.
         "auc_all_signal": auc_all,
         "auc_fm_signal": auc_fm,
+        "auc_nonfm_signal": auc_nonfm,
         "accuracy_at_threshold_0p5": accuracy,
         "background_rejection": {
             "all_signal_at_50_percent": rejection_at_efficiency(
@@ -674,10 +654,16 @@ def main() -> None:
                 len(background_score),
             ),
             "fm_signal_at_80_percent": rejection_at_efficiency(
-                fpr_fm,
-                tpr_fm,
-                0.80,
-                len(background_score),
+                fpr_fm, tpr_fm, 0.80, len(background_score)
+            ),
+            "nonfm_signal_at_50_percent": rejection_at_efficiency(
+                fpr_nonfm, tpr_nonfm, 0.50, len(background_score)
+            ),
+            "nonfm_signal_at_70_percent": rejection_at_efficiency(
+                fpr_nonfm, tpr_nonfm, 0.70, len(background_score)
+            ),
+            "nonfm_signal_at_80_percent": rejection_at_efficiency(
+                fpr_nonfm, tpr_nonfm, 0.80, len(background_score)
             ),
         },
     }
@@ -686,8 +672,31 @@ def main() -> None:
     # validate_workflow_suite.py.
     summary_text = json.dumps(summary, indent=2, sort_keys=True) + "\n"
 
-    (args.output_dir / "summary.json").write_text(summary_text)
-    (args.output_dir / "pretty_summary.json").write_text(summary_text)
+    (args.output_dir / "metrics.json").write_text(summary_text, encoding="utf-8")
+    metrics_rows = []
+    for subset, auc_value, fpr, tpr, signal_count in (
+        ("all_signal", auc_all, fpr_all, tpr_all, len(signal_score)),
+        ("fully_matched_signal", auc_fm, fpr_fm, tpr_fm, len(signal_fm_score)),
+        ("not_fully_matched_signal", auc_nonfm, fpr_nonfm, tpr_nonfm, len(signal_nonfm_score)),
+    ):
+        metrics_rows.append(
+            {
+                "subset": subset,
+                "signal_events": int(signal_count),
+                "background_events": int(len(background_score)),
+                "roc_auc": float(auc_value),
+                "background_rejection_at_signal_efficiency_0.5": rejection_at_efficiency(
+                    fpr, tpr, 0.5, len(background_score)
+                ),
+                "background_rejection_at_signal_efficiency_0.7": rejection_at_efficiency(
+                    fpr, tpr, 0.7, len(background_score)
+                ),
+                "background_rejection_at_signal_efficiency_0.8": rejection_at_efficiency(
+                    fpr, tpr, 0.8, len(background_score)
+                ),
+            }
+        )
+    pd.DataFrame(metrics_rows).to_csv(args.output_dir / "metrics.csv", index=False)
 
     print(summary_text, end="")
 

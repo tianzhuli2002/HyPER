@@ -13,8 +13,8 @@ from torch.optim import Adam, AdamW, lr_scheduler
 from torch_geometric.utils import degree, unbatch
 from torchmetrics.functional.classification import binary_auroc
 
-from .MPNNs import MPNNs
-from .classification import classificationModel, pool_event_representation
+from .mpnn import MessagePassingBlock
+from .classification import ClassificationHead, pool_event_representation
 from .hyperedge import HyperedgeModel
 from .loss import (
     additive_total_loss,
@@ -123,7 +123,7 @@ class HyPERModel(LightningModule):
         for layer_index in range(int(num_message_passing_layers)):
             first = layer_index == 0
             layers.append(
-                MPNNs(
+                MessagePassingBlock(
                     node_in_channels if first else message_feats,
                     edge_in_channels if first else message_feats,
                     global_in_channels if first else message_feats,
@@ -143,7 +143,7 @@ class HyPERModel(LightningModule):
             dropout=dropout,
         )
         self.Classification = (
-            classificationModel(
+            ClassificationHead(
                 n_feats_out=1,
                 contraction_feats=contraction_feats,
                 message_feats=message_feats,

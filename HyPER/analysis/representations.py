@@ -3,13 +3,152 @@
 from __future__ import annotations
 
 import hashlib
+import math
 
 import numpy as np
+
+
+# The first term is a relative scientific threshold; the second protects the
+# exact numerical calculation from declaring round-off noise to be structure.
+# Exact repeated rows are always treated as zero variance independently of the
+# threshold.  The value is recorded in every representation-health/CKA
+# product so that the decision is inspectable.
+VARIANCE_RELATIVE_TOLERANCE = 1e-12
+VARIANCE_ROUNDOFF_FACTOR = 64.0
 
 
 def event_index_sha256(indices) -> str:
     values = np.ascontiguousarray(np.asarray(indices, dtype=np.int64).reshape(-1))
     return hashlib.sha256(values.tobytes()).hexdigest()
+
+
+def _exactly_constant(values: np.ndarray) -> bool:
+    """Return whether every finite row is bitwise equal to the first row."""
+    if values.shape[0] == 0:
+        return True
+    first = values[0]
+    for start in range(0, values.shape[0], 8192):
+        if not np.all(values[start:start + 8192] == first):
+            return False
+    return True
+
+
+def _variance_threshold(values: np.ndarray) -> float:
+    scale = float(np.max(np.abs(values))) if values.size else 0.0
+    scale = max(1.0, scale)
+    roundoff = (
+        np.finfo(np.float64).eps
+        * max(values.shape)
+        * VARIANCE_ROUNDOFF_FACTOR
+        * scale
+    )
+    return max(VARIANCE_RELATIVE_TOLERANCE * scale, roundoff)
+
+
+def representation_diagnostics(values, *, unique_row_limit: int = 5000) -> dict[str, object]:
+    """Calculate finite, variance, diversity and rank diagnostics for an export."""
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 2:
+        raise ValueError(f"Representation diagnostics require a 2D array, got {values.shape}.")
+    event_count, feature_dimension = map(int, values.shape)
+    finite = np.isfinite(values)
+    finite_fraction = float(np.mean(finite)) if values.size else 1.0
+    result: dict[str, object] = {
+        "event_count": event_count,
+        "feature_dimension": feature_dimension,
+        "finite_fraction": finite_fraction,
+        "centred_frobenius_norm": None,
+        "active_dimension_count": None,
+        "minimum_feature_standard_deviation": None,
+        "maximum_feature_standard_deviation": None,
+        "unique_row_count": None,
+        "numerical_rank": None,
+        "effective_rank": None,
+        "variance_threshold": None,
+        "zero_variance": False,
+        "zero_variance_detection": "not_evaluated",
+    }
+    if event_count == 0 or feature_dimension == 0 or not finite.all():
+        return result
+
+    mean = values.mean(axis=0)
+    centered = values - mean
+    norm = float(np.linalg.norm(centered))
+    threshold = _variance_threshold(values)
+    exact_constant = _exactly_constant(values)
+    # A row-wise norm threshold is derived from the per-feature threshold.
+    norm_threshold = threshold * math.sqrt(event_count * feature_dimension)
+    zero_variance = exact_constant or norm <= norm_threshold
+    if zero_variance:
+        norm = 0.0
+
+    standard_deviation = values.std(axis=0)
+    active = int(np.count_nonzero(standard_deviation > threshold))
+    if zero_variance:
+        active = 0
+        standard_deviation = np.zeros(feature_dimension, dtype=np.float64)
+
+    result.update(
+        {
+            "centred_frobenius_norm": norm,
+            "active_dimension_count": active,
+            "minimum_feature_standard_deviation": float(np.min(standard_deviation)),
+            "maximum_feature_standard_deviation": float(np.max(standard_deviation)),
+            "variance_threshold": float(threshold),
+            "zero_variance": bool(zero_variance),
+            "zero_variance_detection": "exact_repeated_rows"
+            if exact_constant
+            else ("relative_threshold" if zero_variance else "varying"),
+        }
+    )
+    if event_count <= unique_row_limit:
+        result["unique_row_count"] = int(np.unique(values, axis=0).shape[0])
+
+    if zero_variance:
+        result["numerical_rank"] = 0
+        result["effective_rank"] = 0.0
+        return result
+
+    # Exact numerical rank of a large 896-wide event representation is an
+    # expensive eigendecomposition and adds no protection to the CKA result.
+    # Use the feature-variance participation rank for wide arrays and reserve
+    # the exact covariance rank for compact intermediate blocks.
+    if feature_dimension <= 256:
+        covariance = centered.T @ centered
+        eigenvalues = np.linalg.eigvalsh(covariance)
+        eigenvalues = np.maximum(eigenvalues, 0.0)
+        largest = float(eigenvalues[-1]) if len(eigenvalues) else 0.0
+        rank_threshold = (
+            max(1.0, largest)
+            * np.finfo(np.float64).eps
+            * max(event_count, feature_dimension)
+            * VARIANCE_ROUNDOFF_FACTOR
+        )
+        positive = eigenvalues[eigenvalues > rank_threshold]
+        result["numerical_rank"] = int(len(positive))
+        power = positive
+    else:
+        result["numerical_rank"] = None
+        power = standard_deviation ** 2
+    if np.any(power > 0):
+        probabilities = power[power > 0] / power[power > 0].sum()
+        result["effective_rank"] = float(np.exp(-np.sum(probabilities * np.log(probabilities))))
+    else:
+        result["effective_rank"] = 0.0
+    return result
+
+
+def cka_undefined_reason(left_diagnostics: dict[str, object], right_diagnostics: dict[str, object]) -> str | None:
+    """Return the precise supported reason for an undefined matrix cell."""
+    left_zero = bool(left_diagnostics.get("zero_variance", False))
+    right_zero = bool(right_diagnostics.get("zero_variance", False))
+    if left_zero and right_zero:
+        return "both_zero_variance"
+    if left_zero:
+        return "left_zero_variance"
+    if right_zero:
+        return "right_zero_variance"
+    return None
 
 
 def _unique_indices(export: dict, description: str) -> np.ndarray:
@@ -59,8 +198,18 @@ def linear_cka(x, y) -> float:
         raise ValueError(f"CKA requires 2D features with the same N>=2; got {x.shape}, {y.shape}.")
     if not np.isfinite(x).all() or not np.isfinite(y).all():
         raise ValueError("CKA inputs must be finite.")
+    x_exact_constant = _exactly_constant(x)
+    y_exact_constant = _exactly_constant(y)
     x = x - x.mean(axis=0, keepdims=True)
     y = y - y.mean(axis=0, keepdims=True)
+    x_norm_frobenius = float(np.linalg.norm(x))
+    y_norm_frobenius = float(np.linalg.norm(y))
+    threshold = max(
+        VARIANCE_RELATIVE_TOLERANCE,
+        np.finfo(np.float64).eps * max(x.shape[0], x.shape[1], y.shape[1]) * VARIANCE_ROUNDOFF_FACTOR,
+    )
+    if x_exact_constant or y_exact_constant or x_norm_frobenius <= threshold or y_norm_frobenius <= threshold:
+        raise ValueError("CKA is undefined for a zero-variance representation.")
     cross = np.linalg.norm(x.T @ y, ord="fro") ** 2
     x_norm = np.linalg.norm(x.T @ x, ord="fro") ** 2
     y_norm = np.linalg.norm(y.T @ y, ord="fro") ** 2

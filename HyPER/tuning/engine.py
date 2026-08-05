@@ -19,6 +19,7 @@ import optuna
 import yaml
 from omegaconf import OmegaConf
 
+from HyPER.configuration import set_task_mode
 from HyPER.train import run_training, setup_torch_runtime
 from .coefficients import loss_coefficients
 from .configuration import configure_tuning_data_isolation
@@ -59,15 +60,19 @@ def _atomic_json(path: Path, value) -> None:
 
 def load_configs(base_config: str, tuning_config: str, overrides=None):
     base = OmegaConf.load(base_config)
-    tune = OmegaConf.load(tuning_config)
-    return OmegaConf.merge(base, tune, OmegaConf.from_dotlist(list(overrides or [])))
+    tuning_path = Path(tuning_config).expanduser().resolve()
+    common_path = tuning_path.parent / "common.yaml"
+    common = OmegaConf.load(common_path) if common_path.is_file() else OmegaConf.create({})
+    tune = OmegaConf.load(tuning_path)
+    return OmegaConf.merge(
+        base, common, tune, OmegaConf.from_dotlist(list(overrides or []))
+    )
 
 
 def configure_stage(cfg, stage: int, trial, frozen_alpha=None):
     cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
     if stage == 1:
-        cfg.classification.enabled = False
-        cfg.reconstruction.enabled = True
+        set_task_mode(cfg, "reconstruction")
         cfg.loss.edge_weight = 0.5
         cfg.loss.hyperedge_weight = 0.5
         cfg.loss.classification_weight = 0.0
@@ -75,8 +80,7 @@ def configure_stage(cfg, stage: int, trial, frozen_alpha=None):
     elif stage == 2:
         alpha = float(trial.suggest_categorical("alpha", list(cfg.tuning.alpha_grid)))
         params = {"alpha": alpha}
-        cfg.classification.enabled = True
-        cfg.reconstruction.enabled = True
+        set_task_mode(cfg, "joint")
         for key, value in loss_coefficients(alpha, 0.05).items():
             cfg.loss[key] = value
     elif stage == 3:
@@ -84,8 +88,7 @@ def configure_stage(cfg, stage: int, trial, frozen_alpha=None):
             raise ValueError("Stage 3 requires the selected Stage 2 alpha.")
         beta = float(trial.suggest_categorical("beta", list(cfg.tuning.beta_grid)))
         params = {"beta": beta, "frozen_alpha": float(frozen_alpha)}
-        cfg.classification.enabled = True
-        cfg.reconstruction.enabled = True
+        set_task_mode(cfg, "joint")
         for key, value in loss_coefficients(float(frozen_alpha), beta).items():
             cfg.loss[key] = value
     else:
@@ -239,7 +242,6 @@ def objective_factory(cfg, stage: int, frozen_alpha=None):
                 train_indices_path=trial_cfg.tuning.train_indices_file,
                 validation_indices_path=trial_cfg.tuning.validation_indices_file,
             )
-            trial_cfg.tuning.enabled = True
             trial_cfg.tuning.checkpointing = stage in (2, 3)
             trial_cfg.tuning.monitor = monitor
             trial_cfg.tuning.direction = mode

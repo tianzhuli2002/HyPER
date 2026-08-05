@@ -1,16 +1,17 @@
-from .messagePassing import EdgeModel, NodeModel, GlobalModel
-from .hyperedge import HyperedgeModel
-from .MPNNs import MPNNs
-from .HyPERModel import HyPERModel
-from .classification import classificationModel
+"""HyPER model components."""
 
+from .classification import ClassificationHead
+from .hyper_model import HyPERModel
+from .hyperedge import HyperedgeModel
+from .message_passing import EdgeModel, GlobalModel, NodeModel
+from .mpnn import MessagePassingBlock
 
 __all__ = [
-    'EdgeModel',
-    'NodeModel',
-    'GlobalModel',
-    'HyperedgeModel',
-    'MPNNs',
-    'HyPERModel',
-    'classificationModel',
+    "ClassificationHead",
+    "EdgeModel",
+    "GlobalModel",
+    "HyPERModel",
+    "HyperedgeModel",
+    "MessagePassingBlock",
+    "NodeModel",
 ]

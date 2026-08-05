@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 from pathlib import Path
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -18,12 +21,16 @@ from HyPER.analysis.runtime import (
     load_analysis_config,
     load_frozen_model,
     truth_fully_matched,
+    resource_diagnostics,
+    write_resource_diagnostics,
 )
+from HyPER.analysis.representations import representation_diagnostics
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
+    parser.add_argument("--topology", choices=("ttbar1L", "ttH"), required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--h5", required=True)
     parser.add_argument("--split-cache", required=True)
@@ -37,6 +44,8 @@ def parse_args():
     parser.add_argument("--model-name", default=None)
     parser.add_argument("--representations", nargs="+", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--commit", default=None)
+    parser.add_argument("--profile-hash", default=None)
     return parser.parse_args()
 
 
@@ -57,6 +66,7 @@ def deterministic_indices(split_cache: str, split: str, count: int, seed: int) -
 
 def main() -> int:
     args = parse_args()
+    started = time.perf_counter()
     if args.accelerator == "gpu" and not torch.cuda.is_available():
         raise RuntimeError("GPU acceleration was requested but PyTorch cannot access CUDA.")
     device = torch.device("cuda:0" if args.accelerator == "gpu" else "cpu")
@@ -75,14 +85,10 @@ def main() -> int:
     print(f"split_cache={Path(args.split_cache).resolve()} split={args.split} events={len(selected)}")
     print(f"device={device} representations={args.representations}")
 
-    stored: dict[str, list[np.ndarray]] = {
-        "source_event_index": [], "truth_class": [], "truth_fully_matched": []
-    }
-    for name in args.representations:
-        stored[name] = []
-    if model.classification_enabled:
-        stored["native_classification_logit"] = []
-        stored["native_classification_probability"] = []
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    stored: dict[str, np.ndarray] | None = None
+    row_start = 0
     with torch.inference_mode():
         for batch in module.predict_dataloader():
             batch = batch.to(device)
@@ -92,11 +98,16 @@ def main() -> int:
                 raise KeyError(f"Requested representations are unavailable: {missing}; available={sorted(representations)}")
             source = batch.source_event_index.detach().cpu().reshape(-1).numpy().astype(np.int64)
             truth = batch.cls_t.detach().cpu().reshape(-1).numpy().astype(np.int8)
-            stored["source_event_index"].append(source)
-            stored["truth_class"].append(truth)
-            stored["truth_fully_matched"].append(truth_fully_matched(batch))
+            batch_values: dict[str, np.ndarray] = {
+                "source_event_index": source,
+                "truth_class": truth,
+                "truth_fully_matched": truth_fully_matched(batch, args.topology),
+            }
             for name in args.representations:
-                stored[name].append(representations[name].detach().float().cpu().numpy())
+                if name == "classification_head_input" and "final_event" in batch_values:
+                    batch_values[name] = batch_values["final_event"]
+                else:
+                    batch_values[name] = representations[name].detach().float().cpu().numpy()
             logits = outputs[3]
             if logits is not None:
                 logits = logits.detach().float().cpu().reshape(-1).numpy()
@@ -104,11 +115,34 @@ def main() -> int:
                     representations["classification_head_input"]
                 ).detach().float().cpu().reshape(-1).numpy()
                 np.testing.assert_allclose(reconstructed, logits, rtol=1e-5, atol=1e-6)
-                stored["native_classification_logit"].append(logits)
-                stored["native_classification_probability"].append(
-                    torch.sigmoid(torch.from_numpy(logits)).numpy()
-                )
-    output = {name: np.concatenate(chunks) for name, chunks in stored.items() if chunks}
+                batch_values["native_classification_logit"] = logits
+                batch_values["native_classification_probability"] = torch.sigmoid(
+                    torch.from_numpy(logits)
+                ).numpy()
+            if stored is None:
+                stored = {
+                    name: np.empty((len(selected),) + np.asarray(value).shape[1:], dtype=(
+                        np.int64 if name == "source_event_index" else
+                        np.int8 if name in {"truth_class", "truth_fully_matched"} else np.float32
+                    ))
+                    for name, value in batch_values.items()
+                }
+            missing = set(stored) - set(batch_values)
+            unexpected = set(batch_values) - set(stored)
+            if missing or unexpected:
+                raise RuntimeError(f"Batch export fields changed: missing={sorted(missing)}, unexpected={sorted(unexpected)}.")
+            row_stop = row_start + len(source)
+            if row_stop > len(selected):
+                raise RuntimeError("Exporter received more events than the selected deterministic sample.")
+            for name, value in batch_values.items():
+                value = np.asarray(value)
+                if value.shape[0] != len(source) or value.shape[1:] != stored[name].shape[1:]:
+                    raise RuntimeError(f"Export field {name!r} shape changed: {value.shape} vs {stored[name].shape}.")
+                stored[name][row_start:row_stop] = value
+            row_start = row_stop
+    if stored is None or row_start != len(selected):
+        raise RuntimeError(f"Exported {row_start} events but expected {len(selected)}.")
+    output = dict(stored)
     if not np.array_equal(output["source_event_index"], selected):
         raise RuntimeError("Export order or source-event identity differs from deterministic selection.")
     if len(np.unique(output["source_event_index"])) != len(output["source_event_index"]):
@@ -127,7 +161,47 @@ def main() -> int:
     })
     destination = Path(args.output).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(destination, **output)
+    temporary = destination.with_name(destination.name + ".tmp")
+    with temporary.open("wb") as handle:
+        np.savez_compressed(handle, **output)
+    temporary.replace(destination)
+    health_names = [name for name in args.representations if name != "classification_head_input"]
+    health = {
+        "model_name": str(output["model_name"]),
+        "topology": args.topology,
+        "split": args.split,
+        "event_count": int(len(selected)),
+        "commit": args.commit,
+        "profile_hash": args.profile_hash,
+        "variance_policy": {
+            "relative_tolerance": 1e-12,
+            "roundoff_factor": 64.0,
+            "exact_repeated_rows_are_zero_variance": True,
+        },
+        "representations": {
+            name: representation_diagnostics(output[name]) for name in health_names
+        },
+        "aliases": {
+            "classification_head_input": {
+                "target": "final_event",
+                "equal_values": bool(np.array_equal(output["classification_head_input"], output["final_event"])),
+                "physically_stored_twice_in_npz": True,
+                "duplicate_raw_bytes": int(output["final_event"].nbytes),
+            }
+        },
+    }
+    (destination.parent / f"{destination.stem}_health.json").write_text(
+        json.dumps(health, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8"
+    )
+    with (destination.parent / f"{destination.stem}_health.csv").open("w", newline="", encoding="utf-8") as handle:
+        fields = ("model_name", "topology", "split", "representation", *health["representations"][health_names[0]].keys())
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for name in health_names:
+            writer.writerow({"model_name": health["model_name"], "topology": args.topology, "split": args.split, "representation": name, **health["representations"][name]})
+    diagnostics = resource_diagnostics(stage="export", started=started, events_processed=len(selected), output_root=destination.parent)
+    diagnostics.update({"model_name": str(output["model_name"]), "split": args.split, "representation_file": str(destination)})
+    write_resource_diagnostics(destination.parent, diagnostics)
     for name in args.representations:
         print(f"{name}: {output[name].shape} {output[name].dtype}")
     print(f"wrote={destination}")

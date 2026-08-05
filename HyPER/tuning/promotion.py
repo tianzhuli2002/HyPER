@@ -11,9 +11,11 @@ import numpy as np
 import yaml
 from omegaconf import OmegaConf
 
+from HyPER.configuration import set_task_mode
 from HyPER.data import HyPERDataModule
 from HyPER.models import HyPERModel
-from HyPER.train import _file_sha256, _graph_config, _plain, run_training, setup_torch_runtime
+from HyPER.train import _file_sha256, run_training, setup_torch_runtime
+from HyPER.factories import build_model, graph_config, plain
 from .configuration import configure_effective_graph_dataset, configure_tuning_data_isolation
 from .monitor import BestObservedValidation
 
@@ -48,8 +50,7 @@ def configure_candidate(args, trial, output):
     cfg = OmegaConf.load(_require_file(args.base_config, "promotion base config"))
     for path, value in trial.params.items():
         OmegaConf.update(cfg, path, value, merge=False, force_add=False)
-    cfg.classification.enabled = False
-    cfg.reconstruction.enabled = True
+    set_task_mode(cfg, "reconstruction")
     cfg.loss.edge_weight = .5
     cfg.loss.hyperedge_weight = .5
     cfg.loss.classification_weight = 0.
@@ -97,39 +98,26 @@ def _instantiate_for_validation(cfg):
     tuning_cfg = cfg.tuning
     datamodule = HyPERDataModule(
         root=str(cfg.dataset.root), train_set=str(cfg.dataset.train_set),
-        val_set=None if cfg.dataset.val_set is None else str(cfg.dataset.val_set),
         predict_set=str(cfg.dataset.predict_set), batch_size=int(cfg.dataset.batch_size),
         drop_last=bool(cfg.dataset.drop_last), num_workers=int(cfg.dataset.num_workers),
         pin_memory=bool(cfg.dataset.pin_memory), persistent_workers=bool(cfg.dataset.persistent_workers),
-        prefetch_factor=int(cfg.dataset.prefetch_factor), force_reload=bool(cfg.dataset.force_reload),
-        use_ondisk=bool(cfg.dataset.use_ondisk), graph_config=_graph_config(cfg),
-        split_config=_plain(cfg.dataset.split), predict_split=cfg.predicting.split,
+        prefetch_factor=int(cfg.dataset.prefetch_factor), graph_config=graph_config(cfg),
+        split_config=plain(cfg.dataset.split), predict_split=cfg.predicting.split,
         source_indices_file=cfg.predicting.source_indices_file,
         source_h5_path=cfg.dataset.get("source_h5_path"), require_two_event_classes=False,
         tuning_mode=True, tuning_train_indices_file=tuning_cfg.train_indices_file,
         tuning_val_indices_file=tuning_cfg.validation_indices_file, seed=int(cfg.general.seed),
     )
-    model = HyPERModel(
-        node_in_channels=datamodule.node_in_channels, edge_in_channels=datamodule.edge_in_channels,
-        global_in_channels=datamodule.global_in_channels, edge_out_channels=datamodule.edge_out_channels,
-        hyperedge_out_channels=datamodule.hyperedge_out_channels,
-        edge_class_names=datamodule.edge_class_names, hyperedge_class_names=datamodule.hyperedge_class_names,
-        message_feats=int(cfg.model.message_feats), dropout=float(cfg.model.dropout),
-        num_message_passing_layers=int(cfg.model.num_message_passing_layers),
-        contraction_feats=int(cfg.model.contraction_feats), hyperedge_order=int(cfg.model.hyperedge_order),
-        optimizer=str(cfg.optimizer.name), lr=float(cfg.optimizer.learning_rate),
-        weight_decay=float(cfg.optimizer.weight_decay), lr_scheduler_enabled=bool(cfg.lr_scheduler.enabled),
-        lr_scheduler_method=str(cfg.lr_scheduler.method), lr_scheduler_monitor=str(cfg.lr_scheduler.monitor),
-        lr_scheduler_mode=str(cfg.lr_scheduler.mode), lr_scheduler_factor=float(cfg.lr_scheduler.factor),
-        lr_scheduler_patience=int(cfg.lr_scheduler.patience), lr_scheduler_min_lr=float(cfg.lr_scheduler.min_lr),
-        lr_scheduler_frequency=int(cfg.lr_scheduler.frequency), classification_enabled=False,
-        reconstruction_enabled=True, edge_class_weights=_plain(cfg.loss.edge_class_weights),
-        hyperedge_class_weights=_plain(cfg.loss.hyperedge_class_weights), edge_weight=float(cfg.loss.edge_weight),
-        hyperedge_weight=float(cfg.loss.hyperedge_weight), classification_weight=0.0,
-        classification_pos_weight=cfg.loss.classification_pos_weight, log_metrics_to_logger=False,
+    model = build_model(
+        cfg,
+        datamodule,
+        classification_enabled=False,
+        reconstruction_enabled=True,
+        log_metrics_to_logger=False,
         validation_subset_path=str(tuning_cfg.validation_indices_file),
         validation_subset_hash=_file_sha256(str(tuning_cfg.validation_indices_file)),
     )
+
     return datamodule, model
 
 
@@ -317,11 +305,10 @@ def select(args):
     winner, path = min(entries, key=rank)
     cfg = OmegaConf.load(args.base_config)
     for dotted, value in winner["parameters"].items(): OmegaConf.update(cfg, dotted, value, merge=False, force_add=False)
-    cfg.classification.enabled = False; cfg.reconstruction.enabled = True
+    set_task_mode(cfg, "reconstruction")
     cfg.loss.edge_weight = .5; cfg.loss.hyperedge_weight = .5; cfg.loss.classification_weight = 0.
     contract_path = path.parent / "promotion_manifest.json"
     contract = json.loads(_require_file(contract_path, "winning promotion manifest").read_text())
-    cfg.dataset.split.enabled = True
     cfg.dataset.split.cache_path = contract["canonical_split"]
     cfg.dataset.split.require_existing = True
     cfg.dataset.split.predict_split = None

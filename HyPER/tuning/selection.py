@@ -13,6 +13,8 @@ import optuna
 import yaml
 from omegaconf import OmegaConf
 
+from HyPER.configuration import set_task_mode
+
 from .coefficients import loss_coefficients
 from .engine import ALPHA_GRID, BETA_GRID
 
@@ -239,12 +241,12 @@ def select_stage(sqlite_path, study_name, stage, base_config, output_dir, tolera
     cfg = OmegaConf.load(base_config)
     if stage == 1:
         for path, value in selected.params.items(): OmegaConf.update(cfg, path, value, merge=False, force_add=False)
-        cfg.classification.enabled = False; cfg.reconstruction.enabled = True
+        set_task_mode(cfg, "reconstruction")
         cfg.loss.edge_weight = .5; cfg.loss.hyperedge_weight = .5; cfg.loss.classification_weight = 0.
         parameter_file, parameter = "stage1_best_parameters.yaml", dict(selected.params)
     elif stage == 2:
         alpha = float(selected.params["alpha"]); parameter_file, parameter = "stage2_best_alpha.yaml", {"alpha": alpha}
-        cfg.classification.enabled = True; cfg.reconstruction.enabled = True
+        set_task_mode(cfg, "joint")
         for key, value in loss_coefficients(alpha, .05).items(): cfg.loss[key] = value
     else:
         beta = float(selected.params["beta"]); parameter_file, parameter = "stage3_best_beta.yaml", {"beta": beta}
@@ -300,12 +302,12 @@ def final_configs(stage3_config, output_dir, graph_manifest, split_cache, subset
     output = Path(output_dir); output.mkdir(parents=True, exist_ok=True); modes = {}
     for mode in ("reconstruction_only", "classification_only", "joint"):
         cfg = OmegaConf.create(OmegaConf.to_container(joint, resolve=True))
-        if mode == "reconstruction_only": cfg.classification.enabled=False; cfg.reconstruction.enabled=True; weights=loss_coefficients(alpha, 0.0)
-        elif mode == "classification_only": cfg.classification.enabled=True; cfg.reconstruction.enabled=False; weights={"edge_weight":0.0,"hyperedge_weight":0.0,"classification_weight":1.0}
-        else: cfg.classification.enabled=True; cfg.reconstruction.enabled=True; weights=loss_coefficients(alpha, beta)
+        if mode == "reconstruction_only": set_task_mode(cfg, "reconstruction"); weights=loss_coefficients(alpha, 0.0)
+        elif mode == "classification_only": set_task_mode(cfg, "classification"); weights={"edge_weight":0.0,"hyperedge_weight":0.0,"classification_weight":1.0}
+        else: set_task_mode(cfg, "joint"); weights=loss_coefficients(alpha, beta)
         for key, value in weights.items(): cfg.loss[key] = value
-        cfg.dataset.split.enabled=True; cfg.dataset.split.cache_path=str(split_path); cfg.dataset.split.require_existing=True; cfg.dataset.split.predict_split=None
-        cfg.dataset.force_reload=False; cfg.tuning_ancestry=ancestry
+        cfg.dataset.split.cache_path=str(split_path); cfg.dataset.split.require_existing=True; cfg.dataset.split.predict_split=None
+        cfg.tuning_ancestry=ancestry
         path=output/f"{mode}.yaml"; _write_yaml(path, OmegaConf.to_container(cfg, resolve=True)); modes[mode]=str(path.resolve())
     _write_json(output/"final_config_manifest.json", {"alpha":alpha,"beta":beta,"ancestry":ancestry,"configs":modes})
     return modes

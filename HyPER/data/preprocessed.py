@@ -231,7 +231,7 @@ class GraphDB():
             raise RuntimeError(
                 f"Existing graph DB is unreadable or lacks a Graphs dataset: {self.db_path}. "
                 "HyPER will not delete it automatically; rebuild intentionally in a fresh path "
-                "or with dataset.force_reload=true."
+                "or rebuild it explicitly with the graph-database builder."
             )
 
         if os.path.exists(self.db_path):
@@ -409,7 +409,7 @@ class GraphDB():
         if not os.path.exists(self.manifest_path):
             raise RuntimeError(
                 f"Existing graph DB has no manifest and cannot be validated: {self.db_path}. "
-                "Rebuild intentionally with `dataset.force_reload=true`."
+                "Rebuild explicitly with the graph-database builder."
             )
 
         with open(self.manifest_path, encoding="utf-8") as f:
@@ -418,7 +418,7 @@ class GraphDB():
         if stored_hash != self.config_hash:
             raise RuntimeError(
                 f"Existing graph DB manifest does not match the current graph config: {self.db_path}. "
-                "Rebuild intentionally with `dataset.force_reload=true` or choose a fresh dataset/cache name."
+                "Rebuild explicitly with the graph-database builder or choose a fresh dataset name."
             )
         stored_schema = manifest.get("schema_version")
         if stored_schema != DB_SCHEMA_VERSION:
@@ -430,7 +430,7 @@ class GraphDB():
         if stored_format != DB_FORMAT:
             raise RuntimeError(
                 f"Existing graph DB format {stored_format!r} is unsupported; expected {DB_FORMAT!r}: "
-                f"{self.db_path}. Rebuild intentionally with `dataset.force_reload=true`."
+                f"{self.db_path}. Rebuild explicitly with the graph-database builder."
             )
 
     def __len__(self):

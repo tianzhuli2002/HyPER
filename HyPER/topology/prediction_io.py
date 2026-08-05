@@ -161,7 +161,7 @@ def _manifest_n_events(parts_dir: Path) -> int | None:
                 manifest = json.load(handle)
         except (OSError, json.JSONDecodeError):
             continue
-        for key in ("n_events", "n_prediction_rows"):
+        for key in ("number_of_prediction_rows", "n_prediction_rows", "n_events"):
             value = manifest.get(key)
             try:
                 if value is not None:
@@ -232,8 +232,8 @@ def load_hyper_prediction_output(
 ) -> pd.DataFrame:
     """Load a HyPER prediction output from a single file or `.pkl.parts` directory.
 
-    Supported inputs are `.pkl`, `.pickle`, `.csv`, line-delimited `.json` /
-    `.jsonl`, and directories or prefixes ending in `.pkl.parts`.
+    Supported inputs are atomic `.pkl`/`.pickle` files and directories or
+    prefixes ending in `.pkl.parts`.
     """
     output_path = Path(path)
     lower_name = output_path.name.lower()
@@ -249,12 +249,11 @@ def load_hyper_prediction_output(
 
     if lower_name.endswith((".pkl", ".pickle")):
         frame = pd.read_pickle(output_path)
-    elif lower_name.endswith(".csv"):
-        frame = pd.read_csv(output_path, nrows=max_events)
-    elif lower_name.endswith((".json", ".jsonl")):
-        frame = pd.read_json(output_path, lines=True)
     else:
-        raise ValueError(f"Unsupported HyPER output format: {output_path}")
+        raise ValueError(
+            f"Unsupported HyPER output format: {output_path}. "
+            "Use .pkl or .pkl.parts production output."
+        )
 
     total_rows = len(frame)
     truncated = False

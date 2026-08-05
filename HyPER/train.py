@@ -23,20 +23,13 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from omegaconf import DictConfig, OmegaConf
 from packaging import version
 
+from HyPER.checkpoints import resolve_checkpoint
+from HyPER.configuration import validate_runtime_config
 from HyPER.data import HyPERDataModule
 from HyPER.models import HyPERModel
+from HyPER.factories import build_model, graph_config, plain
 from HyPER.utils.timing import TrainingTimingCallback
 from HyPER.utils.epoch_summary import PersistentEpochSummary
-
-
-def _plain(value):
-    return OmegaConf.to_container(value, resolve=True) if OmegaConf.is_config(value) else value
-
-
-def _graph_config(cfg: DictConfig) -> dict:
-    if "input" not in cfg or "target" not in cfg:
-        raise ValueError("HyPER configs must provide input and target sections.")
-    return _plain(OmegaConf.create({"input": cfg.input, "target": cfg.target}))
 
 
 def _file_sha256(path: str | None) -> str | None:
@@ -51,32 +44,6 @@ def _file_sha256(path: str | None) -> str | None:
             digest.update(chunk)
     return digest.hexdigest()
 
-
-def _resolve_checkpoint(selector: str | None, model_directory: str | None, purpose: str) -> str | None:
-    if selector is None or not str(selector).strip():
-        return None
-    selector = str(selector).strip()
-    direct = Path(selector).expanduser()
-    if direct.is_file():
-        return str(direct.resolve())
-    if selector not in {"best", "last"}:
-        raise FileNotFoundError(
-            f"{purpose} checkpoint must be an existing path or explicit selector 'best'/'last', got {selector!r}."
-        )
-    if model_directory is None:
-        raise ValueError(f"{purpose} checkpoint selector {selector!r} requires a model directory.")
-    checkpoint_dir = Path(model_directory).expanduser() / "checkpoints"
-    if selector == "last":
-        candidate = checkpoint_dir / "last.ckpt"
-        if not candidate.is_file():
-            raise FileNotFoundError(candidate)
-        return str(candidate.resolve())
-    candidates = list(checkpoint_dir.glob("best-total*.ckpt"))
-    if len(candidates) != 1:
-        raise RuntimeError(
-            f"Selector 'best' requires exactly one best-total checkpoint in {checkpoint_dir}, found {len(candidates)}."
-        )
-    return str(candidates[0].resolve())
 
 
 def _load_probe_backbone(model: HyPERModel, checkpoint_path: str, skip_prefixes=("Classification.",)):
@@ -119,10 +86,13 @@ def run_training(cfg: DictConfig, extra_callbacks=None, logger_name="", return_m
     print(OmegaConf.to_yaml(cfg))
     seed = int(cfg.general.seed)
     pl.seed_everything(seed, workers=True)
-    classification_enabled = bool(cfg.classification.enabled)
-    reconstruction_enabled = bool(cfg.reconstruction.enabled)
+    topology, task = validate_runtime_config(cfg)
+    classification_enabled = task.classification_enabled
+    reconstruction_enabled = task.reconstruction_enabled
     tuning_cfg = cfg.get("tuning", {})
-    tuning_enabled = bool(tuning_cfg.get("enabled", False))
+    tuning_enabled = bool(tuning_cfg.get("train_indices_file")) and bool(
+        tuning_cfg.get("validation_indices_file")
+    )
     exploratory_tuning = tuning_enabled and not bool(tuning_cfg.get("checkpointing", False))
     performance_cfg = cfg.get("performance", {})
     validation_diagnostics_cfg = cfg.get("validation_diagnostics", {})
@@ -135,7 +105,6 @@ def run_training(cfg: DictConfig, extra_callbacks=None, logger_name="", return_m
     datamodule = HyPERDataModule(
         root=str(cfg.dataset.root),
         train_set=str(cfg.dataset.train_set),
-        val_set=None if cfg.dataset.val_set is None else str(cfg.dataset.val_set),
         predict_set=str(cfg.dataset.predict_set),
         batch_size=int(cfg.dataset.batch_size),
         drop_last=bool(cfg.dataset.drop_last),
@@ -143,10 +112,8 @@ def run_training(cfg: DictConfig, extra_callbacks=None, logger_name="", return_m
         pin_memory=bool(cfg.dataset.pin_memory),
         persistent_workers=bool(cfg.dataset.persistent_workers),
         prefetch_factor=int(cfg.dataset.prefetch_factor),
-        force_reload=bool(cfg.dataset.force_reload),
-        use_ondisk=bool(cfg.dataset.use_ondisk),
-        graph_config=_graph_config(cfg),
-        split_config=_plain(cfg.dataset.split),
+        graph_config=graph_config(cfg),
+        split_config=plain(cfg.dataset.split),
         predict_split=cfg.predicting.split,
         source_indices_file=cfg.predicting.source_indices_file,
         source_h5_path=cfg.dataset.get("source_h5_path"),
@@ -165,40 +132,15 @@ def run_training(cfg: DictConfig, extra_callbacks=None, logger_name="", return_m
         ),
     )
 
-    model = HyPERModel(
-        node_in_channels=datamodule.node_in_channels,
-        edge_in_channels=datamodule.edge_in_channels,
-        global_in_channels=datamodule.global_in_channels,
-        edge_out_channels=datamodule.edge_out_channels,
-        hyperedge_out_channels=datamodule.hyperedge_out_channels,
-        edge_class_names=datamodule.edge_class_names,
-        hyperedge_class_names=datamodule.hyperedge_class_names,
-        message_feats=int(cfg.model.message_feats),
-        dropout=float(cfg.model.dropout),
-        num_message_passing_layers=int(cfg.model.num_message_passing_layers),
-        contraction_feats=int(cfg.model.contraction_feats),
-        hyperedge_order=int(cfg.model.hyperedge_order),
-        optimizer=str(cfg.optimizer.name),
-        lr=float(cfg.optimizer.learning_rate),
-        weight_decay=float(cfg.optimizer.weight_decay),
-        lr_scheduler_enabled=bool(cfg.lr_scheduler.enabled),
-        lr_scheduler_method=str(cfg.lr_scheduler.method),
-        lr_scheduler_monitor=str(cfg.lr_scheduler.monitor),
-        lr_scheduler_mode=str(cfg.lr_scheduler.mode),
-        lr_scheduler_factor=float(cfg.lr_scheduler.factor),
-        lr_scheduler_patience=int(cfg.lr_scheduler.patience),
-        lr_scheduler_min_lr=float(cfg.lr_scheduler.min_lr),
-        lr_scheduler_frequency=int(cfg.lr_scheduler.frequency),
+    model = build_model(
+        cfg,
+        datamodule,
         classification_enabled=classification_enabled,
         reconstruction_enabled=reconstruction_enabled,
-        edge_class_weights=_plain(cfg.loss.edge_class_weights),
-        hyperedge_class_weights=_plain(cfg.loss.hyperedge_class_weights),
-        edge_weight=float(cfg.loss.edge_weight),
-        hyperedge_weight=float(cfg.loss.hyperedge_weight),
-        classification_weight=float(cfg.loss.classification_weight),
-        classification_pos_weight=cfg.loss.classification_pos_weight,
         log_metrics_to_logger=not exploratory_tuning,
-        validation_subset_path=None if validation_subset_path is None else str(validation_subset_path),
+        validation_subset_path=(
+            None if validation_subset_path is None else str(validation_subset_path)
+        ),
         validation_subset_hash=_file_sha256(validation_subset_path),
         validation_role_ranking_enabled=bool(
             validation_diagnostics_cfg.get("role_ranking_enabled", False)
@@ -213,21 +155,17 @@ def run_training(cfg: DictConfig, extra_callbacks=None, logger_name="", return_m
         validate_candidate_event_assignment=bool(
             performance_cfg.get("validate_candidate_event_assignment", False)
         ),
-        optimizer_foreach=cfg.optimizer.get("foreach"),
-        optimizer_fused=bool(cfg.optimizer.get("fused", False)),
     )
 
     probe_manifest = None
-    if bool(cfg.get("probe", {}).get("enabled", False)):
+    if task.probe_enabled:
         if not classification_enabled or reconstruction_enabled:
             raise ValueError("Frozen probe requires classification enabled and reconstruction disabled.")
-        checkpoint = _resolve_checkpoint(
+        checkpoint = resolve_checkpoint(
             cfg.probe.get("pretrained_checkpoint"),
             cfg.probe.get("pretrained_model_directory"),
-            "Frozen-probe",
+            purpose="Frozen-probe checkpoint",
         )
-        if checkpoint is None:
-            raise ValueError("Frozen probe requires probe.pretrained_checkpoint.")
         prefixes = tuple(str(value) for value in cfg.probe.trainable_parameter_prefixes)
         load_info = _load_probe_backbone(model, checkpoint, skip_prefixes=prefixes)
         trainable, frozen = model.freeze_for_probe(prefixes)
@@ -345,6 +283,8 @@ def run_training(cfg: DictConfig, extra_callbacks=None, logger_name="", return_m
             "hyperedge_weight": float(cfg.loss.hyperedge_weight),
             "classification_weight": float(cfg.loss.classification_weight),
         },
+        "topology": topology,
+        "task": task.mode,
         "classification_enabled": classification_enabled,
         "reconstruction_enabled": reconstruction_enabled,
         "performance": {

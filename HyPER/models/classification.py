@@ -30,7 +30,7 @@ def pool_event_representation(
         dim=1,
     ).float()
 
-class classificationModel(Module):
+class ClassificationHead(Module):
     r"""Event-level S/B classification head using learned HyPER embeddings.
 
     Inputs:

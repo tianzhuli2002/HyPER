@@ -9,11 +9,14 @@ import csv
 import json
 from pathlib import Path
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 from sklearn.metrics import roc_auc_score
+
+from HyPER.analysis.runtime import resource_diagnostics, write_resource_diagnostics
 
 DIRECTION_TO_PAIRED = {
     "reconstruction_to_classification": "reconstruction_to_classification_paired_score",
@@ -87,6 +90,7 @@ def control_auc_rows(
         return list(executor.map(calculate, range(matrix.shape[0])))
 
 def main() -> int:
+    started = time.perf_counter()
     args = parse_args()
     if args.workers <= 0:
         raise ValueError("--workers must be positive.")
@@ -151,7 +155,17 @@ def main() -> int:
         },
     }
     (output / "shuffled_null_summary.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8"
+    )
+    write_resource_diagnostics(
+        output,
+        resource_diagnostics(
+            stage="statistics_controls",
+            started=started,
+            events_processed=len(labels),
+            output_root=output,
+        ),
+        filename="runtime_diagnostics_controls.json",
     )
     print(f"wrote={output}")
     return 0

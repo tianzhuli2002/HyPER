@@ -1,40 +1,5 @@
-from types import ModuleType
-from importlib import import_module
+"""HyPER: typed graph reconstruction and event classification."""
 
-# python/util/lazy_loader.py
-class LazyLoader(ModuleType):
-    def __init__(self, local_name, parent_module_globals, name):
-        self._local_name = local_name
-        self._parent_module_globals = parent_module_globals
-        super().__init__(name)
+__version__ = "2.0.0"
 
-    def _load(self):
-        module = import_module(self.__name__)
-        self._parent_module_globals[self._local_name] = module
-        self.__dict__.update(module.__dict__)
-        return module
-
-    def __getattr__(self, item):
-        module = self._load()
-        return getattr(module, item)
-
-    def __dir__(self):
-        module = self._load()
-        return dir(module)
-
-
-data = LazyLoader('data', globals(), 'HyPER.data')
-models = LazyLoader('models', globals(), 'HyPER.models')
-utils = LazyLoader('utils', globals(), 'HyPER.utils')
-topology = LazyLoader('topology', globals(), 'HyPER.topology')
-
-__version__ = 'v1'
-
-
-__all__ = [
-    'data',
-    'models',
-    'utils',
-    'topology',
-    '__version__',
-]
+__all__ = ["__version__"]

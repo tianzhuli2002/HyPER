@@ -1,3 +1,67 @@
 defaults:
-  - ttbar_SL_typed
-  - _self_
+- topology: ???
+- task: ???
+- _self_
+config_name: ${topology}_${task.mode}
+general:
+  seed: 42
+dataset:
+  batch_size: 4096
+  drop_last: false
+  num_workers: 16
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+validation_diagnostics:
+  role_ranking_enabled: false
+  classification_metrics_enabled: false
+  every_n_epochs: 1
+  max_events: null
+trainer:
+  accelerator: gpu
+  devices: 1
+  epochs: 500
+  precision: bf16-mixed
+  gradient_clip_val: 2.0
+  log_every_n_steps: 50
+  check_val_every_n_epoch: 2
+  limit_train_batches: null
+  limit_val_batches: 1.0
+  limit_test_batches: 1.0
+  run_test_after_fit: true
+  val_check_interval: null
+  num_sanity_val_steps: 0
+  enable_progress_bar: false
+profiling:
+  enabled: false
+  log_every_n_steps: 50
+  cuda_synchronize: false
+  output_json: null
+paths:
+  savedir: HyPER_logs
+  training_manifest: null
+training:
+  resume_from_checkpoint: null
+early_stopping:
+  enabled: true
+  monitor: val_loss
+  mode: min
+  patience: 20
+predicting:
+  accelerator: cpu
+  split: test
+  model_directory: null
+  checkpoint: null
+  save_as: null
+  batch_size: 1024
+  chunk_size_events: 100000
+  max_events: null
+  source_indices_file: null
+  memory_log_every_batches: 500
+  overwrite: false
+  include_raw: false
+onnx_export:
+  accelerator: ${predicting.accelerator}
+  model_directory: null
+  checkpoint: null
+  save_as: HyPER.onnx

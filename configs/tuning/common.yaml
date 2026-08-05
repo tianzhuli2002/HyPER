@@ -1,0 +1,68 @@
+tuning:
+  seed: 42
+  train_indices_file: null
+  validation_indices_file: null
+  subset_manifest_path: null
+  target_completed_trials: 24
+  max_attempted_trials: 32
+  trials_per_worker: 4
+  startup_trials: 5
+  max_epochs: 12
+  min_epochs: 4
+  early_stopping_patience: 3
+  pruner: median
+  pruning_warmup_epochs: 4
+  min_remaining_seconds: 7200
+  monitor: val_reconstruction_loss
+  direction: min
+  alpha_grid:
+  - 0.05
+  - 0.1
+  - 0.2
+  - 0.3
+  - 0.4
+  - 0.5
+  - 0.6
+  - 0.7
+  - 0.8
+  - 0.9
+  - 0.95
+  beta_grid:
+  - 0.01
+  - 0.02
+  - 0.03
+  - 0.05
+  - 0.07
+  - 0.1
+  - 0.3
+  - 0.5
+  - 0.7
+  search_space:
+    optimizer.learning_rate:
+      type: float
+      low: 1.0e-05
+      high: 0.003
+      log: true
+    optimizer.weight_decay:
+      type: float
+      low: 1.0e-08
+      high: 0.01
+      log: true
+    model.dropout:
+      type: float
+      low: 0.0
+      high: 0.2
+    model.message_feats:
+      type: categorical
+      values:
+      - 32
+      - 64
+      - 96
+      - 128
+    model.contraction_feats:
+      type: categorical
+      values:
+      - 64
+      - 128
+      - 192
+      - 256

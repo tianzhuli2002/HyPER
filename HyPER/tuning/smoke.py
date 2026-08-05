@@ -14,6 +14,8 @@ import optuna
 import torch
 from omegaconf import OmegaConf
 
+from HyPER.configuration import set_task_mode
+
 from .coefficients import loss_coefficients
 from .engine import load_configs, run_worker
 from HyPER.train import setup_torch_runtime
@@ -157,7 +159,7 @@ def main():
                 winner = choose_stage2([row])
                 next_cfg = OmegaConf.create(OmegaConf.to_container(previous, resolve=True))
                 for key, weight in loss_coefficients(value, .05).items(): next_cfg.loss[key] = weight
-                next_cfg.classification.enabled = True; next_cfg.reconstruction.enabled = True
+                set_task_mode(next_cfg, "joint")
                 ancestry = dict(next_cfg.get("tuning_ancestry", {})); ancestry["stage2_alpha"] = value
                 next_cfg.tuning_ancestry = ancestry
                 previous = next_cfg

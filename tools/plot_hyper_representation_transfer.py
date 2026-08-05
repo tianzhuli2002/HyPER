@@ -8,6 +8,7 @@ import csv
 import json
 from pathlib import Path
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -15,6 +16,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import Patch
 from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import roc_auc_score, roc_curve
 
@@ -34,6 +36,7 @@ from HyPER.topology.plot_style import (
     decorate_axis,
     save_figure,
 )
+from HyPER.analysis.runtime import resource_diagnostics, write_resource_diagnostics
 
 METHOD_LABELS = {
     "native_classification_only_score": "Native classification-only",
@@ -61,6 +64,27 @@ SUBSET_LABELS = {
 }
 
 
+def masked_cka_matrix(values):
+    numeric = np.full((len(values), len(values[0])), np.nan, dtype=np.float64)
+    for row, values_row in enumerate(values):
+        for column, value in enumerate(values_row):
+            if value is not None:
+                numeric[row, column] = float(value)
+    return np.ma.masked_invalid(numeric)
+
+
+def plot_cka_series(ax, x, values, label, *, marker="o", linewidth=2.0):
+    numeric = np.asarray([np.nan if value is None else float(value) for value in values])
+    defined = np.isfinite(numeric)
+    if np.any(defined):
+        # Keep the undefined x-coordinate in the series as a NaN so
+        # matplotlib breaks the line rather than interpolating across a
+        # documented zero-variance representation.
+        ax.plot(x, numeric, marker=marker, linewidth=linewidth, label=label)
+    for index in np.flatnonzero(~defined):
+        ax.text(x[index], 0.04, "N/A", ha="center", va="bottom", fontsize=8, color="black")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scores-dir", required=True)
@@ -70,7 +94,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--full-test-cka-dir", required=True)
     parser.add_argument("--alignments-root", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--title", default="ttbar single-lepton representation transfer")
+    parser.add_argument("--title", default="Representation transfer")
+    parser.add_argument(
+        "--plot-set",
+        choices=("essential", "full"),
+        default="essential",
+        help="Write four principal figures, or the complete diagnostic suite.",
+    )
     return parser.parse_args()
 
 
@@ -93,24 +123,22 @@ def category_histograms(ax, scores: np.ndarray, labels: np.ndarray, fm: np.ndarr
     bins = np.linspace(0.0, 1.0, 41)
     categories = (
         (labels == 0, "Background", BACKGROUND_COLOUR),
-        ((labels == 1) & fm, "Signal FM", FM_COLOUR),
-        ((labels == 1) & ~fm, "Signal non-FM", NONFM_COLOUR),
+        ((labels == 1) & fm, "Fully matched signal", FM_COLOUR),
+        ((labels == 1) & ~fm, "Not fully matched signal", NONFM_COLOUR),
     )
     for mask, label, colour in categories:
         ax.hist(
             scores[mask],
             bins=bins,
             density=True,
-            histtype="stepfilled",
-            alpha=0.20,
+            histtype="step",
             edgecolor=colour,
-            facecolor=colour,
-            linewidth=2.0,
+            linewidth=2.2,
             label=f"{label} ($N={int(mask.sum()):,}$)",
         )
     ax.set_xlim(0.0, 1.0)
     ax.set_xlabel(xlabel)
-    ax.set_ylabel("Normalised events")
+    ax.set_ylabel("Probability density")
     decorate_axis(ax, title=title)
     ax.legend(loc="best")
 
@@ -122,31 +150,48 @@ def add_roc(ax, labels, scores, label, colour, linestyle="-") -> tuple[np.ndarra
     return fpr, tpr, auc
 
 
-def plot_zero_shot(scores, labels, fm, output: Path, title: str) -> None:
+def plot_zero_shot(scores, labels, fm, output: Path, title: str, full_suite: bool = False) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(13.5, 5.3), sharey=True)
-    category_histograms(
-        axes[0], scores["reconstruction_zero_shot_score"], labels, fm,
-        r"$S_{\mathrm{reco}}$", "Reconstruction-only",
+    panels = (
+        (axes[0], "reconstruction_zero_shot_score", "Reconstruction-only"),
+        (axes[1], "joint_reconstruction_zero_shot_score", "Joint model"),
     )
-    category_histograms(
-        axes[1], scores["joint_reconstruction_zero_shot_score"], labels, fm,
-        r"$S_{\mathrm{reco}}$", "Joint model",
-    )
-    fig.suptitle(f"{title}: reconstruction-confidence score", y=1.02)
+    for ax, field, panel_title in panels:
+        values = scores[field]
+        category_histograms(ax, values, labels, fm, r"$S_{\mathrm{reco}}$", panel_title)
+        fm_mask = (labels == 0) | ((labels == 1) & fm)
+        nonfm_mask = (labels == 0) | ((labels == 1) & ~fm)
+        auc_all = roc_auc_score(labels, values)
+        auc_fm = roc_auc_score(labels[fm_mask], values[fm_mask])
+        auc_nonfm = roc_auc_score(labels[nonfm_mask], values[nonfm_mask])
+        ax.text(
+            0.97,
+            0.08,
+            "AUC\n"
+            f"All signal  {auc_all:.3f}\n"
+            f"Fully matched  {auc_fm:.3f}\n"
+            f"Not fully matched  {auc_nonfm:.3f}",
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=9.2,
+            bbox={"facecolor": "white", "alpha": 0.82, "edgecolor": "none"},
+        )
+    fig.suptitle(f"{title}: reconstruction confidence", y=1.02)
     fig.tight_layout()
     save_figure(fig, output, "zero_shot_score_distributions")
 
+    if not full_suite:
+        return
+
     fig, axes = plt.subplots(1, 2, figsize=(13.5, 5.8), sharex=True, sharey=True)
-    for ax, field, panel_title in (
-        (axes[0], "reconstruction_zero_shot_score", "Reconstruction-only"),
-        (axes[1], "joint_reconstruction_zero_shot_score", "Joint model"),
-    ):
+    for ax, field, panel_title in panels:
         values = scores[field]
         add_roc(ax, labels, values, "All signal", SIGNAL_COLOUR)
         fm_mask = (labels == 0) | ((labels == 1) & fm)
         nonfm_mask = (labels == 0) | ((labels == 1) & ~fm)
-        add_roc(ax, labels[fm_mask], values[fm_mask], "Signal FM", FM_COLOUR)
-        add_roc(ax, labels[nonfm_mask], values[nonfm_mask], "Signal non-FM", NONFM_COLOUR)
+        add_roc(ax, labels[fm_mask], values[fm_mask], "Fully matched signal", FM_COLOUR)
+        add_roc(ax, labels[nonfm_mask], values[nonfm_mask], "Not fully matched signal", NONFM_COLOUR)
         ax.plot([0, 1], [0, 1], linestyle="--", color=REFERENCE_COLOUR, linewidth=1.2)
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
@@ -164,10 +209,12 @@ def plot_zero_shot(scores, labels, fm, output: Path, title: str) -> None:
         ("joint_reconstruction_zero_shot_score", "Joint model", JOINT_COLOUR),
     ):
         fpr, tpr, _ = roc_curve(labels, scores[field])
-        minimum = 1.0 / max(int(np.sum(labels == 0)), 1)
-        rejection = 1.0 / np.maximum(fpr, minimum)
-        ax.plot(tpr, rejection, linewidth=2.0, color=colour, label=label)
-    ax.set_xlim(0, 1)
+        background_events = max(int(np.sum(labels == 0)), 1)
+        valid = (fpr * background_events >= 10) & (tpr >= 0.2) & (tpr <= 0.9)
+        rejection = 1.0 / np.maximum(fpr[valid], 1.0 / background_events)
+        ax.plot(tpr[valid], rejection, linewidth=2.0, color=colour, label=label)
+    ax.set_xlim(0.2, 0.9)
+    ax.set_yscale("log")
     ax.set_xlabel("Signal efficiency")
     ax.set_ylabel("Background rejection")
     decorate_axis(ax, title=f"{title}: zero-shot background rejection")
@@ -262,6 +309,83 @@ def read_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def plot_native_multitask_effect(metrics_dir: Path, output: Path, title: str) -> None:
+    difference_rows = read_csv(metrics_dir / "bootstrap_differences.csv")
+    summary_rows = read_csv(metrics_dir / "bootstrap_summary.csv")
+    subset_order = (
+        "inclusive_all_signal",
+        "fully_matched_signal_vs_background",
+        "non_fully_matched_signal_vs_background",
+    )
+    subset_labels = {
+        "inclusive_all_signal": "All signal",
+        "fully_matched_signal_vs_background": "Fully matched signal",
+        "non_fully_matched_signal_vs_background": "Not fully matched signal",
+    }
+    lookup = {
+        row["subset"]: row
+        for row in difference_rows
+        if row["difference"] == "native_joint_minus_native_classification"
+    }
+    rejection = {
+        (row["subset"], row["method"]): float(row["point_estimate"])
+        for row in summary_rows
+        if row["metric"] == "background_rejection_at_signal_efficiency_0.5"
+        and row["method"] in {"native_joint_score", "native_classification_only_score"}
+    }
+    y = np.arange(len(subset_order))[::-1]
+    values = np.asarray([float(lookup[name]["point_estimate"]) for name in subset_order])
+    low68 = np.asarray([float(lookup[name]["interval_68_low"]) for name in subset_order])
+    high68 = np.asarray([float(lookup[name]["interval_68_high"]) for name in subset_order])
+    low95 = np.asarray([float(lookup[name]["interval_95_low"]) for name in subset_order])
+    high95 = np.asarray([float(lookup[name]["interval_95_high"]) for name in subset_order])
+
+    fig, ax = plt.subplots(figsize=(9.0, 4.7))
+    ax.errorbar(
+        values,
+        y,
+        xerr=[values - low95, high95 - values],
+        fmt="none",
+        ecolor=JOINT_COLOUR,
+        elinewidth=1.3,
+        capsize=3,
+        zorder=1,
+    )
+    ax.errorbar(
+        values,
+        y,
+        xerr=[values - low68, high68 - values],
+        fmt="o",
+        color=JOINT_COLOUR,
+        ecolor=JOINT_COLOUR,
+        elinewidth=4.0,
+        markersize=6.5,
+        capsize=0,
+        zorder=2,
+    )
+    ax.axvline(0.0, color=REFERENCE_COLOUR, linestyle="--", linewidth=1.2)
+    ax.set_yticks(y, [subset_labels[name] for name in subset_order])
+    ax.set_xlabel(r"$\Delta$AUC (joint $-$ classification-only)")
+    ax.set_ylabel("")
+    span = max(abs(low95.min()), abs(high95.max()))
+    ax.set_xlim(-1.30 * span, 1.62 * span)
+    for yy, subset, value in zip(y, subset_order, values):
+        class_rej = rejection[(subset, "native_classification_only_score")]
+        joint_rej = rejection[(subset, "native_joint_score")]
+        relative = 100.0 * (joint_rej / class_rej - 1.0)
+        ax.text(
+            1.05 * span,
+            yy,
+            rf"$\Delta$AUC={value:+.4f}" + "\n" + rf"$R_{{b}}$(50%): {relative:+.1f}%",
+            va="center",
+            ha="left",
+            fontsize=9.3,
+        )
+    decorate_axis(ax, title=f"{title}: effect of joint reconstruction training")
+    fig.tight_layout()
+    save_figure(fig, output, "native_multitask_effect")
+
+
 def plot_bootstrap(metrics_dir: Path, output: Path, title: str) -> None:
     summary_rows = read_csv(metrics_dir / "bootstrap_summary.csv")
     inclusive = [
@@ -312,13 +436,15 @@ def plot_bootstrap(metrics_dir: Path, output: Path, title: str) -> None:
 
 def plot_control_nulls(controls_dir: Path, output: Path, title: str) -> None:
     rows = read_csv(controls_dir / "shuffled_null_summary.csv")
+    direction_labels = {
+        "reconstruction_to_classification": "Reconstruction → classification",
+        "reconstruction_to_joint": "Reconstruction → joint",
+        "joint_to_classification": "Joint → classification",
+    }
     with np.load(controls_dir / "alignment_control_auc_distributions.npz", allow_pickle=False) as loaded:
-        directions = (
-            "reconstruction_to_classification",
-            "reconstruction_to_joint",
-            "joint_to_classification",
-        )
-        fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.8), sharey=True)
+        directions = tuple(direction_labels)
+        fig, axes = plt.subplots(1, 3, figsize=(15.2, 4.9), sharey=True)
+        legend_handles = None
         for ax, direction in zip(axes, directions):
             row = next(
                 item for item in rows
@@ -327,26 +453,117 @@ def plot_control_nulls(controls_dir: Path, output: Path, title: str) -> None:
                 and item["subset"] == "inclusive_all_signal"
             )
             values = loaded[f"{direction}__shuffled__inclusive_all_signal"]
-            ax.hist(values, bins=max(10, min(20, len(values))), density=True,
-                    color=SHUFFLED_COLOUR, alpha=0.55, edgecolor=BACKGROUND_COLOUR)
-            ax.axvline(float(row["paired_auc"]), color=ALIGNED_COLOUR, linewidth=2.2, label="Paired")
-            ax.axvline(float(row["direct_auc"]), color=DIRECT_COLOUR, linewidth=2.0, linestyle="--", label="Direct")
-            ax.axvline(float(row["median"]), color=BACKGROUND_COLOUR, linewidth=1.6, linestyle=":", label="Shuffled median")
+            ax.hist(
+                values,
+                bins=max(10, min(18, len(values))),
+                density=False,
+                color=SHUFFLED_COLOUR,
+                alpha=0.55,
+                edgecolor=BACKGROUND_COLOUR,
+                label="Shuffled-event controls",
+            )
+            paired = ax.axvline(
+                float(row["paired_auc"]), color=ALIGNED_COLOUR, linewidth=2.4,
+                label="Paired-event alignment",
+            )
+            direct = ax.axvline(
+                float(row["direct_auc"]), color=DIRECT_COLOUR, linewidth=2.0,
+                linestyle="--", label="Direct head swap",
+            )
+            median = ax.axvline(
+                float(row["median"]), color=BACKGROUND_COLOUR, linewidth=1.7,
+                linestyle=":", label="Shuffled median",
+            )
+            count = int(row["control_count"])
+            exceed = int(row["controls_at_or_above_paired"])
             ax.set_xlabel("Full-test ROC AUC")
             decorate_axis(
                 ax,
-                title=f"{direction.replace('_', ' ')}\nempirical $p={float(row['empirical_p_value']):.3f}$",
+                title=(
+                    f"{direction_labels[direction]}\n"
+                    rf"$p_{{\mathrm{{emp}}}}=({exceed}+1)/({count}+1)="
+                    f"{float(row['empirical_p_value']):.3f}$"
+                ),
             )
-            ax.legend(fontsize=8)
-        axes[0].set_ylabel("Control density")
-        fig.suptitle(f"{title}: shuffled-alignment nulls", y=1.02)
-        fig.tight_layout()
+            if legend_handles is None:
+                legend_handles, legend_labels = ax.get_legend_handles_labels()
+        axes[0].set_ylabel("Number of shuffled alignments")
+        fig.suptitle(f"{title}: paired alignment against shuffled-event controls", y=1.04)
+        fig.legend(
+            legend_handles,
+            legend_labels,
+            loc="lower center",
+            ncol=4,
+            frameon=False,
+            bbox_to_anchor=(0.5, -0.02),
+        )
+        fig.tight_layout(rect=(0, 0.09, 1, 1))
         save_figure(fig, output, "shuffled_alignment_nulls")
 
 
 def load_cka_summary(cka_root: Path, pair: str) -> dict:
     path = cka_root / pair / "cka_summary.json"
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def plot_representation_geometry(cka_root: Path, output: Path, title: str) -> None:
+    summaries = {pair: load_cka_summary(cka_root, pair) for pair in PAIR_LABELS}
+    layer_labels = {
+        "block_0": "Block 1",
+        "block_1": "Block 2",
+        "block_2": "Block 3",
+        "final_event": "Pooled event",
+    }
+    fig = plt.figure(figsize=(15.2, 9.0))
+    grid = fig.add_gridspec(2, 3, height_ratios=(1.0, 0.72), hspace=0.38, wspace=0.28)
+    image = None
+    for column, (pair, summary) in enumerate(summaries.items()):
+        left_names = [name for name in summary["left_representation_names"] if name != "classification_head_input"]
+        right_names = [name for name in summary["right_representation_names"] if name != "classification_head_input"]
+        left_indices = [summary["left_representation_names"].index(name) for name in left_names]
+        right_indices = [summary["right_representation_names"].index(name) for name in right_names]
+        full_matrix = summary["full_cross_layer_cka"]["all"]
+        matrix = [
+            [full_matrix[left_index][right_index] for right_index in right_indices]
+            for left_index in left_indices
+        ]
+        ax = fig.add_subplot(grid[0, column])
+        cmap = plt.get_cmap("viridis").copy()
+        cmap.set_bad("#bdbdbd")
+        image = ax.imshow(masked_cka_matrix(matrix), vmin=0, vmax=1, cmap=cmap, aspect="auto")
+        ax.set_xticks(range(len(right_names)), [layer_labels[name] for name in right_names], rotation=28, ha="right")
+        ax.set_yticks(range(len(left_names)), [layer_labels[name] for name in left_names])
+        decorate_axis(ax, title=PAIR_LABELS[pair])
+        for row in range(len(matrix)):
+            for col in range(len(matrix[row])):
+                value = matrix[row][col]
+                ax.text(col, row, "N/A" if value is None else f"{value:.2f}", ha="center", va="center", fontsize=9, color="black" if value is None else ("white" if value < 0.55 else "black"))
+        if column == 0:
+            ax.set_ylabel("Source-network depth")
+        ax.set_xlabel("Target-network depth")
+
+    ax = fig.add_subplot(grid[1, :])
+    x = np.arange(len(REPRESENTATIONS))
+    for pair, summary in summaries.items():
+        values = [summary["corresponding_layer_cka"]["all"].get(name) for name in REPRESENTATIONS]
+        plot_cka_series(ax, x, values, PAIR_LABELS[pair], marker="o", linewidth=2.0)
+        if values[-1] is not None:
+            ax.text(x[-1] + 0.04, values[-1], f"{values[-1]:.2f}", va="center", fontsize=9)
+    ax.set_xticks(x, [layer_labels[name] for name in REPRESENTATIONS])
+    ax.set_xlim(-0.12, len(REPRESENTATIONS) - 0.72)
+    ax.set_ylim(0, 1.02)
+    ax.set_ylabel("Linear centred CKA")
+    ax.set_xlabel("Corresponding network depth")
+    decorate_axis(ax, title="Corresponding-layer similarity for all events")
+    ax.legend(loc="upper right", ncol=3, fontsize=9)
+    if image is not None:
+        colourbar_axis = fig.add_axes([0.925, 0.555, 0.012, 0.315])
+        cbar = fig.colorbar(image, cax=colourbar_axis)
+        cbar.set_label("Linear centred CKA")
+    fig.legend(handles=[Patch(facecolor="#bdbdbd", edgecolor="none", label="N/A: zero event-to-event variance")], loc="lower center", frameon=False, fontsize=8)
+    fig.suptitle(f"{title}: representation geometry", y=0.995)
+    fig.subplots_adjust(left=0.07, right=0.90, bottom=0.08, top=0.93)
+    save_figure(fig, output, "representation_geometry")
 
 
 def plot_cka(cka_root: Path, full_test_dir: Path, output: Path, title: str) -> None:
@@ -356,9 +573,15 @@ def plot_cka(cka_root: Path, full_test_dir: Path, output: Path, title: str) -> N
         right_names = [name for name in summary["right_representation_names"] if name != "classification_head_input"]
         left_indices = [summary["left_representation_names"].index(name) for name in left_names]
         right_indices = [summary["right_representation_names"].index(name) for name in right_names]
-        matrix = np.asarray(summary["full_cross_layer_cka"]["all"])[np.ix_(left_indices, right_indices)]
+        full_matrix = summary["full_cross_layer_cka"]["all"]
+        matrix = [
+            [full_matrix[left_index][right_index] for right_index in right_indices]
+            for left_index in left_indices
+        ]
         fig, ax = plt.subplots(figsize=(7.0, 5.8))
-        image = ax.imshow(matrix, vmin=0, vmax=1, cmap="viridis", aspect="auto")
+        cmap = plt.get_cmap("viridis").copy()
+        cmap.set_bad("#bdbdbd")
+        image = ax.imshow(masked_cka_matrix(matrix), vmin=0, vmax=1, cmap=cmap, aspect="auto")
         ax.set_xticks(range(len(right_names)), right_names, rotation=35, ha="right")
         ax.set_yticks(range(len(left_names)), left_names)
         ax.set_xlabel("Right representation")
@@ -366,9 +589,9 @@ def plot_cka(cka_root: Path, full_test_dir: Path, output: Path, title: str) -> N
         decorate_axis(ax, title=f"{PAIR_LABELS[pair]}: all events")
         for row in range(matrix.shape[0]):
             for column in range(matrix.shape[1]):
-                value = matrix[row, column]
-                ax.text(column, row, f"{value:.3f}", ha="center", va="center",
-                        fontsize=9, color="white" if value < 0.55 else "black")
+                value = matrix[row][column]
+                ax.text(column, row, "N/A" if value is None else f"{value:.3f}", ha="center", va="center", fontsize=9, color="black" if value is None else ("white" if value < 0.55 else "black"))
+        ax.legend(handles=[Patch(facecolor="#bdbdbd", edgecolor="none", label="N/A")], loc="upper left", fontsize=7, frameon=False)
         fig.colorbar(image, ax=ax, label="Linear centred CKA")
         fig.tight_layout()
         save_figure(fig, output, f"cka_inclusive_{pair}")
@@ -376,11 +599,11 @@ def plot_cka(cka_root: Path, full_test_dir: Path, output: Path, title: str) -> N
     fig, axes = plt.subplots(2, 2, figsize=(12.5, 9.0), sharex=True, sharey=True)
     for ax, subset in zip(axes.flat, SUBSET_LABELS):
         for pair, summary in summaries.items():
-            values = [summary["corresponding_layer_cka"][subset][name] for name in REPRESENTATIONS]
-            ax.plot(REPRESENTATIONS, values, marker="o", linewidth=1.8, label=PAIR_LABELS[pair])
+            values = [summary["corresponding_layer_cka"][subset].get(name) for name in REPRESENTATIONS]
+            plot_cka_series(ax, np.arange(len(REPRESENTATIONS)), values, PAIR_LABELS[pair], marker="o", linewidth=1.8)
         ax.set_ylim(0, 1.02)
         ax.set_ylabel("Linear centred CKA")
-        ax.tick_params(axis="x", rotation=25)
+        ax.set_xticks(np.arange(len(REPRESENTATIONS)), REPRESENTATIONS, rotation=25)
         decorate_axis(ax, title=SUBSET_LABELS[subset])
     axes[0, 0].legend(fontsize=9)
     fig.suptitle(f"{title}: corresponding-layer CKA", y=1.01)
@@ -443,6 +666,7 @@ def scientific_summary(
     full_test_dir: Path,
     alignments_root: Path,
     output: Path,
+    render_figure: bool = False,
 ) -> None:
     bootstrap = read_csv(metrics_dir / "bootstrap_summary.csv")
     auc_rows = {
@@ -539,6 +763,8 @@ def scientific_summary(
         json.dumps({"rows": rows}, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    if not render_figure:
+        return
     fig, ax = plt.subplots(figsize=(11.5, max(6.0, 0.36 * len(rows))))
     ax.axis("off")
     table_data = []
@@ -563,6 +789,7 @@ def scientific_summary(
 
 def main() -> int:
     args = parse_args()
+    started = time.perf_counter()
     configure_matplotlib()
     scores_dir = Path(args.scores_dir).expanduser().resolve()
     metrics_dir = Path(args.metrics_dir).expanduser().resolve()
@@ -575,14 +802,29 @@ def main() -> int:
     labels = np.asarray(load_array(scores_dir, "test_truth_class"), dtype=np.int8)
     fm = np.asarray(load_array(scores_dir, "test_truth_fully_matched"), dtype=bool)
     scores = {field: np.asarray(load_array(scores_dir, field), dtype=np.float64) for field in METHOD_LABELS}
-    plot_zero_shot(scores, labels, fm, output, args.title)
-    plot_transfer_rocs(scores, labels, output, args.title)
-    plot_correlations(scores, output, args.title)
-    plot_bootstrap(metrics_dir, output, args.title)
+    full_suite = args.plot_set == "full"
+    plot_native_multitask_effect(metrics_dir, output, args.title)
+    plot_zero_shot(scores, labels, fm, output, args.title, full_suite=full_suite)
     plot_control_nulls(controls_dir, output, args.title)
-    plot_cka(cka_root, full_test_dir, output, args.title)
-    plot_alignment_diagnostics(alignments_root, output, args.title)
-    scientific_summary(metrics_dir, controls_dir, cka_root, full_test_dir, alignments_root, output)
+    plot_representation_geometry(cka_root, output, args.title)
+    if full_suite:
+        plot_transfer_rocs(scores, labels, output, args.title)
+        plot_correlations(scores, output, args.title)
+        plot_bootstrap(metrics_dir, output, args.title)
+        plot_cka(cka_root, full_test_dir, output, args.title)
+        plot_alignment_diagnostics(alignments_root, output, args.title)
+    scientific_summary(
+        metrics_dir,
+        controls_dir,
+        cka_root,
+        full_test_dir,
+        alignments_root,
+        output,
+        render_figure=full_suite,
+    )
+    diagnostics = resource_diagnostics(stage="plots", started=started, output_root=output)
+    diagnostics.update({"plot_set": args.plot_set, "output": str(output)})
+    write_resource_diagnostics(output, diagnostics)
     print(f"wrote={output}")
     return 0
 

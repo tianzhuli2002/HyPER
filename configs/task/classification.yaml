@@ -1,0 +1,9 @@
+# @package _global_
+task:
+  mode: classification
+loss:
+  edge_weight: 0.0
+  hyperedge_weight: 0.0
+  classification_weight: 1.0
+trainer:
+  check_val_every_n_epoch: 1

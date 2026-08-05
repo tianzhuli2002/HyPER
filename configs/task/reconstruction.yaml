@@ -1,0 +1,7 @@
+# @package _global_
+task:
+  mode: reconstruction
+loss:
+  edge_weight: 0.5
+  hyperedge_weight: 0.5
+  classification_weight: 0.0

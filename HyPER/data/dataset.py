@@ -105,9 +105,9 @@ class HyPERDataset(Dataset):
         self._invalid_truth_label_warning_count = 0
 
         target_cfg = parsed_inputs.get('target', {})
-        self.target_encoding = str(target_cfg.get("encoding", "")).strip().lower()
+        self.target_encoding = str(target_cfg.get("encoding", "typed")).strip().lower()
         if self.target_encoding != "typed":
-            raise ValueError("target.encoding must be explicitly set to 'typed'.")
+            raise ValueError("HyPER supports typed reconstruction targets only.")
 
         edge_target_cfg = target_cfg.get('edge', {}) or {}
         hyperedge_target_cfg = target_cfg.get('hyperedge', {}) or {}

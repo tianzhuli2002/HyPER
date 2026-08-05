@@ -8,14 +8,14 @@ Legacy ttbar SL role convention:
     3 = W_HAD_J1
     4 = W_HAD_J2
 
-Semantic reconstruction contract after ttbar_single_lep():
+Semantic reconstruction contract after reconstruct_ttbar1l():
 
     HyPER_best_top1 = leptonic top
     HyPER_best_top2 = hadronic top
     HyPER_best_w1   = leptonic W edge
     HyPER_best_w2   = hadronic W edge
 
-If raw HyPER outputs are provided, this script first calls ttbar_single_lep().
+If raw HyPER outputs are provided, this script first calls reconstruct_ttbar1l().
 
 Evaluation policy:
 
@@ -29,9 +29,9 @@ Evaluation policy:
         signal events only, fully matched, n_jets >= 4, finite observable values.
 
     Background events:
-        still reconstructed by ttbar_single_lep() if raw outputs are provided and
-        still written to observables.csv for diagnostics, but excluded from
-        reconstruction efficiencies and observable plots.
+        still reconstructed by reconstruct_ttbar1l() if raw outputs are provided. They are
+        excluded from reconstruction efficiencies and observable plots; an
+        event-level table is written only with --write-event-table.
 """
 
 from __future__ import annotations
@@ -58,12 +58,13 @@ from HyPER.topology.reconstruction_score import ttbar_sl_event_reconstruction_sc
 from HyPER.topology.plot_style import configure_matplotlib, save_figure as shared_save_figure
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
-
-from prediction_io import coerce_source_indices, iter_hyper_prediction_parts, load_hyper_prediction_output, read_h5_rows  # noqa: E402
-from joint_reco_plotting import (  # noqa: E402
+from HyPER.topology.prediction_io import (
+    coerce_source_indices,
+    iter_hyper_prediction_parts,
+    load_hyper_prediction_output,
+    read_h5_rows,
+)
+from HyPER.topology.joint_reco_plotting import (
     H5_LABEL_CANDIDATES,
     binary_labels_from_h5_data,
     category_masks,
@@ -73,7 +74,7 @@ from joint_reco_plotting import (  # noqa: E402
     resolve_event_labels,
     write_category_diagnostics,
 )
-from ttbar import ttbar_single_lep  # noqa: E402
+from HyPER.topology.ttbar import reconstruct_ttbar1l
 
 
 LOGGER = logging.getLogger(__name__)
@@ -111,37 +112,25 @@ RAW_COLUMNS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--h5", required=True, help="Original ttbar SL H5 file.")
+    parser.add_argument("--h5", required=True, help="Original ttbar1L H5 file.")
     parser.add_argument("--prediction-output", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-events", type=int, default=None)
     parser.add_argument("--score-field", default="HyPER_CLS_PROB")
     parser.add_argument("--label-field", default=None)
-    parser.add_argument("--formats", nargs="+", default=["pdf"])
-    parser.add_argument("--no-sb", action="store_true")
-    parser.add_argument("--strict-length", action="store_true")
-    parser.add_argument("--alignment", choices=["row_order", "source_index"], default="source_index")
-    parser.add_argument("--allow-duplicate-source-index", action="store_true")
-    parser.add_argument(
-        "--classification",
-        action="store_true",
-        help="Keep HyPER_CLS_PROB when reconstructing raw outputs.",
-    )
+    parser.add_argument("--formats", nargs="+", default=["pdf", "png"])
     parser.add_argument("--chunk-size", type=int, default=100000)
-    parser.add_argument("--write-event-csv", action="store_true")
-    parser.add_argument("--skip-event-csv", action="store_true")
+    parser.add_argument("--write-event-table", action="store_true")
     parser.add_argument("--max-plot-points", type=int, default=1000000)
-    parser.add_argument(
-        "--plot-scope",
-        choices=["fully_matched", "signal_split", "all_split", "all"],
-        default="fully_matched",
-        help=(
-            "Observable plotting scope. fully_matched preserves the existing "
-            "signal fully matched selection; split modes add suffixed inclusive plots."
-        ),
-    )
+    parser.add_argument("--plot-set", choices=("essential", "full"), default="essential")
     parser.add_argument("--log-level", default="INFO")
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Fixed production safety contract. These attributes are retained only for
+    # the internal implementation while the old unsafe CLI switches are gone.
+    args.classification = True
+    args.plot_scope = "fully_matched" if args.plot_set == "essential" else "all"
+    return args
 
 
 def valid_structured_rows(arr: np.ndarray) -> np.ndarray:
@@ -240,7 +229,7 @@ def normalise_predictions(predictions: pd.DataFrame, classification: bool) -> pd
                 "Missing raw columns: " + ", ".join(missing)
             )
 
-        reco = ttbar_single_lep(
+        reco = reconstruct_ttbar1l(
             predictions,
             classification=classification or ("HyPER_CLS_PROB" in predictions.columns),
         )
@@ -251,29 +240,6 @@ def normalise_predictions(predictions: pd.DataFrame, classification: bool) -> pd
         reco["HyPER_CLS_PROB"] = np.nan
 
     return reco.reset_index(drop=True)
-
-
-def read_h5_prefix(path: str | Path, n_events: int) -> dict[str, np.ndarray]:
-    with h5py.File(path, "r") as handle:
-        for required in ("INPUTS/JET", "INPUTS/LEPTON", "INPUTS/MET", "LABELS/JET"):
-            if required not in handle:
-                raise KeyError(f"Missing required dataset {required}")
-
-        data = {
-            "jets": handle["INPUTS/JET"][:n_events],
-            "leptons": handle["INPUTS/LEPTON"][:n_events],
-            "met": handle["INPUTS/MET"][:n_events],
-            "jet_labels": handle["LABELS/JET"][:n_events],
-        }
-
-        if "INPUTS/GLOBAL" in handle:
-            data["global_inputs"] = handle["INPUTS/GLOBAL"][:n_events]
-
-        for candidate in H5_LABEL_CANDIDATES:
-            if candidate in handle:
-                data[candidate] = handle[candidate][:n_events]
-
-    return data
 
 
 def jet_multiplicity(global_inputs: np.ndarray | None, jet_rows: np.ndarray) -> int:
@@ -569,95 +535,6 @@ def evaluate_event(
     }
 
 
-def evaluate_events(
-    data: dict[str, np.ndarray],
-    reco: pd.DataFrame,
-    n_processed: int,
-    signal_labels: np.ndarray | None,
-) -> pd.DataFrame:
-    global_inputs = data.get("global_inputs")
-    rows = []
-
-    for event_idx in range(n_processed):
-        global_row = (
-            global_inputs[event_idx, 0]
-            if global_inputs is not None and global_inputs.ndim > 1
-            else None
-        )
-        is_signal = None if signal_labels is None else int(signal_labels[event_idx])
-
-        rows.append(
-            evaluate_event(
-                event_idx=event_idx,
-                row=reco.iloc[event_idx],
-                jets_event=data["jets"][event_idx],
-                leptons_event=data["leptons"][event_idx],
-                met_event=data["met"][event_idx],
-                jet_labels_event=data["jet_labels"][event_idx],
-                global_input_event=global_row,
-                is_signal=is_signal,
-            )
-        )
-
-    return pd.DataFrame(rows)
-
-
-def efficiency_rows(evaluation: pd.DataFrame) -> list[dict[str, Any]]:
-    rows = []
-    base_mask = evaluation["reco_eval_event"].to_numpy(dtype=bool)
-
-    for bin_name in NJET_BINS:
-        if bin_name == "overall":
-            mask = base_mask
-        else:
-            mask = base_mask & (evaluation["njet_bin"].to_numpy() == bin_name)
-
-        subset = evaluation.loc[mask]
-        n_events = int(len(subset))
-        row: dict[str, Any] = {"njet_bin": bin_name, "n_events": n_events}
-
-        for name, column in (
-            ("event_eff", "event_correct"),
-            ("b_lep_eff", "b_lep_correct"),
-            ("b_had_eff", "b_had_correct"),
-            ("whad_eff", "whad_correct"),
-            ("thad_eff", "thad_correct"),
-            ("reco_valid_fraction", "reco_valid"),
-        ):
-            row[name] = float(subset[column].mean()) if n_events else float("nan")
-
-        rows.append(row)
-
-    return rows
-
-
-def pattern_counts(evaluation: pd.DataFrame) -> dict[str, dict[str, int]]:
-    base = evaluation.loc[evaluation["reco_eval_event"] == 1].copy()
-
-    out: dict[str, dict[str, int]] = {}
-    for column in ("top1_label_tuple", "top2_label_tuple", "w1_label_tuple", "w2_label_tuple"):
-        out[column] = {
-            str(key): int(value)
-            for key, value in Counter(base[column].astype(str)).most_common(30)
-        }
-
-    out["w2_wrong_only"] = {
-        str(key): int(value)
-        for key, value in Counter(
-            base.loc[base["whad_correct"] == 0, "w2_label_tuple"].astype(str)
-        ).most_common(30)
-    }
-
-    out["top2_wrong_only"] = {
-        str(key): int(value)
-        for key, value in Counter(
-            base.loc[base["thad_correct"] == 0, "top2_label_tuple"].astype(str)
-        ).most_common(30)
-    }
-
-    return out
-
-
 def clean_json_value(value: Any) -> Any:
     if isinstance(value, (np.integer,)):
         return int(value)
@@ -824,10 +701,16 @@ def plot_efficiency_per_jet_detailed(
         save_fig(output_dir, f"efficiency_components_{safe_bin}_jets", formats)
 
 
-def plot_efficiencies(eff_rows: list[dict[str, Any]], output_dir: Path, formats: list[str]) -> None:
+def plot_efficiencies(
+    eff_rows: list[dict[str, Any]],
+    output_dir: Path,
+    formats: list[str],
+    plot_set: str,
+) -> None:
     plot_efficiency_bar(eff_rows, output_dir, formats)
     plot_component_efficiency_bars(eff_rows, output_dir, formats)
-    plot_efficiency_per_jet_detailed(eff_rows, output_dir, formats)
+    if plot_set == "full":
+        plot_efficiency_per_jet_detailed(eff_rows, output_dir, formats)
 
 
 def plot_hist(
@@ -925,98 +808,42 @@ def plot_hist_by_scope(
     save_fig(output_dir, f"{name}_{plot_scope}", formats)
 
 
-def plot_observables(
-    evaluation: pd.DataFrame,
-    output_dir: Path,
-    formats: list[str],
-    plot_scope: str = "fully_matched",
-) -> None:
-    if plot_scope == "fully_matched":
-        evaluation = evaluation.loc[evaluation["reco_eval_event"] == 1].copy()
-    else:
-        evaluation = evaluation.copy()
-
-    for name in ("m_Whad", "m_thad", "m_tlep_visible", "m_ttbar_visible"):
-        values = evaluation[name].to_numpy(dtype=float)
-        if plot_scope == "fully_matched":
-            plot_hist(values, name, name, output_dir, name, formats)
-        else:
-            plot_hist_by_scope(evaluation, values, name, name, output_dir, name, formats, plot_scope)
-
-        truth_name = f"{name}_truth"
-        if truth_name in evaluation.columns:
-            pred = evaluation[name].to_numpy(dtype=float)
-            truth = evaluation[truth_name].to_numpy(dtype=float)
-            mask = np.isfinite(pred) & np.isfinite(truth)
-            if np.any(mask):
-                resolution = pred[mask] - truth[mask]
-                if plot_scope == "fully_matched":
-                    plot_hist(
-                        resolution,
-                        f"{name} - truth [GeV]",
-                        f"{name} resolution",
-                        output_dir,
-                        f"{name}_resolution",
-                        formats,
-                    )
-                else:
-                    resolution_values = np.full(len(evaluation), np.nan, dtype=float)
-                    resolution_values[mask] = resolution
-                    plot_hist_by_scope(
-                        evaluation,
-                        resolution_values,
-                        f"{name} - truth [GeV]",
-                        f"{name} resolution",
-                        output_dir,
-                        f"{name}_resolution",
-                        formats,
-                        plot_scope,
-                    )
-
-    for name in ("event_reco_score", "top_had_score", "top_lep_score", "w_had_score", "w_lep_score"):
-        output_name = name if name != "event_reco_score" else "reco_score_distribution"
-        values = evaluation[name].to_numpy(dtype=float)
-        if plot_scope == "fully_matched":
-            plot_hist(values, name, name, output_dir, output_name, formats)
-        else:
-            plot_hist_by_scope(evaluation, values, name, name, output_dir, output_name, formats, plot_scope)
-
-
 def plot_standard_observable_families(
     evaluation: pd.DataFrame,
     output_dir: Path,
     formats: list[str],
+    plot_set: str,
 ) -> dict[str, dict[str, int]]:
     rows_used: dict[str, dict[str, int]] = {}
-    for column in ("m_Whad", "m_thad", "m_tlep_visible", "m_ttbar_visible"):
+    mass_columns = ("m_Whad", "m_thad", "m_ttbar_visible")
+    if plot_set == "full":
+        mass_columns = ("m_Whad", "m_thad", "m_tlep_visible", "m_ttbar_visible")
+    labels = {
+        "m_Whad": (r"$m(W_{\mathrm{had}})$ [GeV]", "Hadronic W mass"),
+        "m_thad": (r"$m(t_{\mathrm{had}})$ [GeV]", "Hadronic top mass"),
+        "m_tlep_visible": (r"$m(t_{\mathrm{lep}}^{\mathrm{vis}})$ [GeV]", "Visible leptonic top mass"),
+        "m_ttbar_visible": (r"$m(t\bar{t})_{\mathrm{vis}}$ [GeV]", "Visible ttbar mass"),
+        "event_reco_score": ("Reconstruction confidence", "Event reconstruction confidence"),
+    }
+    for column in mass_columns:
         if column in evaluation.columns:
+            xlabel, title = labels[column]
             rows_used[column] = plot_observable_pair(
-                evaluation,
-                column,
-                column,
-                column,
-                column,
-                4,
-                output_dir,
-                formats,
+                evaluation, column, column, xlabel, title, 4, output_dir, formats,
+                include_category_split=(plot_set == "full"),
             )
-    for column in (
-        "event_reco_score",
-        "top_had_score",
-        "top_lep_score",
-        "w_had_score",
-        "w_lep_score",
-    ):
+    score_columns = ("event_reco_score",)
+    if plot_set == "full":
+        score_columns = (
+            "event_reco_score", "top_had_score", "top_lep_score",
+            "w_had_score", "w_lep_score",
+        )
+    for column in score_columns:
         if column in evaluation.columns:
+            xlabel, title = labels.get(column, (column, column))
             rows_used[column] = plot_observable_pair(
-                evaluation,
-                column,
-                column,
-                column,
-                column,
-                4,
-                output_dir,
-                formats,
+                evaluation, column, column, xlabel, title, 4, output_dir, formats,
+                include_category_split=(plot_set == "full"),
             )
     return rows_used
 
@@ -1041,126 +868,6 @@ def binary_roc(labels: np.ndarray, scores: np.ndarray) -> tuple[np.ndarray, np.n
     fpr = np.concatenate(([0.0], fps / negatives, [1.0]))
 
     return fpr, tpr, float(np.trapz(tpr, fpr))
-
-
-def make_sb_plots(
-    evaluation: pd.DataFrame,
-    labels: np.ndarray | None,
-    label_source: str | None,
-    score_field: str,
-    no_sb: bool,
-    output_dir: Path,
-    formats: list[str],
-) -> tuple[dict[str, Any] | None, str | None]:
-    if no_sb:
-        return None, "S/B plots skipped by --no-sb."
-
-    if score_field not in evaluation.columns or not np.any(np.isfinite(evaluation[score_field].to_numpy(dtype=float))):
-        return None, f"S/B plots skipped because score field {score_field!r} is absent or all NaN."
-
-    if labels is None:
-        return None, "S/B plots skipped because no binary event labels were found."
-
-    labels = labels[: len(evaluation)]
-    scores = evaluation[score_field].to_numpy(dtype=float)
-
-    unique_labels = sorted(set(labels[np.isfinite(scores)].astype(int).tolist()))
-    if unique_labels != [0, 1]:
-        return None, f"S/B plots skipped because labels do not contain both classes: {unique_labels}."
-
-    plt.figure(figsize=(6.0, 4.2))
-    bins = np.linspace(0.0, 1.0, 41)
-    for label, title in ((0, "Background"), (1, "Signal")):
-        values = scores[(labels == label) & np.isfinite(scores)]
-        if len(values):
-            plt.hist(values, bins=bins, histtype="step", density=True, label=title)
-    plt.xlabel(score_field)
-    plt.ylabel("Density")
-    plt.legend()
-    plt.tight_layout()
-    save_fig(output_dir, "sb_score_distribution", formats)
-
-    fpr, tpr, auc = binary_roc(labels, scores)
-    if len(fpr):
-        plt.figure(figsize=(5.2, 5.0))
-        plt.plot(fpr, tpr, label=f"AUC={auc:.3f}")
-        plt.plot([0, 1], [0, 1], linestyle="--", linewidth=1)
-        plt.xlabel("Background efficiency")
-        plt.ylabel("Signal efficiency")
-        plt.legend()
-        plt.tight_layout()
-        save_fig(output_dir, "roc_curve", formats)
-
-    summary = {
-        "score_field": score_field,
-        "label_source": label_source,
-        "fallback_fully_matched_used": False,
-        "n_events": int(np.sum(np.isfinite(scores))),
-        "n_signal": int(np.sum(labels == 1)),
-        "n_background": int(np.sum(labels == 0)),
-        "auc": auc,
-        "mean_score_signal": float(np.nanmean(scores[labels == 1])),
-        "mean_score_background": float(np.nanmean(scores[labels == 0])),
-    }
-
-    with (output_dir / "sb_summary.json").open("w", encoding="utf-8") as handle:
-        json.dump({key: clean_json_value(value) for key, value in summary.items()}, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-
-    return summary, None
-
-
-def write_outputs(
-    output_dir: Path,
-    evaluation: pd.DataFrame,
-    eff_rows: list[dict[str, Any]],
-    summary: dict[str, Any],
-) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    evaluation.to_csv(output_dir / "observables.csv", index=False)
-    write_csv(output_dir / "efficiency_by_njets.csv", eff_rows)
-
-    overall = next(row for row in eff_rows if row["njet_bin"] == "overall")
-    summary_csv_row = {
-        "processed_events": summary["processed_events"],
-        "signal_events": summary["signal_events"],
-        "background_events": summary["background_events"],
-        "fully_matched_events": summary["fully_matched_events"],
-        "reco_eval_events": summary["reco_eval_events"],
-        "reco_eval_fraction": summary["reco_eval_fraction"],
-        "event_eff": overall["event_eff"],
-        "b_lep_eff": overall["b_lep_eff"],
-        "b_had_eff": overall["b_had_eff"],
-        "whad_eff": overall["whad_eff"],
-        "thad_eff": overall["thad_eff"],
-        "reco_valid_fraction": overall["reco_valid_fraction"],
-        "sb_status": summary.get("sb_status"),
-    }
-    write_csv(output_dir / "summary.csv", [summary_csv_row])
-
-    with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2, sort_keys=True, default=clean_json_value)
-        handle.write("\n")
-
-
-def read_h5_slice(path: str | Path, start: int, stop: int) -> dict[str, np.ndarray]:
-    with h5py.File(path, "r") as handle:
-        for required in ("INPUTS/JET", "INPUTS/LEPTON", "INPUTS/MET", "LABELS/JET"):
-            if required not in handle:
-                raise KeyError(f"Missing required dataset {required}")
-        data = {
-            "jets": handle["INPUTS/JET"][start:stop],
-            "leptons": handle["INPUTS/LEPTON"][start:stop],
-            "met": handle["INPUTS/MET"][start:stop],
-            "jet_labels": handle["LABELS/JET"][start:stop],
-        }
-        if "INPUTS/GLOBAL" in handle:
-            data["global_inputs"] = handle["INPUTS/GLOBAL"][start:stop]
-        for candidate in H5_LABEL_CANDIDATES:
-            if candidate in handle:
-                data[candidate] = handle[candidate][start:stop]
-    return data
 
 
 def read_h5_indexed(path: str | Path, source_indices: np.ndarray, chunk_size: int) -> dict[str, np.ndarray]:
@@ -1273,7 +980,7 @@ def main() -> None:
     alignment_mode = None
     event_csv_written = False
     event_csv_path = output_dir / "observables.csv"
-    write_event_csv = bool(args.write_event_csv and not args.skip_event_csv)
+    write_event_csv = bool(args.write_event_table)
 
     for prediction_chunk in iter_hyper_prediction_parts(
         args.prediction_output,
@@ -1283,44 +990,26 @@ def main() -> None:
         if len(prediction_chunk) == 0:
             continue
         if n_prediction_events is None:
-            n_prediction_events = int(prediction_chunk.attrs.get("hyper_total_rows", len(prediction_chunk)))
-            requested_alignment = str(args.alignment)
-            if requested_alignment == "row_order":
-                alignment_mode = "row_order"
-            else:
-                alignment_mode = "source_index"
-            if alignment_mode == "row_order" and n_h5_events != n_prediction_events:
-                raise ValueError(
-                    f"Length mismatch: H5 has {n_h5_events} events, "
-                    f"prediction has {n_prediction_events} rows."
-                )
-
-        assert alignment_mode is not None
-        if alignment_mode == "row_order":
-            chunk_len = min(len(prediction_chunk), n_h5_events - n_processed)
-        else:
-            chunk_len = len(prediction_chunk)
-        if chunk_len <= 0:
-            break
-        prediction_chunk = prediction_chunk.iloc[:chunk_len].reset_index(drop=True)
-
-        reco = normalise_predictions(prediction_chunk, classification=args.classification).reset_index(drop=True)
-        if alignment_mode == "row_order":
-            start = n_processed
-            stop = start + chunk_len
-            source_indices = np.arange(start, stop, dtype=np.int64)
-            data = read_h5_slice(args.h5, start, stop)
-        else:
-            source_indices, index_warnings = coerce_source_indices(
-                prediction_chunk,
-                n_h5_events=n_h5_events,
-                allow_duplicates=bool(args.allow_duplicate_source_index),
+            n_prediction_events = int(
+                prediction_chunk.attrs.get("hyper_total_rows", len(prediction_chunk))
             )
-            for warning in index_warnings:
-                if warning not in warnings_list:
-                    warnings_list.append(warning)
-                    LOGGER.warning(warning)
-            data = read_h5_indexed(args.h5, source_indices, chunk_size=args.chunk_size)
+            alignment_mode = "source_index"
+
+        chunk_len = len(prediction_chunk)
+        prediction_chunk = prediction_chunk.reset_index(drop=True)
+        reco = normalise_predictions(
+            prediction_chunk, classification=args.classification
+        ).reset_index(drop=True)
+        source_indices, index_warnings = coerce_source_indices(
+            prediction_chunk,
+            n_h5_events=n_h5_events,
+            allow_duplicates=False,
+        )
+        for warning in index_warnings:
+            if warning not in warnings_list:
+                warnings_list.append(warning)
+                LOGGER.warning(warning)
+        data = read_h5_indexed(args.h5, source_indices, chunk_size=args.chunk_size)
         h5_labels, chunk_h5_label_source = binary_labels_from_h5_data(data, args.label_field)
         labels, chunk_label_source = resolve_event_labels(
             prediction_chunk,
@@ -1393,16 +1082,13 @@ def main() -> None:
 
         n_processed += chunk_len
         n_prediction_loaded += chunk_len
-        if alignment_mode == "row_order":
-            LOGGER.info("Processed plotting events %d:%d", start, stop)
-        else:
-            LOGGER.info(
-                "Processed plotting prediction rows %d:%d using source_index range %d:%d",
-                n_processed - chunk_len,
-                n_processed,
-                int(source_indices.min()) if len(source_indices) else -1,
-                int(source_indices.max()) if len(source_indices) else -1,
-            )
+        LOGGER.info(
+            "Processed plotting prediction rows %d:%d using source-index range %d:%d",
+            n_processed - chunk_len,
+            n_processed,
+            int(source_indices.min()) if len(source_indices) else -1,
+            int(source_indices.max()) if len(source_indices) else -1,
+        )
         if args.max_events is not None and n_processed >= int(args.max_events):
             break
 
@@ -1432,19 +1118,21 @@ def main() -> None:
         "fully_matched_signal_events": 0,
         "unmatched_signal_events": 0,
     }
-    plot_efficiencies(eff_rows, output_dir, args.formats)
+    plot_efficiencies(eff_rows, output_dir, args.formats, args.plot_set)
     observable_rows_used: dict[str, dict[str, int]] = {}
     if len(evaluation_sample):
         observable_rows_used = plot_standard_observable_families(
-            evaluation_sample, output_dir, args.formats
+            evaluation_sample, output_dir, args.formats, args.plot_set
         )
 
-    if args.no_sb:
-        sb_summary = {"available": False, "reason": "disabled by --no-sb"}
-    else:
-        sb_summary = plot_joint_sb(
-            evaluation_sample, args.score_field, output_dir, args.formats
-        )
+    sb_summary = plot_joint_sb(
+        evaluation_sample,
+        args.score_field,
+        output_dir,
+        args.formats,
+        topology_label="ttbar single-lepton",
+        plot_set=args.plot_set,
+    )
     sb_skip_reason = None if sb_summary.get("available") else sb_summary.get("reason")
     if sb_skip_reason:
         LOGGER.warning("%s", sb_skip_reason)
@@ -1462,20 +1150,20 @@ def main() -> None:
         label_source,
         False,
     )
-    write_category_diagnostics(category_summary, output_dir, args.formats)
+    if args.plot_set == "full":
+        write_category_diagnostics(category_summary, output_dir, args.formats)
 
     summary = {
         "h5": str(args.h5),
         "prediction_output": str(args.prediction_output),
         "output_dir": str(args.output_dir),
-        "topology": "ttbar_singlelep",
+        "topology": "ttbar1L",
         "h5_events": int(n_h5_events),
         "prediction_events": int(n_prediction_events),
         "prediction_rows_loaded": int(n_prediction_loaded),
         "processed_events": int(n_processed),
         "max_events": args.max_events,
         "prediction_truncated_by_loader": bool(args.max_events is not None and n_processed >= int(args.max_events)),
-        "strict_length": bool(args.strict_length),
         "chunk_size": int(args.chunk_size),
         "event_csv": "written" if event_csv_written else "skipped",
         "max_plot_points": int(args.max_plot_points),
@@ -1488,9 +1176,7 @@ def main() -> None:
         "plot_category_counts": plot_counts,
         "plot_sample_events": int(len(evaluation_sample)),
         "event_alignment": alignment_mode,
-        "event_alignment_policy": (
-            "source_index is the default; row_order must be requested explicitly for a declared full-dataset output."
-        ),
+        "event_alignment_policy": "source_event_index is required and duplicates are rejected.",
         "label_source": label_source,
         "fallback_fully_matched_used": False,
         "signal_events": signal_events,
@@ -1520,15 +1206,15 @@ def main() -> None:
                 "same as reconstruction_efficiency, with finite pred/truth observable values where relevant"
             ),
             "background_events": (
-                "can be streamed to observables.csv with --write-event-csv but are excluded from "
+                "can be streamed to observables.csv with --write-event-table but are excluded from "
                 "reconstruction efficiencies and observable plots"
             ),
         },
         "semantic_contract": {
-            "HyPER_best_top1": "leptonic top after ttbar_single_lep()",
-            "HyPER_best_top2": "hadronic top after ttbar_single_lep()",
-            "HyPER_best_w1": "leptonic W edge after ttbar_single_lep()",
-            "HyPER_best_w2": "hadronic W edge after ttbar_single_lep()",
+            "HyPER_best_top1": "leptonic top after reconstruct_ttbar1l()",
+            "HyPER_best_top2": "hadronic top after reconstruct_ttbar1l()",
+            "HyPER_best_w1": "leptonic W edge after reconstruct_ttbar1l()",
+            "HyPER_best_w2": "hadronic W edge after reconstruct_ttbar1l()",
         },
         "efficiency_logic": {
             "Whad_is_correct": "{3, 4}.issubset(w2)",
@@ -1575,7 +1261,7 @@ def main() -> None:
     }
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    if not event_csv_written and not args.skip_event_csv and n_processed <= 1_000_000 and len(evaluation_sample) == n_processed:
+    if not event_csv_written and args.write_event_table and n_processed <= 1_000_000 and len(evaluation_sample) == n_processed:
         evaluation_sample.to_csv(output_dir / "observables.csv", index=False)
         event_csv_written = True
         summary["event_csv"] = "written_sample_complete"

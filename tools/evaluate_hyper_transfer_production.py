@@ -23,9 +23,14 @@ from HyPER.analysis.runtime import (
     load_analysis_config,
     load_frozen_model,
     truth_fully_matched,
+    resource_diagnostics,
+    write_resource_diagnostics,
 )
 from HyPER.topology.prediction_io import iter_hyper_prediction_parts
-from HyPER.topology.reconstruction_score import ttbar_sl_event_reconstruction_score
+from HyPER.topology.reconstruction_score import (
+    event_reconstruction_score,
+    normalise_reconstruction_topology,
+)
 
 DIRECTIONS = {
     "reconstruction_to_classification": ("reconstruction", "classification"),
@@ -52,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     for mode in ("classification", "reconstruction", "joint"):
         parser.add_argument(f"--{mode}-config", required=True)
         parser.add_argument(f"--{mode}-checkpoint", required=True)
+    parser.add_argument("--topology", choices=("ttbar1L", "ttH"), required=True)
     parser.add_argument("--reconstruction-predictions", required=True)
     parser.add_argument("--joint-predictions", required=True)
     for direction in DIRECTIONS:
@@ -139,7 +145,8 @@ def load_alignment_ensemble(root: str) -> tuple[dict[str, np.ndarray], list[dict
     return load_alignment(paired_path), controls
 
 
-def load_reconstruction_scores(path: str) -> dict[int, float]:
+def load_reconstruction_scores(path: str, topology: str) -> dict[int, float]:
+    topology = normalise_reconstruction_topology(topology)
     scores: dict[int, float] = {}
     for frame in iter_hyper_prediction_parts(Path(path), max_events=None, chunk_size=100000):
         required = {"source_event_index", "selected_reconstruction_scores"}
@@ -149,7 +156,16 @@ def load_reconstruction_scores(path: str) -> dict[int, float]:
             index = int(index)
             if index in scores:
                 raise ValueError(f"Duplicate reconstruction source_event_index={index}.")
-            scores[index] = ttbar_sl_event_reconstruction_score(values)
+            scores[index] = event_reconstruction_score(values, topology)
+    if not scores:
+        raise RuntimeError(f"No reconstruction scores were loaded from {path}.")
+    values = np.asarray(list(scores.values()), dtype=np.float64)
+    if not np.isfinite(values).all():
+        invalid = int(np.sum(~np.isfinite(values)))
+        raise RuntimeError(
+            f"{invalid} {topology} reconstruction scores are non-finite; "
+            "check selected_reconstruction_scores and topology compatibility."
+        )
     return scores
 
 
@@ -247,6 +263,7 @@ def create_memmap(path: Path, shape: tuple[int, ...], dtype) -> np.memmap:
 
 def main() -> int:
     args = parse_args()
+    started = time.perf_counter()
     if args.control_chunk_size <= 0:
         raise ValueError("--control-chunk-size must be positive.")
     if args.num_random_controls <= 0:
@@ -312,26 +329,16 @@ def main() -> int:
         direction: alignment_to_device(alignment, device, model_dtype)
         for direction, alignment in paired.items()
     }
-    controls_device = {
-        (direction, "shuffled"): controls_to_device(shuffled[direction], device, model_dtype)
-        for direction in DIRECTIONS
-    }
-    controls_device.update(
-        {
-            (direction, "random"): controls_to_device(
-                random_controls[direction], device, model_dtype
-            )
-            for direction in DIRECTIONS
-        }
-    )
     if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
         print(
-            f"alignment_controls_loaded_on_gpu={torch.cuda.memory_allocated(device) / 1024**3:.3f} GiB",
+            f"paired_alignment_controls_on_gpu={torch.cuda.memory_allocated(device) / 1024**3:.3f} GiB",
             flush=True,
         )
 
-    reconstruction_scores = load_reconstruction_scores(args.reconstruction_predictions)
-    joint_reconstruction_scores = load_reconstruction_scores(args.joint_predictions)
+    topology = normalise_reconstruction_topology(args.topology)
+    reconstruction_scores = load_reconstruction_scores(args.reconstruction_predictions, topology)
+    joint_reconstruction_scores = load_reconstruction_scores(args.joint_predictions, topology)
 
     canonical = {
         "source_event_index": create_memmap(scores_dir / "test_source_event_index.npy", (event_count,), np.int64),
@@ -365,7 +372,6 @@ def main() -> int:
             ],
         }
 
-    started = time.perf_counter()
     row_start = 0
     part_number = 0
     buffered_frames = []
@@ -401,7 +407,7 @@ def main() -> int:
             frame_data = {
                 "source_event_index": indices,
                 "truth_class": batch.cls_t.detach().cpu().reshape(-1).numpy().astype(np.int8),
-                "truth_fully_matched": truth_fully_matched(batch).astype(np.int8),
+                "truth_fully_matched": truth_fully_matched(batch, topology).astype(np.int8),
                 "native_classification_only_score": torch.sigmoid(native_class_logit).cpu().numpy(),
                 "native_joint_score": torch.sigmoid(joint_outputs[3].reshape(-1)).cpu().numpy(),
                 "reconstruction_zero_shot_score": np.asarray(
@@ -451,17 +457,22 @@ def main() -> int:
                     ("random", random_controls[direction]),
                 ):
                     destination = control_maps[(direction, control_type)]
-                    device_controls = controls_device[(direction, control_type)]
                     for control_start in range(0, len(control_list), args.control_chunk_size):
                         control_stop = min(control_start + args.control_chunk_size, len(control_list))
+                        # Keep only the bounded control chunk on the accelerator;
+                        # production-sized ensembles remain resident on host RAM.
+                        device_controls = controls_to_device(
+                            control_list[control_start:control_stop], device, model_dtype
+                        )
                         scores = evaluate_control_chunk(
                             source_by_direction[direction],
                             device_controls,
                             head_by_direction[direction],
-                            control_start,
-                            control_stop,
+                            0,
+                            control_stop - control_start,
                         )
                         destination[control_start:control_stop, row_start:row_stop] = scores
+                        del device_controls, scores
 
             frame = pd.DataFrame(frame_data)
             buffered_frames.append(frame)
@@ -505,7 +516,12 @@ def main() -> int:
         "parts_output": str(parts_dir),
         "alignment_fit_split": "val",
         "labels_used_for_alignment": False,
-        "zero_shot_score_definition": "p_top1 * p_top2 * p_W1 * p_W2",
+        "topology": topology,
+        "zero_shot_score_definition": (
+            "p_top1 * p_top2 * p_W1 * p_W2"
+            if topology == "ttbar1L"
+            else "p_tlep * p_thad * p_Wlep * p_Whad * p_H"
+        ),
         "alignment_directions": control_metadata,
         "num_random_controls": args.num_random_controls,
         "control_chunk_size": args.control_chunk_size,
@@ -514,8 +530,11 @@ def main() -> int:
         "events_per_second": float(event_count / elapsed) if elapsed > 0 else None,
     }
     (output / "evaluation_summary.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8"
     )
+    diagnostics = resource_diagnostics(stage="evaluate", started=started, events_processed=event_count, output_root=output)
+    diagnostics.update({"topology": topology, "control_chunk_size": args.control_chunk_size})
+    write_resource_diagnostics(output, diagnostics)
     print(f"wrote={output} events={event_count} elapsed_seconds={elapsed:.1f}")
     return 0
 

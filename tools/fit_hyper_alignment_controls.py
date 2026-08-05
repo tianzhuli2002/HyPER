@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from HyPER.analysis.representations import align_exports, event_index_sha256, fit_procrustes
+from HyPER.analysis.runtime import resource_diagnostics, write_resource_diagnostics
 
 
 def parse_args() -> argparse.Namespace:
@@ -311,8 +312,16 @@ def main() -> int:
         "labels_loaded_for_fitting": False,
     }
     (output / "alignment_summary.json").write_text(
-        json.dumps(ensemble_summary, indent=2, sort_keys=True) + "\n",
+        json.dumps(ensemble_summary, indent=2, sort_keys=True, allow_nan=False) + "\n",
         encoding="utf-8",
+    )
+    write_resource_diagnostics(
+        output,
+        {
+            **resource_diagnostics(stage="align", started=started, events_processed=len(indices), output_root=output),
+            "direction": args.direction,
+            "fit_event_count": len(indices),
+        },
     )
     print(
         f"wrote={output} direction={args.direction} shuffles={args.num_shuffles}"

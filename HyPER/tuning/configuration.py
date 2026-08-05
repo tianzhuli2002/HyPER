@@ -33,8 +33,6 @@ def configure_effective_graph_dataset(cfg, *, dataset_root, dataset_name) -> dic
     OmegaConf.update(cfg, "dataset.root", str(root), merge=False, force_add=True)
     OmegaConf.update(cfg, "dataset.train_set", name, merge=False, force_add=True)
     OmegaConf.update(cfg, "dataset.predict_set", name, merge=False, force_add=True)
-    OmegaConf.update(cfg, "dataset.val_set", "", merge=False, force_add=True)
-    OmegaConf.update(cfg, "dataset.force_reload", False, merge=False, force_add=True)
     return {
         "dataset_root": str(root),
         "dataset_name": name,
@@ -137,13 +135,11 @@ def configure_tuning_data_isolation(cfg, *, canonical_split_path, train_indices_
     split_path = _required_file(canonical_split_path, "canonical tuning split cache")
     train_path = _required_file(train_indices_path, "tuning training indices")
     validation_path = _required_file(validation_indices_path, "tuning validation indices")
-    OmegaConf.update(cfg, "dataset.split.enabled", True, merge=False, force_add=True)
     OmegaConf.update(cfg, "dataset.split.cache_path", str(split_path), merge=False, force_add=True)
     OmegaConf.update(cfg, "dataset.split.require_existing", True, merge=False, force_add=True)
     OmegaConf.update(cfg, "dataset.split.predict_split", None, merge=False, force_add=True)
     OmegaConf.update(cfg, "predicting.split", None, merge=False, force_add=True)
     OmegaConf.update(cfg, "predicting.source_indices_file", None, merge=False, force_add=True)
-    OmegaConf.update(cfg, "tuning.enabled", True, merge=False, force_add=True)
     OmegaConf.update(cfg, "tuning.train_indices_file", str(train_path), merge=False, force_add=True)
     OmegaConf.update(cfg, "tuning.validation_indices_file", str(validation_path), merge=False, force_add=True)
     return validate_tuning_data_isolation(

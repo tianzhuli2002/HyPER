@@ -15,7 +15,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import Dataset
 
 from HyPER.data.datamodule import HyPERDataModule, SourceIndexSubset
-from HyPER.train import _graph_config
+from HyPER.factories import graph_config
 
 
 def _parse_args() -> argparse.Namespace:
@@ -81,7 +81,6 @@ def main() -> None:
     datamodule = HyPERDataModule(
         root=dataset_root,
         train_set=dataset_name,
-        val_set=None if cfg.dataset.val_set is None else str(cfg.dataset.val_set),
         predict_set=None,
         batch_size=int(args.batch_size or cfg.dataset.batch_size),
         drop_last=False,
@@ -89,9 +88,7 @@ def main() -> None:
         pin_memory=bool(cfg.dataset.pin_memory),
         persistent_workers=bool(cfg.dataset.persistent_workers),
         prefetch_factor=int(args.prefetch_factor),
-        force_reload=False,
-        use_ondisk=True,
-        graph_config=_graph_config(cfg),
+        graph_config=graph_config(cfg),
         split_config=split_cfg,
         predict_split=None,
         source_indices_file=None,

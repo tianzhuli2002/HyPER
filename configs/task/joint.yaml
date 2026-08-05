@@ -1,0 +1,7 @@
+# @package _global_
+task:
+  mode: joint
+loss:
+  edge_weight: 0.49
+  hyperedge_weight: 0.49
+  classification_weight: 0.02

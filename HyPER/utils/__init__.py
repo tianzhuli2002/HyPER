@@ -1,11 +1,3 @@
-from ._hdf5 import ResultWriter
-from .softmax import softmax
-from .connectivity import getUndirectedEdges
-from .custom_scatter import custom_scatter
+"""Utility submodules; import concrete helpers from their defining modules."""
 
-__all__ = [
-    'ResultWriter',
-    'softmax',
-    'getUndirectedEdges'
-    'custom_scatter'
-]
+__all__: list[str] = []

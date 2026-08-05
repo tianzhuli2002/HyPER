@@ -22,6 +22,7 @@ from HyPER.analysis.metrics import (
     prepare_descending_score_groups,
     weighted_grouped_metrics,
 )
+from HyPER.analysis.runtime import resource_diagnostics, write_resource_diagnostics
 
 METHOD_LABELS = {
     "native_classification_only_score": "Native classification-only",
@@ -103,7 +104,21 @@ def interval_summary(values: np.ndarray) -> dict[str, float]:
     }
 
 
+def strict_json_value(value):
+    """Convert non-finite numerical results to JSON null at serialization time."""
+    if isinstance(value, (float, np.floating)):
+        return float(value) if np.isfinite(value) else None
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, dict):
+        return {key: strict_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [strict_json_value(item) for item in value]
+    return value
+
+
 def main() -> int:
+    started_main = time.perf_counter()
     args = parse_args()
     if args.replicates <= 0 or args.chunk_size <= 0:
         raise ValueError("--replicates and --chunk-size must be positive.")
@@ -171,14 +186,15 @@ def main() -> int:
         writer.writerows(operating_rows)
     (output / "full_test_metrics.json").write_text(
         json.dumps(
-            {
+            strict_json_value({
                 "event_count": len(labels),
                 "methods": METHOD_LABELS,
                 "metrics": point_rows,
                 "operating_points": operating_rows,
-            },
+            }),
             indent=2,
             sort_keys=True,
+            allow_nan=False,
         )
         + "\n",
         encoding="utf-8",
@@ -286,7 +302,22 @@ def main() -> int:
         "paired_auc_differences": difference_rows,
     }
     (output / "bootstrap_summary.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(
+            strict_json_value(summary),
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    write_resource_diagnostics(
+        output,
+        resource_diagnostics(
+            stage="statistics",
+            started=started_main,
+            events_processed=len(labels),
+            output_root=output,
+        ),
     )
     print(f"wrote={output} replicates={args.replicates}")
     return 0

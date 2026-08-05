@@ -17,76 +17,30 @@ import pandas as pd
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from HyPER.checkpoints import checkpoint_metadata, resolve_checkpoint
+from HyPER.configuration import TaskSpec, validate_runtime_config
 from HyPER.data import HyPERDataModule
+from HyPER.factories import graph_config, plain
 from HyPER.models import HyPERModel
-from HyPER.topology.ttbar import ttbar_single_lep
-from HyPER.topology.tth import ttH_single_lep
+from HyPER.topology.ttbar import reconstruct_ttbar1l
+from HyPER.topology.tth import reconstruct_tth
 
 
 TOPOLOGY_REGISTRY = {
-    "ttbar_single_lep": ttbar_single_lep,
-    "ttH": ttH_single_lep,
+    "ttbar1L": reconstruct_ttbar1l,
+    "ttH": reconstruct_tth,
 }
 
 
-def _plain(value):
+def plain(value):
     return OmegaConf.to_container(value, resolve=True) if OmegaConf.is_config(value) else value
 
 
 def _graph_config(cfg: DictConfig) -> dict:
-    return _plain(OmegaConf.create({"input": cfg.input, "target": cfg.target}))
+    graph = plain(OmegaConf.create({"input": cfg.input, "target": cfg.target}))
+    graph.setdefault("target", {})["encoding"] = "typed"
+    return graph
 
-
-def _resolve_checkpoint(selector: str | None, model_directory: str | None) -> Path:
-    if selector is None or not str(selector).strip():
-        raise ValueError("predicting.checkpoint must be an explicit path or selector 'best'/'last'.")
-    selector = str(selector).strip()
-    direct = Path(selector).expanduser()
-    if direct.is_file():
-        return direct.resolve()
-    if selector not in {"best", "last"}:
-        raise FileNotFoundError(
-            f"predicting.checkpoint must be an existing path or 'best'/'last', got {selector!r}."
-        )
-    if model_directory is None or not str(model_directory).strip():
-        raise ValueError(f"Checkpoint selector {selector!r} requires predicting.model_directory.")
-    directory = Path(str(model_directory)).expanduser() / "checkpoints"
-    if selector == "last":
-        path = directory / "last.ckpt"
-        if not path.is_file():
-            raise FileNotFoundError(path)
-        return path.resolve()
-    candidates = list(directory.glob("best-total*.ckpt"))
-    if len(candidates) != 1:
-        raise RuntimeError(
-            f"Selector 'best' requires exactly one best-total checkpoint in {directory}, found {len(candidates)}."
-        )
-    return candidates[0].resolve()
-
-
-def _checkpoint_metadata(path: Path) -> dict:
-    checkpoint = torch.load(path, map_location="cpu")
-    callbacks = checkpoint.get("callbacks", {})
-    monitor = score = None
-    for state in callbacks.values():
-        if isinstance(state, dict) and state.get("monitor") and "best_model_score" in state:
-            monitor = state.get("monitor")
-            value = state.get("best_model_score")
-            if value is not None:
-                score = float(value)
-            break
-    if monitor not in {"val_loss", "val_reconstruction_loss", "val_classification_loss"} or score is None:
-        raise RuntimeError(
-            f"Checkpoint {path} does not contain a valid finite monitored callback score; "
-            f"found monitor={monitor!r}, score={score!r}."
-        )
-    return {
-        "checkpoint_path": str(path),
-        "checkpoint_epoch": checkpoint.get("epoch"),
-        "checkpoint_global_step": checkpoint.get("global_step"),
-        "checkpoint_monitor": monitor,
-        "checkpoint_score": score,
-    }
 
 
 def symmetrise_directed_edge_logits(logits: torch.Tensor, num_nodes: int):
@@ -184,7 +138,7 @@ def _raw_frame(predictions: list[dict], hyperedge_order: int, edge_names, hypere
 
 
 def _role_truth(node_truth_ids, node_types, topology_name: str) -> dict:
-    if topology_name == "ttbar_single_lep":
+    if topology_name == "ttbar1L":
         mapping = {"b_lep": 1, "b_had": 2, "W_j1": 3, "W_j2": 4}
     elif topology_name == "ttH":
         mapping = {"b_had": 1, "W_j1": 2, "W_j2": 3, "b_lep": 4, "H_b1": 5, "H_b2": 6}
@@ -208,7 +162,7 @@ def _role_truth(node_truth_ids, node_types, topology_name: str) -> dict:
 
 
 def _selected_fields(row: pd.Series, topology_name: str) -> tuple[list[int], list[float]]:
-    if topology_name == "ttbar_single_lep":
+    if topology_name == "ttbar1L":
         index_fields = ("HyPER_best_top1", "HyPER_best_top2", "HyPER_best_w1", "HyPER_best_w2")
         score_fields = ("HyPER_best_top1_prob", "HyPER_best_top2_prob", "HyPER_best_w1_prob", "HyPER_best_w2_prob")
     else:
@@ -232,7 +186,7 @@ def _format_output(
 ):
     mode = str(output_mode).lower()
     if mode not in {"selected", "raw", "both", "classifier"}:
-        raise ValueError("predicting.output_mode must be selected, raw, both, or classifier.")
+        raise ValueError("Internal prediction product must be selected, raw, both, or classifier.")
     common = [
         "source_event_index", "number_of_nodes", "node_types", "node_p4", "node_ids",
         "node_truth_ids",
@@ -301,7 +255,15 @@ class ChunkedPickleWriter:
         self.rows += len(frame)
 
 
-def _manifest(cfg, checkpoint: Path, datamodule, output: Path, rows: int) -> dict:
+def _manifest(
+    cfg,
+    checkpoint: Path,
+    datamodule,
+    output: Path,
+    rows: int,
+    topology: str,
+    task: TaskSpec,
+) -> dict:
     configured_source = cfg.dataset.get("source_h5_path")
     source_h5 = (
         Path(str(configured_source)).expanduser().resolve()
@@ -314,20 +276,22 @@ def _manifest(cfg, checkpoint: Path, datamodule, output: Path, rows: int) -> dic
         indices = np.load(str(index_file), allow_pickle=False).astype(np.int64, copy=False)
         index_hash = hashlib.sha256(indices.tobytes()).hexdigest()[:16]
     manifest = {
-        **_checkpoint_metadata(checkpoint),
+        **checkpoint_metadata(checkpoint),
         "source_h5_path": str(source_h5),
         "prediction_split": str(datamodule.resolved_predict_split),
         "source_indices_file": None if index_file is None else str(Path(str(index_file)).resolve()),
         "source_indices_hash": index_hash,
         "number_of_prediction_rows": int(rows),
         "classification_score_representation": (
-            "HyPER_CLS_LOGIT and HyPER_CLS_PROB" if bool(cfg.classification.enabled) else None
+            "HyPER_CLS_LOGIT and HyPER_CLS_PROB" if task.classification_enabled else None
         ),
         "reconstruction_score_representation": (
             "reverse-directed logits averaged per physical pair, then softmax"
-            if bool(cfg.reconstruction.enabled) else None
+            if task.reconstruction_enabled else None
         ),
-        "prediction_output_mode": str(cfg.predicting.output_mode),
+        "task": task.mode,
+        "topology": topology,
+        "prediction_product": task.prediction_product,
         "split_cache_path": datamodule.split_cache_path,
         "split_metadata": datamodule.split_metadata,
         "target_encoding": "typed",
@@ -346,7 +310,12 @@ def _rss_mb() -> float:
 @hydra.main(version_base=None, config_path="../configs", config_name="default")
 def Predict(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
-    checkpoint = _resolve_checkpoint(cfg.predicting.checkpoint, cfg.predicting.model_directory)
+    topology_name, task = validate_runtime_config(cfg)
+    checkpoint = resolve_checkpoint(
+        cfg.predicting.checkpoint,
+        cfg.predicting.model_directory,
+        purpose="Prediction checkpoint",
+    )
     output = cfg.predicting.save_as
     if output is None or not str(output).strip():
         raise ValueError("predicting.save_as must be supplied explicitly.")
@@ -363,7 +332,6 @@ def Predict(cfg: DictConfig) -> None:
     datamodule = HyPERDataModule(
         root=str(cfg.dataset.root),
         train_set=str(cfg.dataset.train_set) if cfg.predicting.split is not None else None,
-        val_set=None,
         predict_set=str(cfg.dataset.predict_set),
         batch_size=int(cfg.predicting.batch_size),
         drop_last=False,
@@ -371,14 +339,12 @@ def Predict(cfg: DictConfig) -> None:
         pin_memory=bool(cfg.dataset.pin_memory) and device.type == "cuda",
         persistent_workers=bool(cfg.dataset.persistent_workers),
         prefetch_factor=int(cfg.dataset.prefetch_factor),
-        force_reload=bool(cfg.dataset.force_reload),
-        use_ondisk=bool(cfg.dataset.use_ondisk),
-        graph_config=_graph_config(cfg),
-        split_config=_plain(cfg.dataset.split),
+        graph_config=graph_config(cfg),
+        split_config=plain(cfg.dataset.split),
         predict_split=cfg.predicting.split,
         source_indices_file=cfg.predicting.source_indices_file,
         source_h5_path=cfg.dataset.get("source_h5_path"),
-        require_two_event_classes=bool(cfg.classification.enabled),
+        require_two_event_classes=task.classification_enabled,
         seed=int(cfg.general.seed),
     )
     datamodule.setup("predict")
@@ -386,7 +352,6 @@ def Predict(cfg: DictConfig) -> None:
     if model.edge_class_names != datamodule.edge_class_names or model.hyperedge_class_names != datamodule.hyperedge_class_names:
         raise RuntimeError("Checkpoint reconstruction class names disagree with the prediction dataset.")
 
-    topology_name = str(cfg.predicting.topology)
     if topology_name not in TOPOLOGY_REGISTRY:
         raise ValueError(f"Unsupported topology {topology_name!r}.")
     maximum = cfg.predicting.max_events
@@ -401,7 +366,7 @@ def Predict(cfg: DictConfig) -> None:
             return
         raw = _raw_frame(pending, int(cfg.model.hyperedge_order), datamodule.edge_class_names, datamodule.hyperedge_class_names)
         formatted = _format_output(
-            raw, str(cfg.predicting.output_mode), topology_name,
+            raw, ("both" if bool(cfg.predicting.get("include_raw", False)) else task.prediction_product), topology_name,
             str(datamodule.resolved_predict_split), str(cfg.dataset.predict_set), written,
             cfg.predicting.get("strategy"),
         )
@@ -433,8 +398,10 @@ def Predict(cfg: DictConfig) -> None:
 
     if writer is None:
         result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-        result.to_pickle(output)
-    manifest = _manifest(cfg, checkpoint, datamodule, output, written)
+        temporary = output.with_name(output.name + ".tmp")
+        result.to_pickle(temporary)
+        os.replace(temporary, output)
+    manifest = _manifest(cfg, checkpoint, datamodule, output, written, topology_name, task)
     if writer is not None:
         manifest.update({"format": "chunked_pickle_parts", "part_files": writer.parts})
         (output / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
